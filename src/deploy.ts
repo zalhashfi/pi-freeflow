@@ -26,7 +26,7 @@ const RELAY_AUTH = ${JSON.stringify(relayAuth)};
 const resolveRelayTarget = function(target, relayPath) {
   let targetUrl;
   try { targetUrl = new URL(target); } catch { return { ok: false, status: 400, reason: "invalid x-relay-target" }; }
-  if (typeof relayPath !== "string" || relayPath.indexOf("@") !== -1 || relayPath.indexOf("\\") !== -1 || relayPath.charAt(0) !== "/") {
+  if (typeof relayPath !== "string" || relayPath.indexOf("@") !== -1 || relayPath.indexOf("\\\\") !== -1 || relayPath.charAt(0) !== "/") {
     return { ok: false, status: 403, reason: "forbidden x-relay-path" };
   }
   let finalUrl;
@@ -38,12 +38,12 @@ const resolveRelayTarget = function(target, relayPath) {
 };
 const isPrivateHostname = function(h) {
   if (!h) return true
-  let host = String(h).trim().toLowerCase().replace(/^\[|\]$/g, "")
+  let host = String(h).trim().toLowerCase().replace(/^\\[|\\]$/g, "")
   if (host.length > 1 && host.endsWith(".")) host = host.slice(0, -1)
   if (!host) return true
   if (host === "localhost" || host === "0.0.0.0" || host === "127.0.0.1" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) return true
   if (host.startsWith("::")) return true
-  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  const v4 = host.match(/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/)
   if (v4) {
     const a = Number(v4[1])
     const b = Number(v4[2])
@@ -87,7 +87,7 @@ async function relayHandler(req) {
   if (targetUrl.protocol !== "http:" && targetUrl.protocol !== "https:") return new Response(JSON.stringify({ error: "forbidden x-relay-target protocol" }), { status: 403, headers: { "content-type": "application/json" } });
   if (targetUrl.username || targetUrl.password) return new Response(JSON.stringify({ error: "forbidden x-relay-target (embedded credentials)" }), { status: 403, headers: { "content-type": "application/json" } });
   if (isPrivateHostname(targetUrl.hostname)) return new Response(JSON.stringify({ error: "forbidden x-relay-target (private/loopback host)" }), { status: 403, headers: { "content-type": "application/json" } });
-  const cleanTarget = target.replace(/\/$/, "");
+  const cleanTarget = target.replace(/\\/$/, "");
   if (!ALLOWED_TARGETS.includes(cleanTarget)) return new Response(JSON.stringify({ error: "Forbidden target" }), { status: 403, headers: { "content-type": "application/json" } });
   const relayPath = req.headers.get("x-relay-path") || "/";
   const resolved = resolveRelayTarget(target, relayPath);
