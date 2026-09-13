@@ -79,6 +79,63 @@ function withRateLimitHint(status: number, data: string): string {
 }
 
 /**
+ * Recursively strip `encrypted_content` properties from an object or array.
+ */
+function stripEncryptedContent(obj: unknown): boolean {
+	if (!obj || typeof obj !== "object") return false;
+	let changed = false;
+	if (Array.isArray(obj)) {
+		for (const item of obj) {
+			if (stripEncryptedContent(item)) changed = true;
+		}
+	} else {
+		const record = obj as Record<string, unknown>;
+		if ("encrypted_content" in record) {
+			delete record.encrypted_content;
+			changed = true;
+		}
+		for (const val of Object.values(record)) {
+			if (typeof val === "object" && val !== null) {
+				if (stripEncryptedContent(val)) changed = true;
+			}
+		}
+	}
+	return changed;
+}
+
+/**
+ * Sanitize OpenAI Responses API request body to prevent HTTP 400:
+ * "reasoning `encrypted_content` was not issued to this caller".
+ *
+ * Strips `encrypted_content` from replayed reasoning items in `input` and removes
+ * `"reasoning.encrypted_content"` from `include`.
+ */
+export function sanitizeResponsesPayload(body: Record<string, unknown>): boolean {
+	let modified = false;
+
+	// 1. Remove "reasoning.encrypted_content" from include array if present
+	if (Array.isArray(body.include)) {
+		const filtered = body.include.filter((item) => item !== "reasoning.encrypted_content");
+		if (filtered.length !== body.include.length) {
+			if (filtered.length > 0) {
+				body.include = filtered;
+			} else {
+				delete body.include;
+			}
+			modified = true;
+		}
+	}
+
+	// 2. Strip encrypted_content from any items in input
+	if (body.input && stripEncryptedContent(body.input)) {
+		modified = true;
+	}
+
+	return modified;
+}
+
+
+/**
  * Extract client IP address from incoming HTTP request.
  */
 export function getClientIP(req: http.IncomingMessage): string {
@@ -540,6 +597,19 @@ export function startProxy(
 				}
 			} catch {}
 
+			let bodyBuffer = Buffer.concat(bodyChunks);
+			if (parsedBody && sanitizeResponsesPayload(parsedBody)) {
+				bodyBuffer = Buffer.from(JSON.stringify(parsedBody), "utf8");
+				if (isDebugEnabled()) {
+					log(
+						"debug",
+						"sanitized replayed encrypted_content from responses request",
+						{ model: parsedBody.model },
+						reqId,
+					);
+				}
+			}
+
 			const isStream = parsedBody?.stream === true;
 
 			// Stale-registration guard: responses-only models (muse-spark-*) must
@@ -633,7 +703,7 @@ export function startProxy(
 
 						try {
 							if (parsedBody) {
-								const relayBody = Buffer.concat(bodyChunks);
+								const relayBody = bodyBuffer;
 								// Header-wait timeout + client-disconnect abort; the
 								// timer is cleared once headers arrive so streams are
 								// not killed at the timeout ceiling. Aborts caused by
@@ -710,8 +780,8 @@ export function startProxy(
 						}
 					}
 
-					// Direct path — the relay already parsed/forwarded raw; send the buffered bytes unchanged
-					const directBody = Buffer.concat(bodyChunks);
+					// Direct path — send bodyBuffer (sanitized if responses request was modified)
+					const directBody = bodyBuffer;
 
 					if (isDebugEnabled()) {
 						log(

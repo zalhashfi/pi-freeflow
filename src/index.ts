@@ -143,7 +143,11 @@ export function buildProviderConfig(
 							thinkingFormat: m.thinkingFormat,
 						}
 					: m.api === "openai-responses"
-						? { sessionAffinityFormat: "openai-nosession" }
+						? {
+								sessionAffinityFormat: "openai-nosession",
+								includeEncryptedReasoning: false,
+								filterReasoningHistory: true,
+							}
 						: m.source === "kilo"
 							? {
 									supportsDeveloperRole: false,

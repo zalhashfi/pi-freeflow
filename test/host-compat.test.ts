@@ -141,6 +141,11 @@ test("A: activation completes on a MINIMAL Pi host (no pi.on, ui notify-only) an
 		captured.providerConfig!.models.length >= 26,
 		"static catalog must expose at least 26 models",
 	);
+	const spark13 = captured.providerConfig!.models.find((m) => m.id === "muse-spark-1.3-contributor-free");
+	assert.ok(spark13, "muse-spark-1.3 must be in registered provider models");
+	assert.equal(spark13?.compat?.sessionAffinityFormat, "openai-nosession");
+	assert.equal(spark13?.compat?.includeEncryptedReasoning, false);
+	assert.equal(spark13?.compat?.filterReasoningHistory, true);
 	assert.ok(captured.commands.has("freeflow"), "/freeflow command must be registered");
 	assert.equal(
 		captured.events.size,
@@ -407,7 +412,14 @@ test("I: isLinkedInstall distinguishes a symlinked entry from a regular file", a
 	fs.writeFileSync(linkTarget, backup);
 	try {
 		fs.rmSync(entry, { force: true });
-		fs.symlinkSync(linkTarget, entry, "file");
+		try {
+			fs.symlinkSync(linkTarget, entry, "file");
+		} catch (err: unknown) {
+			if ((err as { code?: string })?.code === "EPERM" && process.platform === "win32") {
+				return; // Windows unprivileged environment disallows symlinks
+			}
+			throw err;
+		}
 		assert.equal(isLinkedInstall(), true, "a symlinked entry must be detected as a linked install");
 	} finally {
 		fs.rmSync(entry, { force: true });

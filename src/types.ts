@@ -120,6 +120,8 @@ export interface ProviderModelCompat {
 	supportsReasoningEffort?: boolean;
 	thinkingFormat?: "openrouter" | string;
 	sessionAffinityFormat?: "openai-nosession" | string;
+	includeEncryptedReasoning?: boolean;
+	filterReasoningHistory?: boolean;
 	[key: string]: unknown;
 }
 
