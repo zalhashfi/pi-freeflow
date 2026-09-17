@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.16.0
+
+### Minor Changes
+
+- New free model: Union Alpha Free joins the picker. It answers through a different upstream endpoint than the other free models, handled automatically — 262K context, image input, tool calling, and zero cost like the rest of the catalog.
+
+## 1.15.2
+
+### Patch Changes
+
+- Relay traffic is now spent only on the free models the pool exists for: requests for other models go straight upstream even with the relay pool on, cutting relay bandwidth. Applies in automatic and always-on modes; relay-off behavior is unchanged.
+- The disabled-deployment rollover now triggers only on genuine hosting verdicts, so ordinary payment and quota refusals always surface immediately without cooling a healthy relay. Relay-list imports also no longer show a negative removal count when the file holds more relays than the current pool.
+
+## 1.15.1
+
+### Patch Changes
+
+- Requests now roll over to the next relay when the current one answers with a disabled-deployment verdict, instead of failing on the first relay and requiring a manual switch. Other payment and quota refusals still surface immediately.
+
+## 1.15.0
+
+### Minor Changes
+
+- Free-tier requests now use native session identifiers and an up-to-date client version, after the upstream gateway began rejecting older formats with a free-tier error. `/freeflow test` also gains an end-to-end chat check that verifies a relay can actually run inference, not just list models.
+
 ## 1.14.0
 
 ### Minor Changes

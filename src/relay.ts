@@ -38,6 +38,21 @@ export function isRetriableStatus(status: number): boolean {
 		(status >= 520 && status <= 530)
 	);
 }
+
+/**
+ * Gated 402 roll predicate: a 402 is a relay-host failure only when it
+ * carries the Vercel edge-error marker or a DEPLOYMENT_DISABLED body match.
+ * Generic 402s (payment/quota) carry neither and must surface immediately.
+ * Only x-vercel-error qualifies as an edge marker: Vercel stamps x-vercel-id
+ * on EVERY function response, so keying on it would misroll a genuine
+ * upstream quota 402 forwarded by a healthy Vercel-hosted relay — and
+ * wrongly cool that relay down.
+ */
+function isRelayDeploymentDisabled(res: Response, bodyText: string | null): boolean {
+	if (res.status !== 402) return false;
+	if (Boolean(res.headers.get("x-vercel-error"))) return true;
+	return bodyText !== null && bodyText.includes("DEPLOYMENT_DISABLED");
+}
 /**
  * Per-conversation reasoning affinity. Callers sending caller-bound reasoning
  * pass the relay that issued it; `onServed` reports the relay that actually
@@ -229,6 +244,43 @@ export async function relayFetch(
 					}
 				}
 				continue;
+			}
+			// Relay deployment disabled (402 DEPLOYMENT_DISABLED from Vercel):
+			// A disabled deployment is a relay-host failure, so roll to the next
+			// relay. A blanket 402 must NOT roll: generic 402s are payment/quota
+			// verdicts that must surface immediately, so gate strictly on Vercel
+			// edge markers or a DEPLOYMENT_DISABLED body match and otherwise fall
+			// through to the terminal path below. The body is peeked via a clone so
+			// the downstream stream stays intact; on any clone/read failure decide
+			// on headers alone (headerless failure reads as a generic 402).
+			if (res.status === 402) {
+				let disabledBody: string | null = null;
+				try {
+					disabledBody = (await res.clone().text()).slice(0, 8192);
+				} catch {
+					disabledBody = null;
+				}
+				if (isRelayDeploymentDisabled(res, disabledBody)) {
+					markRelayFailure(targetUrl, 402, "Deployment disabled (DEPLOYMENT_DISABLED) on relay host");
+					lastResponse?.body?.cancel().catch(() => {});
+					lastResponse = res;
+					lastResponseRelay = targetUrl;
+					log(
+						"warn",
+						`relay ${targetUrl} returned 402 DEPLOYMENT_DISABLED in ${elapsed}s — rolling to next relay`,
+						{ upstream: url },
+						rid,
+					);
+					const now = Date.now();
+					if (now - lastRollNotify > ROLL_NOTIFY_MS) {
+						lastRollNotify = now;
+						const ui = getStatusUi();
+						if (ui?.notify) {
+							ui.notify(`relay ${shortRelayLabel(targetUrl)} failed (HTTP 402) — rolled to next relay`, "warning");
+						}
+					}
+					continue;
+				}
 			}
 			if (isRetriableStatus(res.status)) {
 				markRelayFailure(targetUrl, res.status);
