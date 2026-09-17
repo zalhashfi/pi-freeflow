@@ -79,6 +79,19 @@ export function updateStatusBar(ui?: ExtensionUIContext): void {
 export const STARTUP_TASK_NAME = "pi-freeflow-daemon";
 export const STARTUP_SERVICE_NAME = "pi-freeflow.service";
 
+/**
+ * Tokenize command arguments, respecting single and double quotes.
+ */
+export function tokenizeArgs(input: string): string[] {
+ const tokens: string[] = [];
+ const regex = /[^\s"']+|"([^"]*)"|'([^']*)'/g;
+ let match: RegExpExecArray | null;
+ while ((match = regex.exec(input)) !== null) {
+  tokens.push((match[1] ?? match[2] ?? match[0]).trim());
+ }
+ return tokens.filter(Boolean);
+}
+
 export interface StartupPlan {
  platform: string;
  taskName: string;
@@ -698,7 +711,8 @@ export function createCommandSpec(
     }
     const artifact = buildRelayExport(state, { includeSecrets });
     const count = artifact.state.relays.length;
-    let target = pathArg ? path.resolve(pathArg) : path.resolve(EXPORT_DEFAULT_FILENAME);
+    const cleanPath = pathArg?.trim().replace(/^["']|["']$/g, "");
+    let target = cleanPath ? path.resolve(cleanPath) : path.resolve(EXPORT_DEFAULT_FILENAME);
     if (!pathArg) {
      const choice = await ctx.ui.select("Share relays (export file)", [
       `Export to ${target}`,
@@ -707,7 +721,7 @@ export function createCommandSpec(
      ]);
      if (!choice || choice === "Cancel") return;
      if (choice === "Choose another path…") {
-      const picked = (await ctx.ui.input("Export path:", target))?.trim();
+      const picked = (await ctx.ui.input("Export path:", target))?.trim().replace(/^["']|["']$/g, "");
       if (!picked) return;
       target = path.resolve(picked);
      }
@@ -745,7 +759,8 @@ export function createCommandSpec(
     mode: "merge" | "replace",
     dryRun: boolean,
    ) => {
-    const filePath = (pathArg || "").trim();
+    const cleanPath = (pathArg || "").trim().replace(/^["']|["']$/g, "");
+    const filePath = cleanPath ? path.resolve(cleanPath) : "";
     if (!filePath) {
      ctx.ui.notify("Usage: /freeflow import <path> [--merge|--replace] [--dry-run] — path is required.", "warning");
      return;
@@ -1380,7 +1395,7 @@ export function createCommandSpec(
      ctx.ui.notify(`✗ ${shortRelayLabel(matched.url, relayState.relays)} failed: ${probe.error || `HTTP ${probe.status}`}`, "error");
     }
    } else if (sub === "export") {
-    const tokens = rest.trim() ? rest.trim().split(/\s+/) : [];
+    const tokens = rest.trim() ? tokenizeArgs(rest.trim()) : [];
     let target: string | undefined;
     let includeSecrets = false;
     for (const t of tokens) {
@@ -1395,7 +1410,7 @@ export function createCommandSpec(
     }
     await runExport(target, includeSecrets);
    } else if (sub === "import") {
-    const tokens = rest.trim() ? rest.trim().split(/\s+/) : [];
+    const tokens = rest.trim() ? tokenizeArgs(rest.trim()) : [];
     let target: string | undefined;
     let sawMerge = false;
     let sawReplace = false;

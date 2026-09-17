@@ -449,3 +449,43 @@ test("command spec: /freeflow deploy confirm declined notifies Deploy cancelled"
   );
  });
 });
+
+test("command spec: /freeflow export and import handle quoted paths correctly", async () => {
+ await withSavedDiskState(async () => {
+  const tmpDir = fs.mkdtempSync(path.join(path.dirname(RELAY_STATE_FILE), "export-test-"));
+  const exportPath = path.join(tmpDir, "relays with spaces.json");
+  try {
+   setActiveRelayState({
+    mode: "auto",
+    enabled: true,
+    url: "https://relay-quoted.example.com",
+    relays: [{ url: "https://relay-quoted.example.com", label: "quoted-relay" }],
+   }, true);
+
+   const spec = createCommandSpec(mockApi);
+   const { ctx: exportCtx, notifications: exportNotes } = createMockContext({});
+
+   await spec.handler(`export "${exportPath}" --include-secrets`, exportCtx);
+   assert.ok(
+    exportNotes.some((n) => n.message.includes("Exported 1 relay")),
+    `expected export success notification, got: ${JSON.stringify(exportNotes)}`,
+   );
+   assert.ok(fs.existsSync(exportPath), "exported file must exist on disk");
+
+   setActiveRelayState({ mode: "auto", enabled: true, url: "", relays: [] }, true);
+
+   const { ctx: importCtx, notifications: importNotes } = createMockContext({
+    confirmValue: true,
+   });
+   await spec.handler(`import "${exportPath}" --replace`, importCtx);
+   assert.ok(
+    importNotes.some((n) => n.message.includes("Replaced")),
+    `expected import success notification, got: ${JSON.stringify(importNotes)}`,
+   );
+  } finally {
+   try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+   } catch {}
+  }
+ });
+});
