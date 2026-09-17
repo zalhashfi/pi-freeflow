@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.14.0
+
+### Minor Changes
+
+- c28b7b5: Local proxy recovers on its own: if the background proxy stops unexpectedly, the extension now notices the refused local connection and starts a fresh proxy within seconds instead of leaving every model failing until the next session; shutdowns and crashes are also recorded in the log so the cause is visible.
+
+### Patch Changes
+
+- /freeflow update now goes through the host plugin managers first — reinstall under OMP, package update under Pi — and only then falls back to a global install, using Bun when npm is missing. Previously the first step called an update action the plugin manager does not define, so managed installs always fell through to the wrong target.
+
+## 1.13.0
+
+### Minor Changes
+
+- 39a06b9: Carry a relay pool between machines: `/freeflow export` saves the relays to a file and `/freeflow import` loads them back, adding to the current pool by default or swapping it whole on confirmation.
+
+## 1.12.1
+
+### Patch Changes
+
+- b32f208: Sessions survive a relay change without a rejected turn.
+
+  Responses models sign each thinking block for the upstream backend that produced it, and only that backend can read it back. When a later turn reached a different backend, the replayed blocks were rejected as unreadable ("reasoning `encrypted_content` was not issued to this caller"), the host repeated the same failing request, and the session could not continue.
+
+  pi-freeflow now keeps each conversation on the relay that issued its reasoning while that relay is healthy, and when a relay change is unavoidable (rate limit, relay removed or redeployed, direct-mode switch) it sends that turn without the signed thinking blocks, so the new backend accepts it on the first attempt. If a rejection still happens (the provider can change backends behind a relay), the request is retried once without the blocks, and only the rejected blocks are dropped on later turns, so the model keeps whatever reasoning the current backend can read. Messages, tool calls and tool results are always preserved.
+
 ## 1.12.0
 
 ### Minor Changes
