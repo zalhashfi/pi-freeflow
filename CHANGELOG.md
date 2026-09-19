@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.19.0
+
+### Minor Changes
+
+- Every tool your agent can use now works on every free model: the proxy translates tool definitions between chat, responses, and messages formats automatically, so built-in tools, MCP server tools, and custom tools all pass through intact on all request types. Strict tool schemas are preserved, and requests sent in one format to another endpoint are converted instead of rejected.
+
+## 1.18.0
+
+### Minor Changes
+
+- OpenCode free-tier client fingerprinting: plain chat, subagent, evaluation, and background watchdog requests now pass upstream free-tier gates without error. The proxy automatically supplies compatibility tools and streaming conventions expected by the upstream gateway, while transparently converting responses to standard non-streaming format for callers that request it.
+
+ ## 1.17.1
+
+ ### Patch Changes
+
+ - Assistant and subagent requests now stay working when the shared free-tier gateway refuses sessions: retried and resumed conversations automatically continue on a healthy fallback model instead of repeating the refusal, and normal routing resumes on its own once the gateway recovers.
+
+## 1.17.0
+
+### Minor Changes
+
+- Automatic upstream degradation: when the shared free-tier gateway starts refusing new sessions, new chat sessions seamlessly use a healthy fallback model on the same API, affected errors carry an actionable hint, in-progress chats are never rerouted, and normal routing resumes automatically on recovery. `/freeflow status` now shows live upstream state.
+
 ## 1.16.0
 
 ### Minor Changes

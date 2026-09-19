@@ -23,6 +23,7 @@ export { PKG_VERSION };
 // ── Upstream endpoints ──────────────────────────────────────────────
 export const UPSTREAM_OPENCODE = "https://opencode.ai/zen";
 export const KILO_CHAT_URL = "https://api.kilo.ai/api/gateway/chat/completions";
+export const KILO_RESPONSES_URL = "https://api.kilo.ai/api/gateway/responses";
 export const OPENCODE_API_URL = `${UPSTREAM_OPENCODE}/v1`;
 
 // ── Network & Server defaults ───────────────────────────────────────
@@ -223,6 +224,20 @@ export function resolveOnboardedFlagPath(): string {
    path.dirname(fileURLToPath(import.meta.url)),
    "..",
    ".onboarded",
+  );
+ }
+}
+
+export function resolveUpstreamHealthPath(): string {
+ try {
+  const override = dataDirOverride();
+  if (override) return path.join(override, "pi-freeflow-upstream-health.json");
+  return path.join(homedir(), ".pi", "agent", "pi-freeflow-upstream-health.json");
+ } catch {
+  return path.join(
+   path.dirname(fileURLToPath(import.meta.url)),
+   "..",
+   ".upstream-health.json",
   );
  }
 }
