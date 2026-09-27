@@ -1,9 +1,10 @@
 /**
  * Static model definitions and upstream routing catalogs for pi-freeflow
  *
- * Defines the 27 verified free models:
- * - 8 OpenCode Zen models (2 Responses API + 5 Chat Completions + 1 Anthropic Messages)
+ * Defines the 33 verified free models:
+ * - 9 OpenCode Zen models (2 Responses API + 7 Chat Completions)
  * - 19 KiloCode Keyless Gateway models (18 OpenRouter format + 1 Standard format)
+ * - 5 Cline direct-only models (per-user pool)
  */
 
 import type { ModelDef, ThinkingLevelMap, Upstream } from "./types.ts";
@@ -13,141 +14,161 @@ import type { ModelDef, ThinkingLevelMap, Upstream } from "./types.ts";
  * Endpoint: https://opencode.ai/zen/v1
  */
 export const OPENCODE_MODELS: ModelDef[] = [
-	{
-		id: "muse-spark-1.2-contributor-free",
-		name: "Muse Spark 1.2 (1M)",
-		reasoning: true,
-		contextWindow: 1_048_576,
-		maxTokens: 131_072,
-		api: "openai-responses",
-		input: ["text", "image"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: "minimal",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: null,},
-	},
-	{
-		id: "muse-spark-1.3-contributor-free",
-		name: "Muse Spark 1.3 (1M)",
-		reasoning: true,
-		contextWindow: 1_048_576,
-		maxTokens: 131_072,
-		api: "openai-responses",
-		input: ["text", "image"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: "minimal",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: null,},
-	},
-	{
-		id: "mimo-v2.5-free",
-		name: "MiMo V2.5 (1M)",
-		reasoning: true,
-		contextWindow: 1_048_576,
-		maxTokens: 131_072,
-		input: ["text", "image"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: "low",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "high",
-			max: null,},
-	},
-	{
-		id: "nemotron-3-ultra-free",
-		name: "Nemotron 3 Ultra (1M)",
-		reasoning: true,
-		contextWindow: 1_000_000,
-		maxTokens: 128_000,
-		input: ["text"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: "minimal",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: null,},
-	},
-	{
-		id: "nemotron-3.5-lightning-free",
-		name: "Nemotron 3.5 Lightning (1M)",
-		reasoning: true,
-		contextWindow: 1_000_000,
-		maxTokens: 262_144,
-		input: ["text"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: "minimal",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: null,},
-	},
-	{
-		id: "big-pickle",
-		name: "Big Pickle",
-		reasoning: true,
-		contextWindow: 200_000,
-		maxTokens: 32_000,
-		input: ["text"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: null,
-			low: null,
-			medium: null,
-			high: "high",
-			xhigh: null,
-			max: "max",},
-	},
-	{
-		id: "ling-3.0-flash-fin-free",
-		name: "Ling 3.0 Flash Fin (256K)",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 131_072,
-		input: ["text"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: "minimal",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: null,},
-	},
-	{
-		id: "union-alpha",
-		name: "Union Alpha Free",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 131_072,
-		api: "anthropic-messages",
-		input: ["text", "image"],
-		// Effort wire values verified live 2026-09-17: POST /zen/v1/messages
-		// with output_config.effort returns 200 for low/high/xhigh, 503 for
-		// max. Passed through verbatim so the picker exposes exactly the
-		// levels upstream serves (minimal/medium hidden, unprobed).
-		thinkingLevelMap: {
-			off: null,
-			minimal: null,
-			low: "low",
-			medium: null,
-			high: "high",
-			xhigh: "xhigh",
-			max: null,},
-		},
+ {
+  id: "muse-spark-1.2-contributor-free",
+  name: "Muse Spark 1.2 (1M) [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 131_072,
+  api: "openai-responses",
+  input: ["text", "image"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "minimal",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: null,
+  },
+ },
+ {
+  id: "muse-spark-1.3-contributor-free",
+  name: "Muse Spark 1.3 (1M) [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 131_072,
+  api: "openai-responses",
+  input: ["text", "image"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "minimal",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: null,
+  },
+ },
+ {
+  id: "mimo-v2.5-free",
+  name: "MiMo V2.5 (1M) [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 131_072,
+  input: ["text", "image"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "low",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "high",
+   max: null,
+  },
+ },
+ {
+  id: "mimo-v2.6-flash-free",
+  name: "MiMo V2.6 Flash (1M) [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 131_072,
+  input: ["text", "image"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "low",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "high",
+   max: null,
+  },
+ },
+ {
+  id: "nemotron-3-ultra-free",
+  name: "Nemotron 3 Ultra (1M) [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_000_000,
+  maxTokens: 128_000,
+  input: ["text"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "minimal",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: null,
+  },
+ },
+ {
+  id: "nemotron-3.5-lightning-free",
+  name: "Nemotron 3.5 Lightning (1M) [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_000_000,
+  maxTokens: 262_144,
+  input: ["text"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "minimal",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: null,
+  },
+ },
+ {
+  id: "big-pickle",
+  name: "Big Pickle [OpenCode]",
+  reasoning: true,
+  contextWindow: 200_000,
+  maxTokens: 32_000,
+  input: ["text"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: null,
+   low: null,
+   medium: null,
+   high: "high",
+   xhigh: null,
+   max: "max",
+  },
+ },
+ {
+  id: "ling-3.0-flash-fin-free",
+  name: "Ling 3.0 Flash Fin (256K) [OpenCode]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 131_072,
+  input: ["text"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "minimal",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: null,
+  },
+ },
+ {
+  id: "space-bunny-free",
+  name: "Space Bunny Free (1M) [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 524_288,
+  input: ["text", "image"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: null,
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: "max",
+  },
+ },
 ];
 
 /**
@@ -158,208 +179,305 @@ export const OPENCODE_MODELS: ModelDef[] = [
  * host guessing) and matches the OpenCode-model pattern.
  */
 const KILO_REASONING_MAP: ThinkingLevelMap = {
-	off: null,
-	minimal: "minimal",
-	low: "low",
-	medium: "medium",
-	high: "high",
-	xhigh: "xhigh",
-	max: null,
+ off: null,
+ minimal: "minimal",
+ low: "low",
+ medium: "medium",
+ high: "high",
+ xhigh: "xhigh",
+ max: null,
 };
 
 /**
  * KiloCode Gateway free models (keyless — https://kilo.ai/docs/gateway).
- * Endpoint: https://api.kilo.ai/api/gateway/chat/completions
  */
 export const KILO_MODELS: ModelDef[] = [
-	{
-		id: "dots-studio/dots-3-note-preview:free",
-		name: "Dots3-Note Preview (512K)",
-		reasoning: true,
-		contextWindow: 512_000,
-		maxTokens: 512_000,
-		input: ["text", "image"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "stepfun/step-3.7-flash:free",
-		name: "Step 3.7 Flash",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 262_144,
-		input: ["text", "image"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-		name: "Nemotron 3 Nano Omni",
-		reasoning: true,
-		contextWindow: 256_000,
-		maxTokens: 131_072,
-		input: ["text", "image"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "nvidia/nemotron-3-ultra-550b-a55b:free",
-		name: "Nemotron 3 Ultra 550B (1M)",
-		reasoning: true,
-		contextWindow: 1_000_000,
-		maxTokens: 128_000,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "nvidia/nemotron-3.5-lightning:free",
-		name: "Nemotron 3.5 Lightning (Kilo)",
-		reasoning: true,
-		contextWindow: 1_000_000,
-		maxTokens: 262_144,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "nvidia/nemotron-3-super-120b-a12b:free",
-		name: "Nemotron 3 Super 120B",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 262_144,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "cohere/north-mini-code:free",
-		name: "North Mini Code",
-		reasoning: true,
-		contextWindow: 256_000,
-		maxTokens: 64_000,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "poolside/laguna-s-2.1:free",
-		name: "Laguna S 2.1 (Kilo)",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 32_768,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "poolside/laguna-xs-2.1:free",
-		name: "Laguna XS 2.1",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 32_768,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "liquid/lfm-2.5-2.6b:free",
-		name: "Liquid LFM 2.5",
-		reasoning: true,
-		contextWindow: 65_536,
-		maxTokens: 32_768,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "kilo-auto/free",
-		name: "Kilo Auto",
-		reasoning: true,
-		contextWindow: 256_000,
-		maxTokens: 10_000,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "openrouter/free",
-		name: "OpenRouter Auto",
-		reasoning: true,
-		contextWindow: 200_000,
-		maxTokens: 65_536,
-		input: ["text", "image"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "nvidia/nemotron-3.5-content-safety:free",
-		name: "Nemotron Content Safety",
-		reasoning: false,
-		contextWindow: 128_000,
-		maxTokens: 8_192,
-		input: ["text", "image"],
-	},
-{
-	id: "inclusionai/ling-3.0-flash-fin:free",
-	name: "Ling 3.0 Flash Fin",
-	reasoning: true,
-	contextWindow: 262_144,
-	maxTokens: 32_768,
-	input: ["text"],
-	thinkingFormat: "openrouter",
-	thinkingLevelMap: KILO_REASONING_MAP,
-},
-{
-	id: "nex-agi/nex-n2.5-pro:free",
-	name: "Nex N2.5 Pro",
-	reasoning: true,
-	contextWindow: 262_144,
-	maxTokens: 235_929,
-	input: ["text", "image"],
-	thinkingFormat: "openrouter",
-	thinkingLevelMap: KILO_REASONING_MAP,
-},
-{
-	id: "nex-agi/nex-n2.5-mini:free",
-	name: "Nex N2.5 Mini",
-	reasoning: true,
-	contextWindow: 262_144,
-	maxTokens: 235_929,
-	input: ["text", "image"],
-	thinkingFormat: "openrouter",
-	thinkingLevelMap: KILO_REASONING_MAP,
-},
-{
-	id: "thinkingmachines/inkling-small:free",
-	name: "Inkling Small (1M)",
-	reasoning: true,
-	contextWindow: 1_048_576,
-	maxTokens: 262_144,
-	input: ["text", "image"],
-	thinkingFormat: "openrouter",
-	thinkingLevelMap: KILO_REASONING_MAP,
-},
-	{
-		id: "inclusionai/ling-3.0-flash-sante:free",
-		name: "Ling 3.0 Flash Sante",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 32_768,
-		input: ["text"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
-	{
-		id: "inclusionai/ling-3.0-flash-vl:free",
-		name: "Ling 3.0 Flash VL",
-		reasoning: true,
-		contextWindow: 262_144,
-		maxTokens: 32_768,
-		input: ["text", "image"],
-		thinkingFormat: "openrouter",
-		thinkingLevelMap: KILO_REASONING_MAP,
-	},
+ {
+  id: "dots-studio/dots-3-note-preview:free",
+  name: "Dots3-Note Preview (512K) [Kilo]",
+  reasoning: true,
+  contextWindow: 512_000,
+  maxTokens: 512_000,
+  input: ["text", "image"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+  name: "Nemotron 3 Nano Omni [Kilo]",
+  reasoning: true,
+  contextWindow: 256_000,
+  maxTokens: 131_072,
+  input: ["text", "image"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+  name: "Nemotron 3 Ultra 550B (1M) [Kilo]",
+  reasoning: true,
+  contextWindow: 1_000_000,
+  maxTokens: 128_000,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "nvidia/nemotron-3.5-lightning:free",
+  name: "Nemotron 3.5 Lightning [Kilo]",
+  reasoning: true,
+  contextWindow: 1_000_000,
+  maxTokens: 262_144,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "nvidia/nemotron-3-super-120b-a12b:free",
+  name: "Nemotron 3 Super 120B [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 262_144,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "cohere/north-mini-code:free",
+  name: "North Mini Code [Kilo]",
+  reasoning: true,
+  contextWindow: 256_000,
+  maxTokens: 64_000,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "poolside/laguna-s-2.1:free",
+  name: "Laguna S 2.1 [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 32_768,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "poolside/laguna-xs-2.1:free",
+  name: "Laguna XS 2.1 [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 32_768,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "liquid/lfm-2.5-2.6b:free",
+  name: "Liquid LFM 2.5 [Kilo]",
+  reasoning: true,
+  contextWindow: 65_536,
+  maxTokens: 32_768,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "kilo-auto/free",
+  name: "Kilo Auto [Kilo]",
+  reasoning: true,
+  contextWindow: 256_000,
+  maxTokens: 10_000,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "openrouter/free",
+  name: "OpenRouter Auto [Kilo]",
+  reasoning: true,
+  contextWindow: 200_000,
+  maxTokens: 65_536,
+  input: ["text", "image"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "nvidia/nemotron-3.5-content-safety:free",
+  name: "Nemotron Content Safety [Kilo]",
+  reasoning: false,
+  contextWindow: 128_000,
+  maxTokens: 8_192,
+  input: ["text", "image"],
+ },
+ {
+  id: "inclusionai/ling-3.0-flash-fin:free",
+  name: "Ling 3.0 Flash Fin [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 32_768,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "nex-agi/nex-n2.5-pro:free",
+  name: "Nex N2.5 Pro [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 235_929,
+  input: ["text", "image"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "nex-agi/nex-n2.5-mini:free",
+  name: "Nex N2.5 Mini [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 235_929,
+  input: ["text", "image"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "thinkingmachines/inkling-small:free",
+  name: "Inkling Small (1M) [Kilo]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 262_144,
+  input: ["text", "image"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "inclusionai/ling-3.0-flash-sante:free",
+  name: "Ling 3.0 Flash Sante [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 32_768,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "qwen/qwen3.8-27b:free",
+  name: "Qwen 3.8 27B [Kilo]",
+  reasoning: true,
+  contextWindow: 262_144,
+  maxTokens: 235_929,
+  input: ["text", "image"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+ {
+  id: "z-ai/glm-5.2:free",
+  name: "GLM 5.2 [Kilo]",
+  reasoning: true,
+  contextWindow: 32_768,
+  maxTokens: 29_491,
+  input: ["text"],
+  thinkingFormat: "openrouter",
+  thinkingLevelMap: KILO_REASONING_MAP,
+ },
+];
+
+/**
+ * Full-range effort map (Solar Pro 4 — reference lists none..max; off stays
+ * null per repo convention). The proxy passes effort through verbatim and
+ * upstream serves the levels it supports.
+ */
+const CLINE_REASONING_MAP: ThinkingLevelMap = {
+ off: null,
+ minimal: "minimal",
+ low: "low",
+ medium: "medium",
+ high: "high",
+ xhigh: "xhigh",
+ max: "max",
+};
+/**
+ * Narrow effort map for DeepSeek V4 Flash + GLM Flash + Kimi K3 — reference
+ * reasoningOptions list effort values [low, high, max] only (no toggle
+ * on GLM); minimal/medium/xhigh are not offered so the host never sends
+ * an unsupported level (the proxy forwards effort verbatim).
+ */
+const CLINE_FLASH_REASONING_MAP: ThinkingLevelMap = {
+ off: null,
+ minimal: null,
+ low: "low",
+ medium: null,
+ high: "high",
+ xhigh: null,
+ max: "max",
+};
+
+/**
+ * Cline free models (per-user local pool — https://api.cline.bot).
+ * Direct-only: never served through the relay pool. IDs are Cline-native
+ * and collision-free against the OpenCode/Kilo catalogs (the Kilo-routed
+ * poolside/laguna-s-2.1:free is intentionally NOT duplicated here).
+ * Endpoint: https://api.cline.bot/api/v1/chat/completions
+ */
+export const CLINE_MODELS: ModelDef[] = [
+ {
+  id: "cline-free/deepseek-v4.1-flash",
+  name: "DeepSeek V4.1 Flash [Cline]",
+  reasoning: true,
+  contextWindow: 1_000_000,
+  maxTokens: 384_000,
+  input: ["text", "image"],
+  thinkingLevelMap: CLINE_FLASH_REASONING_MAP,
+ },
+ {
+  id: "cline-free/muse-spark-1.3-contributor",
+  name: "Muse Spark 1.3 (1M) [Cline]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 131_072,
+  api: "openai-responses",
+  input: ["text", "image"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "minimal",
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: null,
+  },
+ },
+ {
+  id: "z-ai/glm-5.3-flash",
+  name: "GLM 5.3 Flash [Cline]",
+  reasoning: true,
+  contextWindow: 1_000_000,
+  maxTokens: 131_072,
+  input: ["text", "image"],
+  thinkingLevelMap: CLINE_FLASH_REASONING_MAP,
+ },
+ {
+  // Cline advertises this sixth free model only to its desktop client
+  // identity (see CLINE_CLIENT_HEADERS). Specs follow the vendored Cline
+  // catalog; maxTokens keeps the tighter chat value so a request can never
+  // overrun what the chat endpoint accepts.
+  id: "cline-free/kimi-k3",
+  name: "Kimi K3 [Cline]",
+  reasoning: true,
+  contextWindow: 1_048_576,
+  maxTokens: 131_072,
+  input: ["text", "image"],
+  thinkingLevelMap: CLINE_FLASH_REASONING_MAP,
+ },
+ {
+  id: "cline-free/solar-pro4",
+  name: "Solar Pro4 [Cline]",
+  reasoning: true,
+  contextWindow: 524_288,
+  maxTokens: 131_072,
+  input: ["text"],
+  thinkingLevelMap: CLINE_REASONING_MAP,
+ },
 ];
 
 /**
@@ -370,69 +488,81 @@ export const KILO_MODELS: ModelDef[] = [
  * - Hy3 = Tencent Hunyuan (not Alibaba Qwen) → removed qwen3-coder alias
  */
 export const MODEL_ALIASES: Record<string, string> = {
-	"dots-3-note-preview": "dots-studio/dots-3-note-preview:free",
-	"step-3.7-flash": "stepfun/step-3.7-flash:free",
-	"nemotron-3-nano-omni": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-	"nemotron-3-ultra-550b": "nvidia/nemotron-3-ultra-550b-a55b:free",
-	"nemotron-3.5-lightning": "nvidia/nemotron-3.5-lightning:free",
-	"nemotron-3-super": "nvidia/nemotron-3-super-120b-a12b:free",
-	"north-mini-code": "cohere/north-mini-code:free",
-	"lfm-2.5": "liquid/lfm-2.5-2.6b:free",
-	"content-safety": "nvidia/nemotron-3.5-content-safety:free",
-	"ling-3.0-flash-fin": "inclusionai/ling-3.0-flash-fin:free",
-	"ling-3.0-flash-sante": "inclusionai/ling-3.0-flash-sante:free",
-	"ling-3.0-flash-vl": "inclusionai/ling-3.0-flash-vl:free",
-	"nex-n2.5-pro": "nex-agi/nex-n2.5-pro:free",
-	"nex-n2.5-mini": "nex-agi/nex-n2.5-mini:free",
-	"inkling-small": "thinkingmachines/inkling-small:free",
-	// provider-prefixed short aliases (slash-normalized)
-	"laguna-s-2.1:free": "poolside/laguna-s-2.1:free",
-	"laguna-xs-2.1:free": "poolside/laguna-xs-2.1:free",
-	"kilo-auto": "kilo-auto/free",
-	"openrouter": "openrouter/free",
+ "dots-3-note-preview": "dots-studio/dots-3-note-preview:free",
+ "nemotron-3-nano-omni": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+ "nemotron-3-ultra-550b": "nvidia/nemotron-3-ultra-550b-a55b:free",
+ "nemotron-3.5-lightning": "nvidia/nemotron-3.5-lightning:free",
+ "nemotron-3-super": "nvidia/nemotron-3-super-120b-a12b:free",
+ "north-mini-code": "cohere/north-mini-code:free",
+ "lfm-2.5": "liquid/lfm-2.5-2.6b:free",
+ "content-safety": "nvidia/nemotron-3.5-content-safety:free",
+ "ling-3.0-flash-fin": "inclusionai/ling-3.0-flash-fin:free",
+ "ling-3.0-flash-sante": "inclusionai/ling-3.0-flash-sante:free",
+ "nex-n2.5-pro": "nex-agi/nex-n2.5-pro:free",
+ "nex-n2.5-mini": "nex-agi/nex-n2.5-mini:free",
+ "inkling-small": "thinkingmachines/inkling-small:free",
+ "mimo-v2.6-flash": "mimo-v2.6-flash-free",
+ "space-bunny": "space-bunny-free",
+ "qwen3.8-27b": "qwen/qwen3.8-27b:free",
+ "glm-5.2": "z-ai/glm-5.2:free",
+ // provider-prefixed short aliases (slash-normalized)
+ "laguna-s-2.1:free": "poolside/laguna-s-2.1:free",
+ "laguna-xs-2.1:free": "poolside/laguna-xs-2.1:free",
+ "kilo-auto": "kilo-auto/free",
+ "openrouter": "openrouter/free",
 };
 
 /**
  * Resolve any model alias to its canonical upstream model ID.
  */
 export function resolveCanonicalModelId(id: string): string {
-	const clean = (id || "").trim();
-	return MODEL_ALIASES[clean] || clean;
+ const clean = (id || "").trim();
+ return MODEL_ALIASES[clean] || clean;
 }
 /**
  * Set of all KiloCode model IDs (including aliases) for fast lookup
  */
 export const KILO_MODEL_IDS = new Set<string>([
-	...KILO_MODELS.map((m) => m.id),
-	...Object.entries(MODEL_ALIASES)
-		.filter(([_, target]) => KILO_MODELS.some((km) => km.id === target))
-		.map(([alias]) => alias),
+ ...KILO_MODELS.map((m) => m.id),
+ ...Object.entries(MODEL_ALIASES)
+  .filter(([_, target]) => KILO_MODELS.some((km) => km.id === target))
+  .map(([alias]) => alias),
 ]);
 
 /**
- * Combined list of all 27 static free models (canonical)
+ * Set of all Cline model IDs (including aliases) for fast lookup
  */
-export const ALL_MODELS: ModelDef[] = [...OPENCODE_MODELS, ...KILO_MODELS];
+export const CLINE_MODEL_IDS = new Set<string>([
+ ...CLINE_MODELS.map((m) => m.id),
+ ...Object.entries(MODEL_ALIASES)
+  .filter(([_, target]) => CLINE_MODELS.some((cm) => cm.id === target))
+  .map(([alias]) => alias),
+]);
+
+/**
+ * Combined list of all 33 static free models (canonical)
+ */
+export const ALL_MODELS: ModelDef[] = [...OPENCODE_MODELS, ...KILO_MODELS, ...CLINE_MODELS];
 
 /**
  * Map of model ID -> ModelDef
  */
 export const MODEL_MAP = new Map<string, ModelDef>(
-	ALL_MODELS.map((m): [string, ModelDef] => [m.id, m]),
+ ALL_MODELS.map((m): [string, ModelDef] => [m.id, m]),
 );
 
 /**
  * Get full list of registered canonical models for Pi/OMP provider registration
  */
 export function getAllRegisteredModels(): ModelDef[] {
-	return ALL_MODELS;
+ return ALL_MODELS;
 }
 
 /**
  * Lookup a model definition by ID (supporting alias fallback)
  */
 export function getModelDef(id: string): ModelDef | undefined {
-	return MODEL_MAP.get(id) || MODEL_MAP.get(resolveCanonicalModelId(id));
+ return MODEL_MAP.get(id) || MODEL_MAP.get(resolveCanonicalModelId(id));
 }
 
 
@@ -440,13 +570,22 @@ export function getModelDef(id: string): ModelDef | undefined {
  * Check if a model ID belongs to KiloCode Gateway
  */
 export function isKiloModel(id: string): boolean {
-	const canonical = resolveCanonicalModelId(id);
-	return KILO_MODEL_IDS.has(id) || KILO_MODEL_IDS.has(canonical);
+ const canonical = resolveCanonicalModelId(id);
+ return KILO_MODEL_IDS.has(id) || KILO_MODEL_IDS.has(canonical);
+}
+
+/**
+ * Check if a model ID belongs to Cline
+ */
+export function isClineModel(id: string): boolean {
+ const canonical = resolveCanonicalModelId(id);
+ return CLINE_MODEL_IDS.has(id) || CLINE_MODEL_IDS.has(canonical);
 }
 
 /**
  * Determine the upstream provider for a given model ID
  */
 export function getModelUpstream(id: string): Upstream {
-	return isKiloModel(id) ? "kilo" : "opencode";
+ if (isClineModel(id)) return "cline";
+ return isKiloModel(id) ? "kilo" : "opencode";
 }

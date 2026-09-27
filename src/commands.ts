@@ -58,6 +58,10 @@ import {
  formatRelayPickerItem,
  formatRelayStatusLabel,
 } from "./relay-state.ts";
+import { addAccount, findClineAccountSlot, loadPool, redactedToken, removeAccount } from "./cline-accounts.ts";
+import type { ClinePoolState } from "./cline-accounts.ts";
+import { CLINE_BROWSER_SIGNOUT_URL, pollDeviceToken, registerClineToken, startDeviceAuth, toApiKey } from "./cline-device-auth.ts";
+import { isCertError } from "./system-ca-fetch.ts";
 import type {
  ExtensionAPI,
  ExtensionContext,
@@ -360,20 +364,165 @@ function startLogsFollow(
  logsFollowTimer.unref?.();
 }
 
+/**
+ * Pick the login slot when the user gives none: "default" for the first
+ * login, then the smallest free "slot-2", "slot-3", … — never overwriting
+ * a saved login. Pure — takes the pool, returns a name.
+ */
+function nextClineSlot(pool: ClinePoolState): string {
+ if (!pool.accounts.some((a) => a.slot === "default")) return "default";
+ let n = 2;
+ while (pool.accounts.some((a) => a.slot === `slot-${n}`)) n += 1;
+ return `slot-${n}`;
+}
+
+/**
+ * Per-slot usage row as persisted under pool.usage. Read defensively: pools
+ * saved before usage tracking existed carry no such field, so every property
+ * is narrowed at use. Never carries identity — callers map slot to identity.
+ */
+interface ClineUsageRow {
+ served: number;
+ lastAt: number;
+ lastModel: string;
+}
+
+/** Usage map off the pool without depending on the tracking lane's types. */
+function clineUsageRows(pool: ClinePoolState): Record<string, ClineUsageRow> {
+ const raw = (pool as unknown as { usage?: unknown }).usage;
+ if (!raw || typeof raw !== "object") return {};
+ const out: Record<string, ClineUsageRow> = {};
+ for (const [slot, entry] of Object.entries(raw as Record<string, unknown>)) {
+  if (!entry || typeof entry !== "object") continue;
+  const rec = entry as Record<string, unknown>;
+  if (typeof rec.served !== "number" || !(rec.served >= 0)) continue;
+  out[slot] = {
+   served: rec.served,
+   lastAt: typeof rec.lastAt === "number" ? rec.lastAt : 0,
+   lastModel: typeof rec.lastModel === "string" ? rec.lastModel : "",
+  };
+ }
+ return out;
+}
+
+/** Masked identity for NEW display text — the raw email never appears there. */
+function maskClineEmail(email: string): string {
+ const at = email.indexOf("@");
+ if (at <= 0) return "***";
+ const domain = email.slice(at + 1);
+ if (!domain) return "***";
+ return `${email[0]}***@${domain}`;
+}
+
+/** Relative age for a usage timestamp, ISO fallback for old/future values. */
+function clineUsageAge(lastAt: number, now = Date.now()): string {
+ if (!(lastAt > 0)) return "";
+ const diff = now - lastAt;
+ if (diff < 0) return new Date(lastAt).toISOString();
+ if (diff < 60_000) return "just now";
+ if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+ if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+ if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d ago`;
+ return new Date(lastAt).toISOString();
+}
+
+/** Usage suffix for one account line; zero-state reads `served 0 · never used`. */
+function formatClineUsageSuffix(slot: string, usage: Record<string, ClineUsageRow>, now = Date.now()): string {
+ const row = usage[slot];
+ if (!row || row.served <= 0) return " · served 0 · never used";
+ const age = clineUsageAge(row.lastAt, now);
+ const last = row.lastModel ? ` · last ${row.lastModel}${age ? ` ${age}` : ""}` : "";
+ return ` · served ${row.served}${last}`;
+}
+
+/**
+ * Compact Cline block for the status banner. Masked identity only — the raw
+ * email never appears here even though account lines still show it.
+ */
+function formatClineStatusSnippet(pool: ClinePoolState, now = Date.now()): string {
+ const n = pool.accounts.length;
+ if (!n) return "Cline: no logins";
+ const usage = clineUsageRows(pool);
+ let best: { slot: string; row: ClineUsageRow } | null = null;
+ for (const a of pool.accounts) {
+  const row = usage[a.slot];
+  if (!row || row.served <= 0) continue;
+  if (!best || row.lastAt > best.row.lastAt) best = { slot: a.slot, row };
+ }
+ if (!best) return `Cline: ${n} login(s) · never used`;
+ const account = pool.accounts.find((a) => a.slot === best.slot);
+ const who = account?.email ? maskClineEmail(account.email) : (account?.accountId || best.slot);
+ const model = best.row.lastModel ? ` (${best.row.lastModel})` : "";
+ return `Cline: ${n} login(s) · last used: [${best.slot}] ${who}${model}`;
+}
+
+/** One notify-ready line per saved login, in pool order, with usage. */
+function formatClineAccountLines(pool: ClinePoolState): string[] {
+ const usage = clineUsageRows(pool);
+ return pool.accounts.map((a, idx) => {
+  const star = a.slot === pool.activeSlot ? "*" : " ";
+  const who = a.email || a.accountId;
+  const whoPart = who ? ` ${who}` : "";
+  // Two slots on one account share one quota, so rotation between them buys
+  // nothing. Mark the later one against the earlier slot it duplicates.
+  const earlier = { accounts: pool.accounts.slice(0, idx) };
+  const dup = findClineAccountSlot(earlier, a);
+  const dupPart = dup ? ` — same account as [${dup}]` : "";
+  return `${star} [${idx + 1}] [${a.slot}]${whoPart} key ending ${redactedToken(a.token)}${dupPart}${formatClineUsageSuffix(a.slot, usage)}`;
+ });
+}
+/** User-safe one-line message for caught values (never echoes secrets). */
+function clineErrorMessage(e: unknown): string {
+ if (e instanceof Error && e.message) return e.message;
+ if (typeof e === "string" && e) return e;
+ return "unknown error";
+}
+
+/**
+ * Validate a user-supplied deploy project name before any network call.
+ * Mirrors the cleanup the deploy builders apply (lowercase, runs of
+ * non-[a-z0-9-] become one dash, edge dashes trimmed): a name with no usable
+ * characters would silently fall back to a generic worker name and likely
+ * collide, and an over-long Cloudflare/Deno name would silently truncate to
+ * something the user did not ask for. Pure: never touches disk or network.
+ */
+export function validateDeployProjectName(
+ raw: string,
+ platform: DeployPlatform,
+): { ok: true; name: string } | { ok: false; reason: string } {
+ const clean = (raw || "")
+  .toLowerCase()
+  .replace(/[^a-z0-9-]+/g, "-")
+  .replace(/-{2,}/g, "-")
+  .replace(/^-+|-+$/g, "");
+ if (!clean) {
+  return {
+   ok: false,
+   reason: `Project name '${(raw || "").trim()}' has no usable letters or numbers — use characters a-z, 0-9, '-'`,
+  };
+ }
+ const max = platform === "cloudflare" ? 58 : platform === "deno" ? 32 : 0;
+ if (max > 0 && clean.length > max) {
+  return {
+   ok: false,
+   reason: `Project name '${clean}' is ${clean.length} chars — ${platform === "cloudflare" ? "Cloudflare" : "Deno Deploy"} allows max ${max}. Shorten it and retry`,
+  };
+ }
+ return { ok: true, name: clean };
+}
 export function createCommandSpec(
  _pi: ExtensionAPI,
  onCatalogRefreshed?: (models: RegisteredModel[]) => void,
 ): Omit<RegisteredCommand, "name"> {
  return {
   description:
-   "Relay egress: auto | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update | deploy vercel | deploy cloudflare | deploy deno | install-startup | uninstall-startup",
+   "Relay egress: auto | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update | deploy vercel | deploy cloudflare | deploy deno | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot]",
   getArgumentCompletions: (prefix: string) =>
    [
     "auto",
     "on",
     "off",
     "hide",
-    "show",
     "widget hide",
     "widget show",
     "status",
@@ -394,6 +543,11 @@ export function createCommandSpec(
     "deploy deno",
     "install-startup",
     "uninstall-startup",
+    "cline",
+    "cline login",
+    "cline login --key",
+    "cline accounts",
+    "cline logout",
     "refresh",
     "models",
     "logs",
@@ -549,18 +703,29 @@ export function createCommandSpec(
      ctx.ui.notify("Deploy cancelled: no token", "warning");
      return;
     }
-    const name =
+    const entered =
      (
       await ctx.ui.input(
        "Project name (empty = auto):",
        defaultName,
       )
      )?.trim() || defaultName;
+    const nameCheck = validateDeployProjectName(entered, platform);
+    if (!nameCheck.ok) {
+     ctx.ui.notify(`Deploy cancelled: ${nameCheck.reason}`, "warning");
+     return;
+    }
+    const name = entered;
+    const cleanName = nameCheck.name;
+    // Never display a short token in full: its "last 4" would be the secret.
+    const tokenTail = token.length > 8 ? token.slice(-4) : "***";
 
     if (typeof ctx.ui.confirm === "function") {
      const ok = await ctx.ui.confirm(
       "Deploy relay",
-      `Deploy ${label} relay '${name}' using token ending ${token.slice(-4)}?`,
+      cleanName === name
+       ? `Deploy ${label} relay '${name}' using token ending ${tokenTail}?`
+       : `Deploy ${label} relay '${name}' (as '${cleanName}') using token ending ${tokenTail}?`,
      );
      if (!ok) {
       ctx.ui.notify("Deploy cancelled", "warning");
@@ -579,29 +744,53 @@ export function createCommandSpec(
      const { url, auth } = await deployer(token, name, (m) =>
       ctx.ui.notify(m, "info"),
      );
+     const finalUrl = url.trim().replace(/\/+$/, "");
      relayState = withRelayState((s) => {
-      const r = ensureRelay(s, url, `deployed ${name}`);
+      const prevLabel = s.relays.find((r) => r.url === finalUrl)?.label;
+      const r = ensureRelay(s, finalUrl, `deployed ${cleanName}`);
       if (auth) r.auth = auth;
       else delete r.auth;
+      // A re-deploy at an existing address refreshes the secret but keeps a
+      // user-chosen short name; only stock `deployed …` labels roll forward.
+      if (prevLabel && !prevLabel.startsWith("deployed ")) r.label = prevLabel;
       s.enabled = true;
-      s.url = url;
+      s.url = finalUrl;
       return s;
      });
      persist();
+     // saveRelayState swallows disk errors, so confirm the pool entry landed:
+     // otherwise a live deployment would silently vanish on the next restart.
+     let poolSaved = false;
+     try {
+      poolSaved = loadRelayState().relays.some((r) => r.url === finalUrl);
+     } catch {
+      poolSaved = false;
+     }
      let probeNote = "";
      try {
-      const probe = await probeRelay(url, auth);
+      const probe = await probeRelay(finalUrl, auth);
       probeNote = probe.ok
        ? ` ✓ reachable (HTTP ${probe.status}, ${probe.latencyMs}ms)`
-       : ` ⚠ deployed but unreachable (${probe.error || `HTTP ${probe.status}`}) — verify with /freeflow test`;
+       : ` ⚠ deployed but unreachable (${probe.error || `HTTP ${probe.status}`}) — run /freeflow test ${finalUrl} to retry, or /freeflow remove ${finalUrl} to drop it`;
      } catch {
       // probeRelay never throws, but keep the notify safe regardless
      }
-     ctx.ui.notify(`✓ Deployed & active: ${url}${probeNote}`, "info");
+     if (!poolSaved) {
+      const secretNote = auth
+       ? " Note: this relay uses a shared secret, so prefer redeploying if the re-added copy fails its probe."
+       : "";
+      ctx.ui.notify(`⚠ Relay is live at ${finalUrl} but NOT saved to the pool (disk write failed)${probeNote} — restore it with: /freeflow add ${finalUrl}.${secretNote}`, "error");
+      return;
+     }
+     ctx.ui.notify(`✓ Deployed & active: ${finalUrl}${probeNote}`, "info");
     } catch (e) {
      updateStatusBar(ctx.ui);
+     // Deploy errors echo upstream detail; never let the platform API token
+     // leak through a message that repeats what the server (or network) said.
+     const rawMsg = (e as Error).message;
+     const safeMsg = token.length >= 8 ? rawMsg.split(token).join("[redacted]") : rawMsg;
      ctx.ui.notify(
-      `Deploy failed: ${(e as Error).message}`,
+      `Deploy failed: ${safeMsg}`,
       "error",
      );
     }
@@ -947,7 +1136,8 @@ export function createCommandSpec(
        : `${u} open`;
      })
      .join(" | ");
-    ctx.ui.notify(`${modeLine} | ${poolLine}\n${stateFileLine}\nUpstream: ${upstreamLine}`, "info");
+    const clineLine = formatClineStatusSnippet(loadPool());
+    ctx.ui.notify(`${modeLine} | ${poolLine}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}`, "info");
    } else if (sub === "kill" || sub === "stop" || sub === "shutdown") {
     const port = getClientPort() || PORT;
     try {
@@ -1403,6 +1593,151 @@ export function createCommandSpec(
      ctx.ui.notify(`✓ ${shortRelayLabel(matched.url, relayState.relays)} ok (HTTP ${probe.status}, ${probe.latencyMs}ms)`, "info");
     } else {
      ctx.ui.notify(`✗ ${shortRelayLabel(matched.url, relayState.relays)} failed: ${probe.error || `HTTP ${probe.status}`}`, "error");
+    }
+   } else if (sub === "cline") {
+    const tokens = rest.trim() ? rest.trim().split(/\s+/) : [];
+    const action = (tokens[0] || "accounts").toLowerCase();
+    const arg = tokens.slice(1).join(" ").trim();
+    if (action === "login") {
+     const raw = tokens.slice(1);
+     const pasteMode = raw.some((t) => t === "--key");
+     const slotArg = raw.filter((t) => t !== "--key").join(" ").trim();
+     if (pasteMode) {
+      // Manual fallback: paste a workos: API key (never shown back).
+      const slot = slotArg || ((await ctx.ui.input("Cline slot name (empty = default):", "default"))?.trim() || "default");
+      const token = ((await ctx.ui.input(`Paste the API key for Cline slot [${slot}]:`, ""))?.trim() || "");
+      if (!token) {
+       ctx.ui.notify("Cancelled — no API key provided", "warning");
+      } else {
+       try {
+        addAccount(slot, token);
+        ctx.ui.notify(`Saved Cline login [${slot}] (key ending ${redactedToken(token)}) — free Cline models are ready to use`, "info");
+       } catch (e) {
+        ctx.ui.notify((e as Error).message, "warning");
+       }
+      }
+      return;
+     }
+     // Device login inside the extension: approve in the browser, no paste.
+     const slot = slotArg || nextClineSlot(loadPool());
+     let started;
+     try {
+      started = await startDeviceAuth();
+     } catch (e) {
+      if (isCertError(e)) {
+       ctx.ui.notify("Could not reach Cline: your antivirus or network proxy intercepts TLS and Node does not trust it. The login retries with your OS certificates automatically — if this persists, restart the host with NODE_USE_SYSTEM_CA=1 set, or point NODE_EXTRA_CA_CERTS at your proxy CA file.", "error");
+       return;
+      }
+      ctx.ui.notify(`Could not reach Cline to start login: ${clineErrorMessage(e)}`, "error");
+      return;
+     }
+     const link = started.verificationUriComplete ?? started.verificationUri;
+     const minutes = Math.max(1, Math.round(started.expiresIn / 60));
+     const loginLine = `Cline login [${slot}]\nOpen this link in your browser:\n${link}\nEnter code: ${started.userCode} (expires in ~${minutes} min)\nWaiting for approval — approve or cancel in the browser; this finishes on its own.\nDifferent account? Sign out first: ${CLINE_BROWSER_SIGNOUT_URL} (or use a private window)`;
+     ctx.ui.notify(loginLine, "info");
+     try { ctx.ui.setStatus("cline-login", `Cline login [${slot}] code ${started.userCode}`); } catch { }
+     const progress = setInterval(() => {
+      ctx.ui.notify(loginLine, "info");
+     }, 45000);
+     // @ts-ignore allow unref to not block process exit in CLI
+     progress.unref?.();
+     try {
+      const deviceTokens = await pollDeviceToken(undefined, started.deviceCode, started.interval, { maxWaitMs: Math.max(60_000, started.expiresIn * 1000) });
+      const creds = await registerClineToken(undefined, deviceTokens.accessToken, deviceTokens.refreshToken);
+      const apiKey = toApiKey(creds.access);
+      const dup = findClineAccountSlot(loadPool(), { token: apiKey, accountId: creds.accountId, email: creds.email }, slot);
+      if (dup) {
+       // Same account twice shares one free quota, so it would never add capacity.
+       ctx.ui.notify(
+        `That Cline account${creds.email ? ` (${creds.email})` : ""} is already saved as [${dup}] — nothing added.\nUse a different account: /freeflow cline signout shows the sign-out link. Or drop the existing one first: /freeflow cline logout ${dup}`,
+        "warning",
+       );
+       return;
+      }
+      addAccount(slot, apiKey, {
+       refreshToken: creds.refresh,
+       expiresAt: creds.expires,
+       ...(creds.accountId ? { accountId: creds.accountId } : {}),
+       ...(creds.email ? { email: creds.email } : {}),
+      });
+      ctx.ui.notify(`Saved Cline login [${slot}] (key ending ${redactedToken(apiKey)}) — free Cline models are ready to use`, "info");
+      const pool = loadPool();
+      ctx.ui.notify(`Cline logins (${pool.accounts.length}):\n${formatClineAccountLines(pool).join("\n")}`, "info");
+     } catch (e) {
+      let code: string | undefined;
+      if (e && typeof e === "object" && "errorCode" in e && typeof e.errorCode === "string") {
+       code = e.errorCode;
+      }
+      if (code === "access_denied") {
+       ctx.ui.notify("Cline login cancelled.", "warning");
+      } else if (code === "expired_token") {
+       ctx.ui.notify("Cline login code expired — run /freeflow cline login again for a fresh code.", "warning");
+      } else {
+       ctx.ui.notify(`Cline login did not finish: ${clineErrorMessage(e)}`, "warning");
+      }
+     } finally {
+      clearInterval(progress);
+      try { ctx.ui.setStatus("cline-login", undefined); } catch { }
+     }
+    } else if (action === "accounts" || action === "list") {
+     const pool = loadPool();
+     if (!pool.accounts.length) {
+      ctx.ui.notify("No Cline logins saved — add one with /freeflow cline login", "info");
+     } else {
+      ctx.ui.notify(`Cline logins (${pool.accounts.length}):\n${formatClineAccountLines(pool).join("\n")}`, "info");
+     }
+    } else if (action === "logout" || action === "remove") {
+     const pool = loadPool();
+     if (!pool.accounts.length) {
+      ctx.ui.notify("No Cline logins saved — nothing to remove", "info");
+     } else {
+      const resolveSlot = (raw: string): string | null => {
+       const clean = (raw || "").trim();
+       if (!clean) return null;
+       const byIndex = Number.parseInt(clean, 10);
+       if (String(byIndex) === clean && byIndex >= 1 && byIndex <= pool.accounts.length) return pool.accounts[byIndex - 1].slot;
+       const exact = pool.accounts.find((a) => a.slot === clean);
+       if (exact) return exact.slot;
+       const folded = pool.accounts.find((a) => a.slot.toLowerCase() === clean.toLowerCase());
+       return folded ? folded.slot : null;
+      };
+      let slot = resolveSlot(arg);
+      if (arg && !slot) {
+       const saved = pool.accounts.map((a, idx) => `${idx + 1}=${a.slot}`).join(", ");
+       ctx.ui.notify(`Cline slot '${arg}' not found. Saved: ${saved}`, "warning");
+      } else {
+       if (!slot) {
+        if (pool.accounts.length === 1) {
+         slot = pool.accounts[0].slot;
+        } else {
+         const opts = formatClineAccountLines(pool);
+         const choice = await ctx.ui.select("Remove Cline login", [...opts, "Cancel"]);
+         if (!choice || choice === "Cancel") {
+          ctx.ui.notify("Cancelled — no slot removed", "warning");
+          return;
+         }
+         const hit = pool.accounts.find((a, idx) => opts[idx] === choice);
+         slot = hit ? hit.slot : null;
+        }
+       }
+       if (!slot) {
+        ctx.ui.notify("Cancelled — no slot removed", "warning");
+       } else if (!removeAccount(slot)) {
+        ctx.ui.notify(`Cline slot '${slot}' not found`, "warning");
+       } else {
+        ctx.ui.notify(`Removed Cline login [${slot}]`, "info");
+       }
+      }
+     }
+    } else if (action === "signout" || action === "sign-out" || action === "switch") {
+     // Signing out is a browser action; it never touches saved logins here.
+     const saved = loadPool().accounts.length;
+     ctx.ui.notify(
+      `Sign out of Cline in your browser to use a different account:\n${CLINE_BROWSER_SIGNOUT_URL}\nA private window works too, and keeps your current session.\nThen run /freeflow cline login again — each login gets its own slot (${saved ? `you have ${saved}; next is ` : "next is "}${nextClineSlot(loadPool())}).`,
+      "info",
+     );
+    } else {
+     ctx.ui.notify("Usage: /freeflow cline login [--key] [slot] | /freeflow cline accounts | /freeflow cline logout [slot] | /freeflow cline signout", "warning");
     }
    } else if (sub === "export") {
     const tokens = rest.trim() ? tokenizeArgs(rest.trim()) : [];

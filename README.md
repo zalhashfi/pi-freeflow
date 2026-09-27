@@ -1,6 +1,6 @@
 # pi-freeflow
 
-> 27 free models with up to 1M context. No API keys to manage. Add your own relays to spread requests across more IPs.
+> 33 free models with up to 1M context. No API keys to manage. Add your own relays to spread requests across more IPs.
 
 Thin by design: a model list, a relay proxy, and a log. The host (`pi-ai`) handles thinking, normalization, and provider behavior.
 
@@ -16,7 +16,7 @@ Thin by design: a model list, a relay proxy, and a log. The host (`pi-ai`) handl
 
 | Feature | What it does | Cost |
 | :--- | :--- | :--- |
-| **27 free models** | 8 from OpenCode Zen, 19 from KiloCode Gateway, context windows up to 1M. Full list below. | **$0** |
+| **33 free models** | 9 from OpenCode Zen, 19 from KiloCode Gateway, 5 from Cline, context windows up to 1M. Full list below. | **$0** |
 | **Relay pool** | Route requests through your own Cloudflare Workers and Vercel Edge relays. Requests rotate across the pool. A relay that rate-limits, times out, or drops the connection cools down while healthy ones take its traffic. | **$0** beyond your platforms' free tiers |
 | **Automatic fallback** | When every relay is cooling down, requests go direct to upstream instead of failing. | **$0** |
 | **Short model names** | Every model has a slash-free, colon-free alias, plus an optional `:effort` suffix for thinking depth. You type `freeflow/<name>`. | **$0** |
@@ -54,7 +54,7 @@ omp
 **OMP, one shot:**
 ```bash
 omp -p --model freeflow/muse-spark-1.2-contributor-free "build me a SaaS"
-omp -p --model freeflow/step-3.7-flash:high "solve this bug"   # alias + thinking level
+omp -p --model freeflow/space-bunny:high "solve this bug"   # alias + thinking level
 ```
 
 **Pi, interactive:**
@@ -65,7 +65,7 @@ pi
 
 **Pi, one shot:**
 ```bash
-pi -p --model freeflow/step-3.7-flash:high "solve this bug"
+pi -p --model freeflow/space-bunny:high "solve this bug"
 ```
 
 Model IDs accept a full canonical ID, a short alias (see the tables below),
@@ -174,19 +174,23 @@ The same command set works identically in OMP and Pi:
 /freeflow update                  # Check for and install a package update
 /freeflow debug on | off          # Toggle full HTTP lifecycle debug logging
 /freeflow kill                    # Stop the shared proxy daemon now (restarts on next use)
+/freeflow cline login               # Sign in through the browser, save to the per-user pool
+/freeflow cline accounts            # List saved Cline logins
+/freeflow cline logout              # Remove a saved Cline login
+/freeflow cline signout             # Link to sign out of Cline in your browser (to add another account)
 /freeflow export [path] [--include-secrets]  # Save the relay pool to a file (default freeflow-relays.json; passwords left out unless asked)
 /freeflow import <path> [--merge|--replace] [--dry-run]  # Load a relay pool from a file (merge is default; replace asks first; dry-run previews only)
 ```
 
 ---
 
-### 27 models, one command
+### 33 models, one command
 
 ```bash
 /model → freeflow → pick
 ```
 
-#### OpenCode Zen (8 models), Responses, Chat, and Messages API
+#### OpenCode Zen (9 models), Responses and Chat API
 
 Good defaults for long coding sessions and agentic work.
 
@@ -195,11 +199,12 @@ Good defaults for long coding sessions and agentic work.
 | `muse-spark-1.2-contributor-free` | Meta Superintelligence Labs | **1M** (1.048.576) | **131K** (131.072) | `minimal … xhigh` | ✅ |
 | `muse-spark-1.3-contributor-free` | Meta Superintelligence Labs | **1M** (1.048.576) | **131K** (131.072) | `minimal … xhigh` | ✅ |
 | `mimo-v2.5-free` | Xiaomi MiMo | **1M** (1.048.576) | **131K** (131.072) | `minimal … xhigh`\* | ✅ |
+| `mimo-v2.6-flash-free` | Xiaomi MiMo | **1M** (1.048.576) | **131K** (131.072) | `minimal … xhigh`\* | ✅ |
 | `nemotron-3.5-lightning-free` | NVIDIA | **1M** (1.000.000) | **262K** (262.144) | `minimal … xhigh` | ❌ |
 | `nemotron-3-ultra-free` | NVIDIA | **1M** (1.000.000) | **128K** (128.000) | `minimal … xhigh` | ❌ |
 | `big-pickle` | Big Pickle | **200K** (200.000) | **32K** (32.000) | `high / max` | ❌ |
 | `ling-3.0-flash-fin-free` | Inclusion AI | **262K** (262.144) | **131K** (131.072) | `minimal … xhigh` | ❌ |
-| `union-alpha` | Union | **262K** (262.144) | **131K** (131.072) | — *(no effort levels)* | ✅ |
+| `space-bunny-free` | Stealth preview (lab undisclosed) | **1M** (1.048.576) | **512K** (524.288) | `low … max` | ✅ |
 
 #### KiloCode Gateway (19 models), OpenRouter compatible
 
@@ -208,7 +213,6 @@ Keyless access. Short aliases work for every row (the full ID is in parentheses)
 | Model ID | Creator / Lab | Context | Max Output | Thinking | Vision |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `dots-3-note-preview` (`dots-studio/...:free`) | Dots Studio | **512K** (512.000) | **512K** (512.000) | `minimal…xhigh`\* | ✅ |
-| `step-3.7-flash` (`stepfun/...:free`) | StepFun | **262K** (262.144) | **262K** (262.144) | `minimal…xhigh`\* | ✅ |
 | `nemotron-3-nano-omni` (`nvidia/...:free`) | NVIDIA | **256K** (256.000) | **131K** (131.072) | `minimal…xhigh`\* | ✅ |
 | `nemotron-3-ultra-550b` (`nvidia/...:free`) | NVIDIA | **1M** (1.000.000) | **128K** (128.000) | `minimal…xhigh`\* | ❌ |
 | `nvidia/nemotron-3.5-lightning:free` | NVIDIA | **1M** (1.000.000) | **262K** (262.144) | `minimal…xhigh`\* | ❌ |
@@ -224,10 +228,27 @@ Keyless access. Short aliases work for every row (the full ID is in parentheses)
 | `ling-3.0-flash-sante` (`inclusionai/ling-3.0-flash-sante:free`) | Inclusion AI | **262K** (262.144) | **32K** (32.768) | `minimal…xhigh`\* | ❌ |
 | `nex-n2.5-pro` (`nex-agi/nex-n2.5-pro:free`) | Nex AGI | **262K** (262.144) | **235K** (235.929) | `minimal…xhigh`\* | ✅ |
 | `nex-n2.5-mini` (`nex-agi/nex-n2.5-mini:free`) | Nex AGI | **262K** (262.144) | **235K** (235.929) | `minimal…xhigh`\* | ✅ |
-| `ling-3.0-flash-vl` (`inclusionai/ling-3.0-flash-vl:free`) | Inclusion AI | **262K** (262.144) | **32K** (32.768) | `minimal…xhigh`\* | ✅ |
 | `inkling-small` (`thinkingmachines/inkling-small:free`) | Thinking Machines | **1M** (1.048.576) | **262K** (262.144) | `minimal…xhigh`\* | ✅ |
+| `qwen3.8-27b` (`qwen/...:free`) | Alibaba Qwen | **262K** (262.144) | **235K** (235.929) | `minimal…xhigh`\* | ✅ |
+| `glm-5.2` (`z-ai/...:free`) | Zhipu AI | **32K** (32.768) | **29K** (29.491) | `minimal…xhigh`\* | ❌ |
 
 \* Levels are forwarded as-is through the OpenRouter-style nested `reasoning` parameter; effort mapping is decided by each model. MiMo collapses `minimal→low` and `xhigh→high` upstream, so its selector shows 5 labels but only 3 distinct effort values.
+
+#### Cline (5 models), OpenAI compatible
+
+Rotating per-account promo, direct only (never through the relay pool). Sign in through your browser with `/freeflow cline login`, manage with `/freeflow cline accounts` and `/freeflow cline logout`. Requests roll across saved logins when one hits its daily free limit.
+
+Add as many logins as you want — each one gets its own slot (`default`, `slot-2`, `slot-3`, …) and a request that hits a limit on one rolls straight to the next. To sign in with a different email, sign out of Cline in that browser first (`/freeflow cline signout` prints the link), or use a private window so your current session stays put.
+
+Each account can only be saved once: an extra login for an account you already have shares the same free quota, so it is refused rather than saved. If a pool already holds two logins for one account (saved before this check), `/freeflow cline accounts` marks the later one `— same account as [default]`, and `/freeflow cline logout <slot>` drops it.
+
+| Model ID | Creator / Lab | Context | Max Output | Thinking | Vision |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `cline-free/deepseek-v4.1-flash` | DeepSeek | **1M** (1.000.000) | **384K** (384.000) | `low/high/max` | ✅ |
+| `cline-free/muse-spark-1.3-contributor` | Meta Superintelligence Labs | **1M** (1.048.576) | **131K** (131.072) | `minimal…xhigh`\* | ✅ |
+| `z-ai/glm-5.3-flash` | Zhipu AI | **1M** (1.000.000) | **131K** (131.072) | `low/high/max` | ✅ |
+| `cline-free/kimi-k3` | Moonshot AI | **1M** (1.048.576) | **131K** (131.072) | `low/high/max` | ✅ |
+| `cline-free/solar-pro4` | Upstage | **512K** (524.288) | **131K** (131.072) | `minimal…max`\* | ❌ |
 
 ---
 
@@ -254,7 +275,7 @@ About 19k lines including tests. The full suite (sandboxed, network-mocked) and 
 ### FAQ
 
 **Do I need API keys?**
-No. Kilo uses a shared free credential and OpenCode free models need no header. You never paste a key.
+No. Kilo uses a shared free credential and OpenCode free models need no header. You never paste a key. Cline free models need a browser login instead: `/freeflow cline login` saves it to a per-user pool on your machine.
 
 **What if all relays hit rate limits?**
 The proxy tries direct upstream. If that is also rate-limited, the host shows the limit. That number is the shared upstream cap; without relays you would hit the same wall sooner.
@@ -322,7 +343,7 @@ pnpm smoke       # verifies extensions/index.ts loads without crashing
 ```
 src/
 ├── index.ts          # extension entry, lifecycle hooks
-├── models.ts         # 27-model catalog definitions
+├── models.ts         # 33-model catalog definitions
 ├── catalog.ts        # model catalog cache (24h disk)
 ├── proxy.ts          # local proxy server (127.0.0.1:28180)
 ├── relay.ts          # relay selection and round-robin

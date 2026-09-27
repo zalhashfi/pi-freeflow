@@ -1,0 +1,711 @@
+/**
+ * Unit tests for the per-user Cline key pool and /freeflow cline commands.
+ * All network use is mocked; the pool file lives in the test sandbox.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import {
+ _resetClinePoolCacheForTest,
+ CLINE_POOL_BACKUP_FILE,
+ CLINE_POOL_FILE,
+ addAccount,
+ loadPool,
+ mapClineError,
+ parseClineFreeLimit,
+ redactedToken,
+ removeAccount,
+ rollChat,
+ savePool,
+} from "../src/cline-accounts.ts";
+import { CLINE_BROWSER_SIGNOUT_URL } from "../src/cline-device-auth.ts";
+import { createCommandSpec } from "../src/commands.ts";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "../src/types.ts";
+
+const SLOT_A = "workos:test-key-aaa111";
+const SLOT_B = "workos:test-key-bbb222";
+
+/** Captured live 2026-09-22 from a saved login sitting on the daily free cap. */
+const LIVE_LIMIT_BODY =
+ '{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model deepseek/deepseek-v4.1-flash. Try again in 20h 4m"}}';
+/**
+ * The id this proxy asks Cline for. Cline names the model in a namespace of its
+ * own inside the 429 body, so only the requested id can key a later lookup.
+ */
+const MODEL = "cline-free/deepseek-v4.1-flash";
+const CAP_DELAY_MS = (20 * 60 + 4) * 60_000;
+
+async function withIsolatedPool(fn: () => Promise<void> | void): Promise<void> {
+ // Both the pool and its recovery copy: savePool snapshots the main file to
+ // .bak, so a helper that restores only the main file leaks test data into the
+ // next test and can resurrect its own fixtures.
+ const read = (p: string) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null);
+ const before = read(CLINE_POOL_FILE);
+ const beforeBak = read(CLINE_POOL_BACKUP_FILE);
+ const restore = (p: string, content: string | null) => {
+  if (content !== null) fs.writeFileSync(p, content, "utf8");
+  else {
+   try { fs.rmSync(p, { force: true }); } catch { }
+  }
+ };
+ try {
+  fs.rmSync(CLINE_POOL_FILE, { force: true });
+  fs.rmSync(CLINE_POOL_BACKUP_FILE, { force: true });
+ } catch { }
+ _resetClinePoolCacheForTest();
+ try {
+  await fn();
+ } finally {
+  _resetClinePoolCacheForTest();
+  restore(CLINE_POOL_FILE, before);
+  restore(CLINE_POOL_BACKUP_FILE, beforeBak);
+ }
+}
+
+function jsonResponse(status: number, body = "{}"): Response {
+ return new Response(body, { status, headers: { "content-type": "application/json" } });
+}
+
+test("cline pool: login saves and reloads a slot", async () => {
+ await withIsolatedPool(() => {
+  addAccount("main", SLOT_A);
+  _resetClinePoolCacheForTest();
+  const pool = loadPool();
+  assert.equal(pool.accounts.length, 1);
+  assert.equal(pool.accounts[0].slot, "main");
+  assert.equal(pool.accounts[0].token, SLOT_A);
+ });
+});
+
+test("cline pool: file is owner-only", async () => {
+ await withIsolatedPool(() => {
+  addAccount("main", SLOT_A);
+  if (process.platform === "win32") return;
+  const mode = fs.statSync(CLINE_POOL_FILE).mode & 0o777;
+  assert.equal(mode, 0o600);
+ });
+});
+
+test("cline pool: corrupt file reads back empty", async () => {
+ await withIsolatedPool(() => {
+  fs.writeFileSync(CLINE_POOL_FILE, "{not json", "utf8");
+  _resetClinePoolCacheForTest();
+  assert.deepEqual(loadPool().accounts, []);
+ });
+});
+
+test("cline pool: skips entries without a workos: key", async () => {
+ await withIsolatedPool(() => {
+  fs.writeFileSync(
+   CLINE_POOL_FILE,
+   JSON.stringify({ accounts: [{ slot: "bad", token: "sk-plain" }, { slot: "good", token: SLOT_A }] }),
+   "utf8",
+  );
+  _resetClinePoolCacheForTest();
+  const pool = loadPool();
+  assert.equal(pool.accounts.length, 1);
+  assert.equal(pool.accounts[0].slot, "good");
+ });
+});
+
+test("cline pool: non-workos token is rejected without echoing it", async () => {
+ await withIsolatedPool(() => {
+  assert.throws(() => addAccount("main", "sk-plain-secret"), (e: unknown) => {
+   assert.ok(!(e as Error).message.includes("sk-plain-secret"));
+   return true;
+  });
+ });
+});
+
+test("cline pool: remove drops one slot", async () => {
+ await withIsolatedPool(() => {
+  addAccount("a", SLOT_A);
+  addAccount("b", SLOT_B);
+  assert.equal(removeAccount("a"), true);
+  assert.equal(removeAccount("missing"), false);
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["b"]);
+ });
+});
+
+test("cline pool: redacted display leaks only the tail", () => {
+ assert.equal(redactedToken(SLOT_A), `…${SLOT_A.slice(-4)}`);
+ assert.ok(!redactedToken(SLOT_A).includes(SLOT_A.slice(0, -4)));
+});
+
+test("mapClineError: status to retryable kind", () => {
+ assert.equal(mapClineError(200), "ok");
+ assert.equal(mapClineError(401), "auth");
+ assert.equal(mapClineError(403), "auth");
+ assert.equal(mapClineError(429), "rate-limit");
+ assert.equal(mapClineError(402), "exhausted");
+ assert.equal(mapClineError(500), "server");
+ assert.equal(mapClineError(400), "client");
+});
+
+test("parseClineFreeLimit: reads the live daily-cap body", () => {
+ const now = Date.now();
+ const limit = parseClineFreeLimit(LIVE_LIMIT_BODY, now);
+ assert.ok(limit, "the live cap body must be recognised");
+ assert.equal(limit.modelId, "deepseek/deepseek-v4.1-flash");
+ assert.equal(limit.resetAt, now + CAP_DELAY_MS);
+});
+
+test("parseClineFreeLimit: minutes-only and bare-hour deltas", () => {
+ const now = 1_000_000;
+ assert.equal(
+  parseClineFreeLimit("Error 429: Daily free limit reached on model a/b. Try again in 35m", now)?.resetAt,
+  now + 35 * 60_000,
+ );
+ assert.equal(
+  parseClineFreeLimit("Error 429: Daily free limit reached on model a/b. Try again in 2", now)?.resetAt,
+  now + 2 * 3600_000,
+ );
+ assert.equal(
+  parseClineFreeLimit("Error 429: Daily free limit reached on model a/b. Try again in 1h 5m", now)?.resetAt,
+  now + 65 * 60_000,
+ );
+});
+
+test("parseClineFreeLimit: an ordinary 429 body is not a cap", () => {
+ assert.equal(parseClineFreeLimit('{"error":{"message":"Error 429: rate limited"}}'), null);
+ assert.equal(parseClineFreeLimit(""), null);
+});
+
+test("rollChat: rolls past a rate-limited slot to the next one", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A);
+  addAccount("b", SLOT_B);
+  const seen: string[] = [];
+  const res = await rollChat({
+   body: JSON.stringify({ model: "x", stream: true }),
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async (url: unknown, init: unknown) => {
+    const auth = new Headers((init as RequestInit).headers).get("authorization") ?? "";
+    seen.push(auth);
+    return auth.endsWith(SLOT_A.slice(-6)) ? jsonResponse(429) : jsonResponse(200, '{"ok":true}');
+   }) as typeof fetch,
+  });
+  assert.equal(res.slot, "b");
+  assert.equal(res.exhausted, false);
+  assert.equal(res.res.status, 200);
+  assert.ok(seen.every((h) => h.startsWith("Bearer workos:")));
+ });
+});
+
+test("rollChat: a chat attempt carries the Cline desktop client identity", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A);
+  const sent: Headers[] = [];
+  const res = await rollChat({
+   body: JSON.stringify({ model: "cline-free/kimi-k3", stream: true }),
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async (url: unknown, init: unknown) => {
+    sent.push(new Headers((init as RequestInit).headers));
+    return jsonResponse(200, '{"ok":true}');
+   }) as typeof fetch,
+  });
+  assert.equal(res.res.status, 200);
+  assert.equal(sent.length, 1, "one attempt must have reached Cline");
+  // The desktop identity is what makes Cline advertise its sixth free model.
+  assert.equal(sent[0].get("x-client-type"), "cline-desktop");
+ });
+});
+
+test("rollChat: all slots failing returns the last real failure", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A);
+  const res = await rollChat({
+   body: "{}",
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async () => jsonResponse(429)) as typeof fetch,
+  });
+  assert.equal(res.slot, "a");
+  assert.equal(res.exhausted, true);
+  assert.equal(res.res.status, 429);
+ });
+});
+
+test("rollChat: empty pool is exhausted with login guidance", async () => {
+ await withIsolatedPool(async () => {
+  let called = false;
+  const res = await rollChat({
+   body: "{}",
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async () => {
+    called = true;
+    return jsonResponse(200);
+   }) as typeof fetch,
+  });
+  assert.equal(called, false);
+  assert.equal(res.exhausted, true);
+  // Not a rate limit: hosts must not back off and hide the login guidance.
+  assert.equal(res.res.status, 401);
+  const text = await res.res.text();
+  assert.ok(text.includes("cline login"));
+ });
+});
+
+test("rollChat: a transient refresh fault still yields a readable upstream body", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A, { refreshToken: "refresh-a", expiresAt: Date.now() - 1000 });
+  const res = await rollChat({
+   body: "{}",
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   // The saved bearer is stale, the attempt comes back 401, and the refresh
+   // itself blows up: the slot's real 401 must survive to the caller intact.
+   fetchImpl: (async () => jsonResponse(401, '{"error":{"message":"token expired"}}')) as typeof fetch,
+   refreshImpl: async () => {
+    throw new Error("network down");
+   },
+  });
+  assert.equal(res.exhausted, true);
+  assert.equal(res.res.status, 401);
+  const body = await res.res.text();
+  assert.ok(body.includes("token expired"), `upstream body must survive, got ${JSON.stringify(body)}`);
+ });
+});
+
+test("rollChat: a refresh grant Cline rejects marks the slot dead, not transient", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A, { refreshToken: "refresh-a", expiresAt: Date.now() - 1000 });
+  let refreshes = 0;
+  const res = await rollChat({
+   body: "{}",
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async () => jsonResponse(401)) as typeof fetch,
+   refreshImpl: async () => {
+    refreshes += 1;
+    return null;
+   },
+  });
+  assert.equal(refreshes, 1, "a dead grant must not be retried within the same request");
+  assert.equal(res.exhausted, true);
+ });
+});
+
+test("rollChat: a caller error returns on the first slot without rolling", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A);
+  const res = await rollChat({
+   body: "{}",
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async () => jsonResponse(400)) as typeof fetch,
+  });
+  assert.equal(res.slot, "a");
+  assert.equal(res.kind, "client");
+ });
+});
+
+test("rollChat: a login capped for this model is tried last", async () => {
+ await withIsolatedPool(async () => {
+  const cap = Date.now() + 3600_000;
+  fs.writeFileSync(
+   CLINE_POOL_FILE,
+   JSON.stringify({
+    accounts: [
+     { slot: "a", token: SLOT_A, addedAt: new Date().toISOString() },
+     { slot: "b", token: SLOT_B, addedAt: new Date().toISOString() },
+    ],
+    activeSlot: "a",
+    limits: { a: { [MODEL]: cap } },
+   }),
+   "utf8",
+  );
+  _resetClinePoolCacheForTest();
+  const asked: string[] = [];
+  const res = await rollChat({
+   body: JSON.stringify({ model: MODEL, stream: true }),
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async (url: unknown, init: unknown) => {
+    asked.push(new Headers((init as RequestInit).headers).get("authorization") ?? "");
+    return jsonResponse(200, '{"ok":true}');
+   }) as typeof fetch,
+  });
+  // The active login is capped for this model, so the healthy one serves first.
+  assert.equal(res.slot, "b");
+  assert.deepEqual(asked, [`Bearer ${SLOT_B}`]);
+ });
+});
+
+test("rollChat: a capped login is still tried when nothing else serves", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A);
+  addAccount("b", SLOT_B);
+  const before = Date.now();
+  const asked: string[] = [];
+  const res = await rollChat({
+   body: JSON.stringify({ model: MODEL, stream: true }),
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async (url: unknown, init: unknown) => {
+    asked.push(new Headers((init as RequestInit).headers).get("authorization") ?? "");
+    return jsonResponse(429, LIVE_LIMIT_BODY);
+   }) as typeof fetch,
+  });
+  // A recorded cap only reorders the roll: a lifted cap must be discoverable.
+  assert.equal(asked.length, 2, "every saved login must still be attempted");
+  assert.equal(res.exhausted, true);
+  assert.equal(res.logins, 2);
+  assert.equal(res.limitOnly, true);
+  assert.ok(res.earliestResetAt !== null && res.earliestResetAt >= before + CAP_DELAY_MS - 1_000);
+  // Reading the 429 body to classify it must not consume the caller's copy.
+  const body = await res.res.text();
+  assert.ok(body.includes("Daily free limit reached"), `caller body must survive, got ${JSON.stringify(body)}`);
+  // Keyed by the id we requested, never by the name Cline put in its own body.
+  const doc = JSON.parse(fs.readFileSync(CLINE_POOL_FILE, "utf8"));
+  for (const slot of ["a", "b"]) {
+   const resetAt = doc.limits?.[slot]?.[MODEL];
+   assert.ok(typeof resetAt === "number", `slot ${slot} must record the cap under ${MODEL}`);
+   assert.ok(resetAt >= before + CAP_DELAY_MS - 1_000, `unexpected reset ${resetAt}`);
+  }
+ });
+});
+
+test("rollChat: an ordinary 429 is not reported as a cap", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A);
+  addAccount("b", SLOT_B);
+  const res = await rollChat({
+   body: JSON.stringify({ model: MODEL, stream: true }),
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async () => jsonResponse(429)) as typeof fetch,
+  });
+  assert.equal(res.logins, 2);
+  assert.equal(res.limitOnly, false);
+  assert.equal(res.earliestResetAt, null);
+  assert.equal(loadPool().limits, undefined);
+ });
+});
+
+test("rollChat: a login that refreshes before answering the cap still counts once", async () => {
+ await withIsolatedPool(async () => {
+  // No expiry, so the bearer is used as saved: the 401 arrives first and the
+  // refresh happens mid-attempt, which is the path that could double count.
+  addAccount("a", SLOT_A, { refreshToken: "refresh-a" });
+  addAccount("b", SLOT_B);
+  let refreshes = 0;
+  const res = await rollChat({
+   body: JSON.stringify({ model: MODEL, stream: true }),
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async (url: unknown, init: unknown) => {
+    const auth = new Headers((init as RequestInit).headers).get("authorization") ?? "";
+    // Slot a's saved bearer is rejected once; its refreshed bearer then answers
+    // the cap, exactly like the second login does.
+    return auth.endsWith(SLOT_A.slice(-6)) ? jsonResponse(401) : jsonResponse(429, LIVE_LIMIT_BODY);
+   }) as typeof fetch,
+   refreshImpl: async () => {
+    refreshes += 1;
+    return { token: `${SLOT_A}-refreshed` };
+   },
+  });
+  assert.equal(refreshes, 1, "the 401 path must have refreshed once");
+  assert.equal(res.exhausted, true);
+  assert.equal(res.logins, 2, "the hint may never name more logins than exist");
+  assert.equal(res.limitOnly, true, "both saved logins answered the cap");
+  assert.ok(res.earliestResetAt !== null);
+ });
+});
+
+test("cline pool: an expired cap is dropped on read", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("a", SLOT_A);
+  const capped = await rollChat({
+   body: JSON.stringify({ model: MODEL, stream: true }),
+   chatUrl: "https://api.cline.bot/api/v1/chat/completions",
+   fetchImpl: (async () => jsonResponse(429, LIVE_LIMIT_BODY)) as typeof fetch,
+  });
+  assert.equal(capped.limitOnly, true);
+  const doc = JSON.parse(fs.readFileSync(CLINE_POOL_FILE, "utf8"));
+  assert.ok(typeof doc.limits?.a?.[MODEL] === "number", "the cap must be persisted with its reset");
+  fs.writeFileSync(
+   CLINE_POOL_FILE,
+   JSON.stringify({
+    accounts: [{ slot: "a", token: SLOT_A, addedAt: new Date().toISOString() }],
+    limits: { a: { [MODEL]: Date.now() - 1 } },
+   }),
+   "utf8",
+  );
+  _resetClinePoolCacheForTest();
+  assert.equal(loadPool().limits, undefined);
+ });
+});
+
+test("cline pool: a document without limits loads and saves unchanged", async () => {
+ await withIsolatedPool(async () => {
+  fs.writeFileSync(
+   CLINE_POOL_FILE,
+   JSON.stringify({
+    accounts: [{ slot: "a", token: SLOT_A, addedAt: new Date().toISOString() }],
+    activeSlot: "a",
+   }),
+   "utf8",
+  );
+  _resetClinePoolCacheForTest();
+  const pool = loadPool();
+  assert.equal(pool.accounts.length, 1);
+  assert.equal(pool.activeSlot, "a");
+  assert.equal(pool.limits, undefined);
+  savePool(pool);
+  _resetClinePoolCacheForTest();
+  const again = loadPool();
+  assert.equal(again.accounts.length, 1);
+  assert.equal(again.limits, undefined);
+  assert.ok(!fs.readFileSync(CLINE_POOL_FILE, "utf8").includes("limits"));
+ });
+});
+
+test("cline pool: unusable limits shapes are ignored", async () => {
+ await withIsolatedPool(async () => {
+  fs.writeFileSync(
+   CLINE_POOL_FILE,
+   JSON.stringify({
+    accounts: [{ slot: "a", token: SLOT_A, addedAt: new Date().toISOString() }],
+    limits: { a: 5, b: { [MODEL]: "soon" }, "": { [MODEL]: Date.now() + 60_000 } },
+   }),
+   "utf8",
+  );
+  _resetClinePoolCacheForTest();
+  assert.equal(loadPool().limits, undefined);
+ });
+});
+
+const mockApi: ExtensionAPI = {
+ registerProvider() { },
+ registerCommand() { },
+};
+
+function cliContext(inputs: string[]): { ctx: ExtensionContext; notifications: Array<{ message: string; type?: string }> } {
+ const notifications: Array<{ message: string; type?: string }> = [];
+ const queue = [...inputs];
+ const ui: ExtensionUIContext = {
+  notify(message: string, type?: "info" | "warning" | "error") {
+   notifications.push({ message, type });
+  },
+  setStatus() { },
+  input(_prompt: string, defaultValue?: string) {
+   const next = queue.shift();
+   return Promise.resolve(next ?? defaultValue ?? "");
+  },
+  select(_prompt: string, options: string[]) {
+   return Promise.resolve(options[0]);
+  },
+ };
+ return { ctx: { ui }, notifications };
+}
+
+test("command: /freeflow cline login saves without leaking the key", async () => {
+ await withIsolatedPool(async () => {
+  const spec = createCommandSpec(mockApi);
+  const { ctx, notifications } = cliContext([SLOT_A]);
+  await spec.handler("cline login main --key", ctx);
+  assert.equal(loadPool().accounts.length, 1);
+  const shown = notifications.map((n) => n.message).join("\n");
+  assert.ok(shown.includes("[main]"));
+  assert.ok(!shown.includes(SLOT_A));
+ });
+});
+
+test("command: /freeflow cline accounts lists saved slots redacted", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("main", SLOT_A);
+  const spec = createCommandSpec(mockApi);
+  const { ctx, notifications } = cliContext([]);
+  await spec.handler("cline accounts", ctx);
+  const shown = notifications.map((n) => n.message).join("\n");
+  assert.ok(shown.includes("[main]"));
+  assert.ok(!shown.includes(SLOT_A));
+ });
+});
+
+test("command: /freeflow cline logout removes the slot", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("main", SLOT_A);
+  const spec = createCommandSpec(mockApi);
+  const { ctx, notifications } = cliContext([]);
+  await spec.handler("cline logout main", ctx);
+  assert.deepEqual(loadPool().accounts, []);
+  assert.ok(notifications.some((n) => n.message.includes("[main]")));
+ });
+});
+
+test("command: /freeflow cline logout accepts the accounts number", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("main", SLOT_A);
+  addAccount("second", SLOT_B);
+  const spec = createCommandSpec(mockApi);
+  const { ctx } = cliContext([]);
+  await spec.handler("cline logout 1", ctx);
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["second"]);
+ });
+});
+
+test("command: /freeflow cline logout with one login removes it directly", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("main", SLOT_A);
+  const spec = createCommandSpec(mockApi);
+  const { ctx, notifications } = cliContext([]);
+  await spec.handler("cline logout", ctx);
+  assert.deepEqual(loadPool().accounts, []);
+  assert.ok(notifications.some((n) => n.message.includes("[main]")));
+ });
+});
+
+test("command: /freeflow cline signout shows the browser sign-out link and keeps saved logins", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("default", SLOT_A);
+  addAccount("slot-2", SLOT_B);
+  const spec = createCommandSpec(mockApi);
+  const { ctx, notifications } = cliContext([]);
+  await spec.handler("cline signout", ctx);
+  const shown = notifications.map((n) => n.message).join("\n");
+  assert.ok(shown.includes(CLINE_BROWSER_SIGNOUT_URL), "must show the sign-out link");
+  assert.ok(shown.includes("you have 2"), "must count the saved logins");
+  assert.ok(shown.includes("slot-3"), "must name the slot the next account would use");
+  // Browser sign-out is not local removal.
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["default", "slot-2"]);
+  assert.ok(!shown.includes(SLOT_A) && !shown.includes(SLOT_B), "must never echo a key");
+ });
+});
+
+test("cline pool: a second slot for the same account is refused", async () => {
+ await withIsolatedPool(() => {
+  addAccount("default", SLOT_A, { accountId: "user-1", email: "someone@example.com" });
+  assert.throws(
+   () => addAccount("slot-2", SLOT_B, { accountId: "user-1", email: "someone@example.com" }),
+   (e: unknown) => {
+    const msg = (e as Error).message;
+    assert.ok(msg.includes("[default]"), `must name the existing slot, got: ${msg}`);
+    assert.ok(!msg.includes(SLOT_B), "must never echo the token");
+    return true;
+   },
+  );
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["default"]);
+ });
+});
+
+test("cline pool: identity falls back to email, then to an identical key", async () => {
+ await withIsolatedPool(() => {
+  addAccount("default", SLOT_A, { email: "Someone@Example.com" });
+  // Same person, different casing, no account id on either side.
+  assert.throws(() => addAccount("slot-2", SLOT_B, { email: "someone@example.com" }));
+  // No identity at all: only the same bearer proves the same credential.
+  addAccount("keyed", "workos:keyed-token-1");
+  assert.throws(() => addAccount("keyed-2", "workos:keyed-token-1"));
+  assert.equal(addAccount("keyed-3", "workos:keyed-token-2").accounts.length, 3);
+ });
+});
+
+test("cline pool: re-logging into an existing slot is not a duplicate", async () => {
+ await withIsolatedPool(() => {
+  addAccount("default", SLOT_A, { accountId: "user-1", email: "someone@example.com" });
+  addAccount("default", SLOT_B, { accountId: "user-1", email: "someone@example.com" });
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["default"]);
+  assert.equal(loadPool().accounts[0].token, SLOT_B, "the fresh grant replaces the old one");
+ });
+});
+
+test("command: /freeflow cline login --key refuses an account already saved", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("default", SLOT_A);
+  const spec = createCommandSpec(mockApi);
+  const { ctx, notifications } = cliContext([SLOT_A]);
+  await spec.handler("cline login slot-2 --key", ctx);
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["default"]);
+  const shown = notifications.map((n) => n.message).join("\n");
+  assert.ok(shown.includes("[default]"), `must explain the clash, got: ${shown}`);
+  assert.ok(!shown.includes(SLOT_A), "must never echo the key");
+ });
+});
+
+test("command: /freeflow cline accounts marks a duplicate account", async () => {
+ await withIsolatedPool(async () => {
+  // Written straight to the pool file: this is a pool saved before the
+  // duplicate check existed, which is the only way such a pair can exist now.
+  fs.writeFileSync(
+   CLINE_POOL_FILE,
+   JSON.stringify({
+    accounts: [
+     { slot: "default", token: SLOT_A, addedAt: new Date().toISOString(), email: "someone@example.com" },
+     { slot: "slot-2", token: SLOT_B, addedAt: new Date().toISOString(), email: "someone@example.com" },
+    ],
+    activeSlot: "default",
+   }),
+   "utf8",
+  );
+  _resetClinePoolCacheForTest();
+  const spec = createCommandSpec(mockApi);
+  const { ctx, notifications } = cliContext([]);
+  await spec.handler("cline accounts", ctx);
+  const shown = notifications.map((n) => n.message).join("\n");
+  assert.ok(shown.includes("same account as [default]"), `must mark the duplicate, got: ${shown}`);
+ });
+});
+
+test("cline pool: an unreadable main file recovers from the backup copy", async () => {
+ await withIsolatedPool(() => {
+  addAccount("default", SLOT_A);
+  addAccount("slot-2", SLOT_B);
+  // Second save snapshots the first, so the backup holds the earlier state.
+  addAccount("slot-2", SLOT_B);
+  assert.ok(fs.existsSync(CLINE_POOL_BACKUP_FILE), "savePool must keep a recovery copy");
+  fs.writeFileSync(CLINE_POOL_FILE, "{not json", "utf8");
+  _resetClinePoolCacheForTest();
+  const recovered = loadPool();
+  assert.deepEqual(recovered.accounts.map((a) => a.slot), ["default", "slot-2"]);
+  // Recovery heals the main file so it is not redone on every load.
+  assert.doesNotThrow(() => JSON.parse(fs.readFileSync(CLINE_POOL_FILE, "utf8")));
+ });
+});
+
+test("cline pool: a deleted main file recovers from the backup copy", async () => {
+ await withIsolatedPool(() => {
+  addAccount("default", SLOT_A);
+  addAccount("slot-2", SLOT_B);
+  fs.rmSync(CLINE_POOL_FILE, { force: true });
+  _resetClinePoolCacheForTest();
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["default", "slot-2"]);
+ });
+});
+
+test("cline pool: a legitimately empty pool is never resurrected from the backup", async () => {
+ await withIsolatedPool(() => {
+  addAccount("default", SLOT_A);
+  addAccount("slot-2", SLOT_B);
+  assert.deepEqual(removeAccount("default"), true);
+  assert.deepEqual(removeAccount("slot-2"), true);
+  assert.deepEqual(loadPool().accounts, []);
+  // The backup still holds the old logins; removing the last one must stick.
+  _resetClinePoolCacheForTest();
+  assert.deepEqual(loadPool().accounts, []);
+ });
+});
+
+test("cline pool: a run of smaller writes cannot clobber the good backup", async () => {
+ await withIsolatedPool(() => {
+  // The incident this guards: a real 2-login pool replaced by a 1-login
+  // fixture, then a second fixture write replacing the backup too.
+  addAccount("default", SLOT_A, { email: "real-one@example.com" });
+  addAccount("slot-2", SLOT_B, { email: "real-two@example.com" });
+  fs.writeFileSync(CLINE_POOL_FILE, JSON.stringify({ accounts: [{ slot: "fixture", token: "workos:fx" }] }), "utf8");
+  _resetClinePoolCacheForTest();
+  addAccount("fixture-2", "workos:fx2");
+  fs.writeFileSync(CLINE_POOL_FILE, "{broken", "utf8");
+  _resetClinePoolCacheForTest();
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["default", "slot-2"], "the larger good pool must survive");
+  assert.deepEqual(
+   loadPool().accounts.map((a) => a.email),
+   ["real-one@example.com", "real-two@example.com"],
+   "the recovered copy must be the real logins, not the fixtures",
+  );
+ });
+});
+
+test("command: /freeflow cline logout offers a picker for several logins", async () => {
+ await withIsolatedPool(async () => {
+  addAccount("main", SLOT_A);
+  addAccount("second", SLOT_B);
+  const spec = createCommandSpec(mockApi);
+  const { ctx } = cliContext([]);
+  await spec.handler("cline logout", ctx);
+  assert.deepEqual(loadPool().accounts.map((a) => a.slot), ["second"]);
+ });
+});

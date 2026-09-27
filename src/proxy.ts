@@ -21,6 +21,7 @@ import {
  ALLOWED_METHODS,
  ALLOWED_PATH_PATTERN,
  BASE_PORT_REPROBE_MS,
+ CLINE_CHAT_URL,
  HOST,
  KILO_CHAT_URL,
  KILO_RESPONSES_URL,
@@ -35,9 +36,21 @@ import {
 import {
  convertSseToJson,
  enforceOpencodeFingerprint,
+ sseToChatCompletionJson,
+ type CaseRestoreMap,
+ type FindGlobRestore,
 } from "./opencode-fingerprint.ts";
 import { isDebugEnabled, log } from "./logger.ts";
-import { getModelUpstream, KILO_MODEL_IDS, MODEL_MAP, resolveCanonicalModelId } from "./models.ts";
+import { getModelUpstream, isClineModel, KILO_MODEL_IDS, MODEL_MAP, resolveCanonicalModelId } from "./models.ts";
+import { ClineAuthError, refreshClineToken, toApiKey } from "./cline-device-auth.ts";
+import { rollChat } from "./cline-accounts.ts";
+import { fetchWithSystemCA } from "./system-ca-fetch.ts";
+import {
+ chatResponsesJsonFromChatCompletion,
+ chatResponsesSseFromChatCompletion,
+ clineChatBodyFromResponsesBody,
+ translateToolsForPath,
+} from "./tool-translation.ts";
 // normalize removed — host pi-ai already normalizes thinking/reasoning before proxy
 import { relayFetch } from "./relay.ts";
 import { getActiveRelayState, orderedRelayCandidates } from "./relay-state.ts";
@@ -45,11 +58,17 @@ import {
  issuerRelayFor,
  prepareResponsesFailoverBody,
  rejectedReasoningCount,
+ rejectedReasoningIdsCount,
  rememberIssuerRelay,
  rememberRejectedReasoning,
+ rememberRejectedReasoningIds,
  responsesConversationKey,
+ stripPreviousResponseId,
  stripRejectedReasoning,
+ stripRejectedReasoningIds,
  stripReasoningEncryption,
+ stripUnresolvableReasoning,
+ isExpiredReasoningReference,
  isReasoningCallerMismatch,
 } from "./responses.ts";
 import { pipeUpstreamStream } from "./stream-pipe.ts";
@@ -64,6 +83,7 @@ import {
  sessionKeyOf,
  wasGateRejected,
  withFreeTierHint,
+ attachHintForDisplay,
 } from "./upstream-health.ts";
 
 
@@ -101,10 +121,259 @@ function withRateLimitHint(status: number, data: string): string {
  try {
   const parsed: unknown = JSON.parse(data);
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && shouldShow429Hint()) {
-   return JSON.stringify({ ...(parsed as Record<string, unknown>), hint: RATE_LIMIT_HINT });
+   return JSON.stringify(attachHintForDisplay(parsed as Record<string, unknown>, RATE_LIMIT_HINT));
   }
  } catch { }
  return data;
+}
+/**
+ * Exhausted-disabled relay verdict from the relay layer (HTTP 503 JSON with
+ * `error.code === "relay_disabled"`): every candidate rolled as disabled and
+ * the direct fallback is unavailable, so the host must retry/fail fast
+ * instead of parking on a provider wait. Passes through to the host
+ * unchanged — hint rewrites must never touch its code or guidance.
+ */
+export function isRelayDisabledError(status: number, data: string): boolean {
+ if (status !== 503) return false;
+ try {
+  const parsed: unknown = JSON.parse(data);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  if (!("error" in parsed)) return false;
+  const err: unknown = parsed.error;
+  if (typeof err !== "object" || err === null || Array.isArray(err)) return false;
+  if (!("code" in err)) return false;
+  return err.code === "relay_disabled";
+ } catch {
+  return false;
+ }
+}
+/** Cline marker errors: each status carries account-actionable guidance. */
+const CLINE_RATE_LIMIT_HINT =
+ "Cline free-use limit reached for this login. Wait for the reset or switch models.";
+const CLINE_FORBIDDEN_HINT =
+ "Cline refused this request. Check the Cline login and retry.";
+const CLINE_AUTH_HINT =
+ "Cline login expired or missing. Reconnect the Cline login and retry.";
+const CLINE_MODEL_HINT =
+ "Cline has no such model. Refresh the model list and retry.";
+
+/**
+ * What the roll knows about a free-limit exhaustion, for the 429 hint: how many
+ * saved logins answered the cap and the nearest reset any of them stated.
+ */
+export interface ClineLimitHint {
+ logins: number;
+ /** Epoch ms, or null when no login's body stated a reset. */
+ resetAt: number | null;
+}
+
+/** Coarse reset delay ("20h 4m", "35m") — the hint names what the body stated. */
+function formatResetDelay(resetAt: number): string {
+ const minutes = Math.max(1, Math.round((resetAt - Date.now()) / 60_000));
+ const hours = Math.floor(minutes / 60);
+ const rest = minutes % 60;
+ if (hours === 0) return `${rest}m`;
+ return rest > 0 ? `${hours}h ${rest}m` : `${hours}h`;
+}
+
+/** Every saved login is out of free use for this model: say what helps next. */
+function clineAllLimitedHint(limit: ClineLimitHint): string {
+ const reset = limit.resetAt === null ? "" : ` Nearest reset in about ${formatResetDelay(limit.resetAt)}.`;
+ return `Cline's daily free limit is used up on all ${limit.logins} saved logins.${reset} Switch models, or add another login with /freeflow cline login.`;
+}
+
+/**
+ * Attach the matching hint to a Cline marker error JSON body (free-limit
+ * 429, 403, 401, model 404). Anything else — other statuses, non-JSON
+ * bodies — passes through untouched.
+ *
+ * `limit` is present only when the roll tried every saved login and every one
+ * of them answered the daily free cap; then "for this login" would be wrong and
+ * hide that another login is the way out.
+ */
+export function mapClineError(status: number, data: string, limit?: ClineLimitHint): string {
+ // Synthetic pool-exhausted bodies already tell the user exactly what to do
+ // (sign in again) — a rate-limit hint would mislead.
+ if (data.includes("cline_pool_exhausted")) return data;
+ const hint = status === 429
+  ? (limit ? clineAllLimitedHint(limit) : CLINE_RATE_LIMIT_HINT)
+  : status === 403
+   ? CLINE_FORBIDDEN_HINT
+   : status === 401
+    ? CLINE_AUTH_HINT
+    : status === 404
+     ? CLINE_MODEL_HINT
+     : null;
+ if (hint === null) return data;
+ try {
+  const parsed: unknown = JSON.parse(data);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+   // Hosts render error.message and ignore the sibling hint field, so the
+   // guidance must live in the visible message too (hint kept for compat).
+   return JSON.stringify(attachHintForDisplay(parsed as Record<string, unknown>, hint));
+  }
+ } catch { }
+ return data;
+}
+/**
+ * Device-login refresher for the Cline pool: one refresh per stale slot per
+ * turn. A grant Cline rejects outright (HTTP 4xx, or a 200 without usable
+ * tokens) is dead — it resolves null so the pool stops trying that slot until
+ * the user logs in again. Anything else (network fault, upstream 5xx) throws,
+ * which keeps the stale bearer for this turn.
+ */
+async function clineRefreshImpl(refreshToken: string): Promise<{ token: string; refreshToken?: string; expiresAt?: number } | null> {
+ try {
+  const creds = await refreshClineToken(undefined, refreshToken);
+  return { token: toApiKey(creds.access), refreshToken: creds.refresh, expiresAt: creds.expires };
+ } catch (e) {
+  if (e instanceof ClineAuthError && typeof e.status === "number" && e.status >= 400 && e.status < 500) {
+   log("warn", "cline refresh grant rejected — slot needs a fresh login", { status: e.status });
+   return null;
+  }
+  if (e instanceof Error && /^Invalid token response|^Token response did not include a refresh token/.test(e.message)) {
+   log("warn", "cline refresh returned no usable tokens — slot needs a fresh login", { reason: e.message });
+   return null;
+  }
+  throw e;
+ }
+}
+
+/**
+ * Serve a Cline-model request direct (never relay pool, no opencode
+ * fingerprint). Cline serves chat completions only: responses-path bodies
+ * translate to chat upstream and the chat answer translates back, re-emitted
+ * as SSE when the caller streamed. Upstream always streams; callers that
+ * asked for plain JSON get the aggregated object.
+ */
+async function handleClineRequest(opts: {
+ parsedBody: Record<string, unknown>;
+ pathname: string;
+ req: http.IncomingMessage;
+ res: http.ServerResponse;
+ reqId: string;
+ clientRequestedStream: boolean;
+}): Promise<void> {
+ const { parsedBody, pathname, req, res, reqId, clientRequestedStream } = opts;
+ const responsesRequest = pathname.endsWith("/responses");
+ const model = typeof parsedBody.model === "string" ? parsedBody.model : "unknown";
+ let chatBody: Record<string, unknown>;
+ if (responsesRequest) {
+  chatBody = clineChatBodyFromResponsesBody(parsedBody);
+ } else {
+  chatBody = { ...parsedBody };
+  if (Array.isArray(chatBody.tools)) chatBody.tools = translateToolsForPath(chatBody.tools, "/v1/chat/completions");
+  delete chatBody.prompt_cache_key;
+ }
+ chatBody.stream = true;
+ let upstreamRes: Response;
+ let limitHint: ClineLimitHint | undefined;
+ try {
+  const result = await rollChat({ body: JSON.stringify(chatBody), chatUrl: CLINE_CHAT_URL, refreshImpl: clineRefreshImpl, fetchImpl: fetchWithSystemCA });
+  upstreamRes = result.res;
+  // The roll returns the last upstream failure when the pool is exhausted,
+  // so "served by" must only log on an actual success.
+  if (upstreamRes.ok && typeof result.slot === "string" && result.slot.length > 0) {
+   log("debug", `cline served by slot ${result.slot}`, { model }, reqId);
+  }
+  // Every saved login answered the daily free cap: name that instead of
+  // blaming "this login", which hides that another login or another model works.
+  if (result.limitOnly && result.logins > 1) {
+   limitHint = { logins: result.logins, resetAt: result.earliestResetAt };
+  }
+ } catch (e) {
+  log("error", "cline pool error", { error: String(e), model }, reqId);
+  if (!res.headersSent) {
+   res.writeHead(502, { "content-type": "application/json" });
+   res.end(JSON.stringify({ error: "upstream error" }));
+  }
+  return;
+ }
+ if (res.writableEnded) {
+  try { await upstreamRes.body?.cancel(); } catch { }
+  return;
+ }
+ if (!upstreamRes.ok) {
+  log("warn", `cline upstream ${upstreamRes.status} for model ${model}`, { status: upstreamRes.status, model }, reqId);
+  const raw = await upstreamRes.text().catch(() => null);
+  if (raw === null) {
+   log("error", "cline upstream body unreadable", { status: upstreamRes.status, model }, reqId);
+   if (!res.headersSent) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "upstream error" }));
+   } else if (!res.writableEnded) {
+    res.end();
+   }
+   return;
+  }
+  const data = mapClineError(upstreamRes.status, raw, limitHint);
+  if (!res.headersSent) {
+   res.writeHead(upstreamRes.status, { "content-type": upstreamRes.headers.get("content-type") || "application/json" });
+   res.end(data);
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ if (!responsesRequest && clientRequestedStream && upstreamRes.body) {
+  res.writeHead(upstreamRes.status, {
+   "content-type": upstreamRes.headers.get("content-type") || "text/event-stream",
+   "cache-control": "no-cache, no-transform",
+   connection: "keep-alive",
+   "x-accel-buffering": "no",
+  });
+  pipeUpstreamStream(
+   Readable.fromWeb(upstreamRes.body as unknown as WebReadableStream),
+   res,
+   req,
+   reqId,
+   "direct",
+  );
+  return;
+ }
+ const sseText = await upstreamRes.text().catch(() => null);
+ if (sseText === null) {
+  log("error", "cline upstream stream unreadable", { status: upstreamRes.status, model }, reqId);
+  if (!res.headersSent) {
+   res.writeHead(502, { "content-type": "application/json" });
+   res.end(JSON.stringify({ error: "upstream error" }));
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ if (!responsesRequest) {
+  const data = convertSseToJson(sseText, pathname);
+  if (!res.headersSent) {
+   res.writeHead(upstreamRes.status, { "content-type": "application/json" });
+   res.end(data);
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ const chat = sseToChatCompletionJson(sseText);
+ const resp = chatResponsesJsonFromChatCompletion(chat, model);
+ if (clientRequestedStream) {
+  if (!res.headersSent) {
+   res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+   });
+   res.end(chatResponsesSseFromChatCompletion(resp));
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ if (!res.headersSent) {
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify(resp));
+ } else if (!res.writableEnded) {
+  res.end();
+ }
 }
 
 /**
@@ -112,13 +381,15 @@ function withRateLimitHint(status: number, data: string): string {
  * when the model is a non-empty string present in MODEL_MAP or KILO_MODEL_IDS
  * (Kilo traffic leaves via its own branch regardless), and when the model is
  * missing/empty (e.g. GET /v1/models carries no body — preserve routing).
- * Anything else (unknown/paid model ids, non-strings) goes direct upstream.
+ * Cline models are direct-only and never relay-eligible. Anything else
+ * (unknown/paid model ids, non-strings) goes direct upstream.
  */
 export function isRelayEligibleModel(model: unknown): boolean {
  if (model === undefined || model === null) return true;
  if (typeof model !== "string") return false;
  if (model.trim() === "") return true;
  const canonical = resolveCanonicalModelId(model.trim());
+ if (isClineModel(canonical)) return false;
  return MODEL_MAP.has(canonical) || KILO_MODEL_IDS.has(canonical);
 }
 
@@ -206,8 +477,9 @@ export function sanitizeHeaders(
  targetHost: string,
 ): Record<string, string> {
  // authorization is deliberately NOT forwarded: the host provider registers
- // with a dummy key (placeholder), and zen free models are keyless — sending
- // that fake key upstream gets 401 Invalid API key. Kilo injects its own key.
+ // with a dummy key (placeholder), and every free upstream here is keyless —
+ // sending that fake key upstream gets 401 Invalid API key. Kilo's own branch
+ // sends no Authorization either (its gateway rejects a placeholder bearer).
  const allowed: Record<string, true> = {
   "content-type": true,
   accept: true,
@@ -485,7 +757,7 @@ function upstreamTimeoutError(): Error & { code: string } {
 }
 
 /**
- * Recover from upstream rejecting a replayed reasoning blob as foreign.
+ * Recover from upstream rejecting a replayed reasoning history.
  *
  * Upstream binds each reasoning `encrypted_content` blob to the service
  * instance that issued it. When the conversation is later served by a different
@@ -495,13 +767,16 @@ function upstreamTimeoutError(): Error & { code: string } {
  * second apart, the direct path returned the same 400, and a 45s burst hit ten
  * conversations.
  *
- * The rejected blob cannot be identified from the response, so this drops every
- * blob, retries once, and then remembers the hashes of the blobs that were in
- * the failing body: later turns drop only those and keep whatever the current
- * instance issued, so the conversation keeps its recent reasoning.
+ * Reasoning references also age out server-side (observed around 9.5h): the
+ * retry after a blob strip can come back as `referenced reasoning item
+ * 'rs_...' was not found or has expired`. That poisoned history cannot be
+ * resolved by any backend, so the chained second step drops every reasoning
+ * item plus `previous_response_id` and retries the same relay again — one
+ * turn of reasoning context is lost instead of the whole session.
  *
- * The 400 body is inspected through a clone: a successful streaming response
- * (the normal path) is never consumed here.
+ * Both 400s are request-scoped: the relay served correctly and is never
+ * marked failed for them. The 400 body is inspected through a clone: a
+ * successful streaming response (the normal path) is never consumed here.
  */
 async function retryWithoutReasoningEncryption(
  response: Response,
@@ -520,36 +795,81 @@ async function retryWithoutReasoningEncryption(
  } catch {
   return response;
  }
- if (!isReasoningCallerMismatch(errorText)) return response;
+ const callerMismatch = isReasoningCallerMismatch(errorText);
+ const expiredDirect = isExpiredReasoningReference(errorText);
+ if (!callerMismatch && !expiredDirect) return response;
 
- const portable = stripReasoningEncryption(sentBody);
- if (!portable) {
-  log(
-   "warn",
-   "upstream rejected caller-bound reasoning but the request carries no encrypted_content to strip",
-   { status: 400 },
-   reqId,
-  );
-  return response;
+ let current = response;
+ let currentBody = sentBody;
+ let currentErrorText = errorText;
+
+ if (callerMismatch) {
+  const portable = stripReasoningEncryption(sentBody);
+  if (!portable) {
+   log(
+    "warn",
+    "upstream rejected caller-bound reasoning but the request carries no encrypted_content to strip",
+    { status: 400 },
+    reqId,
+   );
+   if (!expiredDirect) return response;
+  } else {
+   log(
+    "warn",
+    "upstream rejected caller-bound reasoning (blobs issued by another instance); retrying with encrypted_content stripped",
+    { status: 400, tracked: conversationKey !== null },
+    reqId,
+   );
+   const retried = await resend(portable);
+   if (conversationKey) {
+    const remembered = rememberRejectedReasoning(sentBody, conversationKey);
+    log(
+     "info",
+     `conversation will drop ${remembered} rejected reasoning blob(s) on later turns`,
+     undefined,
+     reqId,
+    );
+   }
+   if (retried.status !== 400) return retried;
+   if ((retried.headers.get("content-type") ?? "").includes("text/event-stream")) return retried;
+   let retryText: string;
+   try {
+    retryText = await retried.clone().text();
+   } catch {
+    return retried;
+   }
+   if (!isExpiredReasoningReference(retryText)) return retried;
+   current = retried;
+   currentBody = portable;
+   currentErrorText = retryText;
+  }
  }
 
+ if (!isExpiredReasoningReference(currentErrorText)) return current;
+ const unresolvable = stripUnresolvableReasoning(currentBody);
+ if (!unresolvable) {
+  if (conversationKey) {
+   const remembered = rememberRejectedReasoningIds(currentErrorText, conversationKey);
+   log(
+    "warn",
+    `upstream rejected expired reasoning reference (${remembered} id(s)); nothing strippable left in the request`,
+    { status: 400, tracked: true },
+    reqId,
+   );
+  }
+  return current;
+ }
+ let rememberedIds = 0;
+ if (conversationKey) {
+  rememberedIds = rememberRejectedReasoningIds(currentErrorText, conversationKey);
+ }
  log(
   "warn",
-  "upstream rejected caller-bound reasoning (blobs issued by another instance); retrying with encrypted_content stripped",
+  `upstream rejected expired reasoning reference (${rememberedIds} id(s)); retrying without reasoning history`,
   { status: 400, tracked: conversationKey !== null },
   reqId,
  );
- const retried = await resend(portable);
- if (retried.ok && conversationKey) {
-  const remembered = rememberRejectedReasoning(sentBody, conversationKey);
-  log(
-   "info",
-   `conversation will drop ${remembered} rejected reasoning blob(s) on later turns`,
-   undefined,
-   reqId,
-  );
- }
- return retried;
+ return await resend(unresolvable);
 }
 
 /**
@@ -607,7 +927,7 @@ export function startProxy(
      id: m.id,
      object: "model",
      created: 0,
-     owned_by: m.source === "kilo" ? "kilocode" : "opencode",
+     owned_by: m.source === "kilo" ? "kilocode" : m.source === "cline" ? "clinecode" : "opencode",
     })),
    });
    res.writeHead(200, {
@@ -678,6 +998,7 @@ export function startProxy(
   req.on("end", async () => {
    const bodyStr = Buffer.concat(bodyChunks).toString();
    let isKilo = false;
+   let isCline = false;
    let parsedBody: Record<string, unknown> | null = null;
    let clientRequestedStream = false;
 
@@ -685,8 +1006,9 @@ export function startProxy(
     parsedBody = JSON.parse(bodyStr);
     if (typeof parsedBody?.model === "string") {
      const canonical = resolveCanonicalModelId(parsedBody.model);
-     parsedBody.model = canonical;
-     if (KILO_MODEL_IDS.has(canonical)) {
+     if (isClineModel(canonical)) {
+      isCline = true;
+     } else if (KILO_MODEL_IDS.has(canonical)) {
       isKilo = true;
      }
     }
@@ -713,24 +1035,30 @@ export function startProxy(
    }
 
    // OpenCode Zen free-tier fingerprint: upstream mandates stream: true and the
-   // file-search tool quartet {bash, glob, grep, read}. Missing tools (such as on
+   // placeholder sextet {bash, glob, grep, read, edit, write}. Missing tools (such as on
    // subagent or advisor watchdog turns) trigger 403 FreeTierError.
    let bodyModified = false;
    let callerHadTools = true;
-   if (!isKilo && parsedBody) {
+   let callerCaseRestore: CaseRestoreMap | undefined;
+   let callerFindGlob: FindGlobRestore | undefined;
+   let callerInjected: string[] | undefined;
+   if (!isKilo && !isCline && parsedBody) {
     const fp = enforceOpencodeFingerprint(parsedBody, target.pathname);
     callerHadTools = fp.callerHadTools;
+    callerCaseRestore = fp.caseRestore;
+    callerFindGlob = fp.findGlob;
+    callerInjected = fp.injected;
     bodyModified = true;
    }
 
    const isStream = clientRequestedStream;
 
-   // Stale-registration guard: responses-only models (muse-spark-*) must
-   // reach upstream via /v1/responses, and messages-only models (union-alpha)
-   // via /v1/messages. A request on the wrong path means the host still holds
-   // a pre-fix provider registration (stale disk cache or no restart after
-   // upgrade) and upstream answers 500.
-   if (!isKilo && typeof parsedBody?.model === "string") {
+   // Stale-registration guard: each model's declared api decides its upstream
+   // path — responses models (muse-spark-*) reach /v1/responses and
+   // anthropic-messages models reach /v1/messages. A request on the wrong path
+   // means the host still holds a pre-fix provider registration (stale disk
+   // cache or no restart after upgrade) and upstream answers 500.
+   if (!isKilo && !isCline && typeof parsedBody?.model === "string") {
     const knownDef = MODEL_MAP.get(String(parsedBody.model));
     if (target.pathname.endsWith("/chat/completions") && knownDef?.api && knownDef.api !== "openai-completions") {
      log("warn", `model ${String(parsedBody.model)} expects ${knownDef.api} but got ${target.pathname} — stale provider registration (restart Pi/OMP after upgrade)`, { model: String(parsedBody.model), path: target.pathname }, reqId);
@@ -741,7 +1069,12 @@ export function startProxy(
     }
    }
    try {
-    if (isKilo && parsedBody) {
+    if (isCline && parsedBody) {
+     // Cline serves chat completions only, direct (never relay pool, no
+     // opencode fingerprint). The pool module owns the per-user Bearer
+     // token: the proxy only passes the body and maps the answer.
+     await handleClineRequest({ parsedBody, pathname: target.pathname, req, res, reqId, clientRequestedStream });
+    } else if (isKilo && parsedBody) {
      // Header-wait timeout + client-disconnect abort: once headers
      // arrive the timer is cleared so a long stream is not killed at
      // the timeout ceiling; the stream phase is owned by
@@ -767,8 +1100,10 @@ export function startProxy(
        {
         method: "POST",
         headers: {
+         // Keyless, like Zen: Kilo's gateway rejects a placeholder bearer
+         // (live 2026-09-22 — "Bearer kilo-free" answers 401 INVALID_TOKEN,
+         // omitting Authorization answers 200 for every free catalog model).
          "Content-Type": "application/json",
-         Authorization: "Bearer kilo-free",
         },
         body: JSON.stringify(parsedBody),
         signal: kiloController.signal,
@@ -856,16 +1191,23 @@ export function startProxy(
         // cannot read this history, so send it portable instead of
         // letting upstream reject the whole request.
         const issuerChanged = issuer !== undefined && issuer !== servingRelay;
-        // Drop only the blobs upstream already rejected, so everything
-        // the current backend issued still flows verbatim.
-        const stripRejected = responsesRequest &&
-         conversationKey !== null &&
-         rejectedReasoningCount(conversationKey) > 0;
-        const bodyForUpstream = issuerChanged
-         ? (stripReasoningEncryption(requestBody) ?? requestBody)
-         : stripRejected
-          ? (stripRejectedReasoning(requestBody, conversationKey) ?? requestBody)
-          : requestBody;
+        // Portable history on hops, selective memory on every turn: dead-id
+        // stripping applies regardless of the hop guard, because a
+        // relay-to-relay or relay-to-direct hop also changes the backend
+        // that must resolve the ids.
+        let bodyForUpstream: Buffer = requestBody;
+        if (responsesRequest && conversationKey !== null) {
+         if (issuerChanged) {
+          bodyForUpstream = stripReasoningEncryption(bodyForUpstream) ?? bodyForUpstream;
+          bodyForUpstream = stripPreviousResponseId(bodyForUpstream) ?? bodyForUpstream;
+         }
+         if (rejectedReasoningCount(conversationKey) > 0) {
+          bodyForUpstream = stripRejectedReasoning(bodyForUpstream, conversationKey) ?? bodyForUpstream;
+         }
+         if (rejectedReasoningIdsCount(conversationKey) > 0) {
+          bodyForUpstream = stripRejectedReasoningIds(bodyForUpstream, conversationKey) ?? bodyForUpstream;
+         }
+        }
         if (issuerChanged && conversationKey !== null) {
          // These blobs belong to a backend this conversation is
          // leaving, so never replay them again.
@@ -979,17 +1321,19 @@ export function startProxy(
          );
         } else {
          if (!response.ok) {
-          log("warn", `upstream ${response.status} for model ${String((parsedBody as Record<string, unknown> | null)?.model ?? "?")} via relay`, { status: response.status, model: (parsedBody as Record<string, unknown> | null)?.model, path: req.url }, reqId);
+          log("warn", `upstream ${response.status} for model ${String((parsedBody as Record<string, unknown> | null)?.model ?? "?")} via relay ${relayState.url || "pool"}`, { status: response.status, model: (parsedBody as Record<string, unknown> | null)?.model, path: req.url, relay: relayState.url }, reqId);
          }
          let rawText = await response.text();
          let ct =
           response.headers.get("content-type") ||
           "application/json";
          if (response.ok && (ct.includes("text/event-stream") || rawText.includes("data:"))) {
-          rawText = convertSseToJson(rawText, target.pathname, callerHadTools);
+          rawText = convertSseToJson(rawText, target.pathname, callerHadTools, callerCaseRestore, callerFindGlob, callerInjected);
           ct = "application/json";
          }
-         const data = withFreeTierHint(response.status, withRateLimitHint(response.status, rawText));
+         const data = isRelayDisabledError(response.status, rawText)
+          ? rawText
+          : withFreeTierHint(response.status, withRateLimitHint(response.status, rawText));
          res.writeHead(response.status, { "content-type": ct });
          res.end(data);
         }
@@ -1020,14 +1364,19 @@ export function startProxy(
       ? issuerRelayFor(directConversationKey)
       : undefined;
      const directIssuerChanged = directIssuer !== undefined && directIssuer !== null;
-     const directStripRejected = directResponsesRequest &&
-      directConversationKey !== null &&
-      rejectedReasoningCount(directConversationKey) > 0;
-     const directBodyForUpstream = directIssuerChanged
-      ? (stripReasoningEncryption(directBody) ?? directBody)
-      : directStripRejected
-       ? (stripRejectedReasoning(directBody, directConversationKey) ?? directBody)
-       : directBody;
+     let directBodyForUpstream: Buffer = directBody;
+     if (directResponsesRequest && directConversationKey !== null) {
+      if (directIssuerChanged) {
+       directBodyForUpstream = stripReasoningEncryption(directBodyForUpstream) ?? directBodyForUpstream;
+       directBodyForUpstream = stripPreviousResponseId(directBodyForUpstream) ?? directBodyForUpstream;
+      }
+      if (rejectedReasoningCount(directConversationKey) > 0) {
+       directBodyForUpstream = stripRejectedReasoning(directBodyForUpstream, directConversationKey) ?? directBodyForUpstream;
+      }
+      if (rejectedReasoningIdsCount(directConversationKey) > 0) {
+       directBodyForUpstream = stripRejectedReasoningIds(directBodyForUpstream, directConversationKey) ?? directBodyForUpstream;
+      }
+     }
      if (directIssuerChanged && directConversationKey !== null) {
       rememberRejectedReasoning(directBody, directConversationKey);
       log(
@@ -1151,7 +1500,7 @@ export function startProxy(
       } else if (upstreamRes.body) {
        let rawText = await upstreamRes.text();
        if (upstreamRes.ok && (outHeaders["content-type"]?.includes("text/event-stream") || rawText.includes("data:"))) {
-        rawText = convertSseToJson(rawText, target.pathname, callerHadTools);
+        rawText = convertSseToJson(rawText, target.pathname, callerHadTools, callerCaseRestore, callerFindGlob, callerInjected);
         outHeaders["content-type"] = "application/json";
        }
        res.writeHead(upstreamRes.status, outHeaders);

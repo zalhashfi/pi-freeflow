@@ -1,5 +1,121 @@
 # Changelog
 
+## 1.27.0
+
+### Minor Changes
+
+- 2b20cbf: Cline accounts now show which login served requests: the accounts list shows per-login request totals with the last used model and time, and status shows a summary of the most recently used login.
+
+### Patch Changes
+
+- 0931e12: Fix deployed relay target matching and private-host protection.
+
+## 1.26.1
+
+### Patch Changes
+
+- Fix `/freeflow deploy vercel` failing at the Vercel build step with `Unterminated string literal`. The generated relay file now passes syntax checks on all three deploy targets, and newly deployed relays come with a built-in password by default instead of being openly usable by anyone with the URL.
+- Recover from expired conversation reasoning references instead of failing every turn. When the provider reports a reasoning item as expired, the request is retried without the unresolvable history on the same relay, so the session continues with one turn of lost reasoning context rather than dying.
+
+## 1.26.0
+
+### Minor Changes
+
+- Three newly available free models: MiMo V2.6 Flash on OpenCode Zen (1M context, answers with vision), plus Qwen 3.8 27B (vision) and GLM 5.2 on the KiloCode Gateway — pick them with the short names `mimo-v2.6-flash`, `qwen3.8-27b`, and `glm-5.2`.
+- New free model available: Space Bunny Free on OpenCode Zen (1M context, large output window, answers with vision) — pick it with the short name `space-bunny`. Two models left the picker because they are gone from the KiloCode Gateway free list: Step 3.7 Flash (only the paid version remains) and Ling 3.0 Flash VL (only the paid version remains).
+
+### Patch Changes
+
+- When Cline's daily free limit is used up on every saved login, the error message now says so directly — how many saved logins ran out, when the nearest one resets, and that switching models or adding another login helps. Previously that guidance sat in a field most clients never display, so you only saw Cline's own terse wording.
+
+## 1.24.0
+
+### Minor Changes
+
+- Cline requests now identify as the Cline desktop app. That client identity is what makes Cline advertise its sixth free model, Kimi K3, so it joins the model list next to the four Cline models you already had.
+
+  Kimi K3 (`cline-free/kimi-k3`) has a 1M-token context window, reads images, and takes the same `low` / `high` / `max` thinking depths as the other flash-class Cline models. It uses the login you already saved with `/freeflow cline login` and the same daily free quota, so a request that hits the limit on one saved login rolls to the next exactly like every other Cline model. Nothing about the other providers changes.
+
+### Patch Changes
+
+- Cline logins are used more sensibly, and the message you get when they are all out matches what actually happened.
+
+  A saved login that has used up its daily free allowance for a model is now skipped instead of being retried on every request, so a turn goes straight to a login that still has allowance for that model. A login that starts working again is picked back up on its own.
+
+  When every saved login is out for that model, the answer now says so: it names how many logins were tried, when the nearest reset is, and that switching models or adding another login (`/freeflow cline login`) is what helps — instead of implying that a single login was at fault.
+
+- Kilo models work again. Kilo's gateway now rejects the placeholder credential the proxy used to send and accepts the same request without one, which broke every Kilo-model turn with a 401 "invalid token" error. The proxy no longer sends a credential for Kilo, so its models answer again instead of failing with a 401.
+- Model selection can no longer lose models the extension ships with. When the saved copy of the live catalog was newer than the built-in list and the live refresh could not run, the provider used to be re-registered from that saved copy alone, so a model added in a later update could drop out of model selection until the app was restarted. The saved copy is now always overlaid on the built-in list, so no update can lose models that way.
+- Removed Union Alpha from the model list. It stopped being served upstream: every request is rejected as an unsupported model, on both the chat and the Anthropic Messages paths, so picking it only produced an error. It is gone from model selection and cannot come back through a stale catalog cache. The Anthropic Messages request path itself stays supported for future models.
+
+## 1.23.3
+
+### Patch Changes
+
+- Fix a test that failed intermittently on CI: it compared the whole response body of a chat request, including the timestamp each side stamps when it builds the body. When a request happened to cross a second boundary the two timestamps differed by one and the test went red even though nothing was wrong. The timestamp is no longer compared digit-for-digit, and the test now checks it is a real timestamp instead. No change to how the proxy behaves.
+
+## 1.23.2
+
+### Patch Changes
+
+- Saved Cline logins are now recoverable. The pool keeps a backup copy beside it, so a pool that is missing or unreadable restores itself from the last good set of logins instead of silently coming back empty — losing every saved login to one bad write is no longer permanent. The backup also holds the largest set of logins ever seen, so it survives a run of smaller bad writes rather than being overwritten by the first one. Removing your last login still sticks: an intentionally empty pool is left alone rather than being repopulated from the backup.
+
+## 1.23.1
+
+### Patch Changes
+
+- Cline logins no longer accept the same account twice. Two logins for one account share a single free quota, so the second one added nothing while making it look like you had more capacity — signing in with an account you already saved now says which slot has it and leaves your logins untouched. If a set of logins already contains the same account twice, `/freeflow cline accounts` marks the later one `— same account as [slot]` so you can tell them apart and remove the spare.
+
+## 1.23.0
+
+### Minor Changes
+
+- Adding more Cline logins is now easy. Every login gets its own slot (`default`, `slot-2`, `slot-3`, …) and requests roll across all of them, so a second or third account keeps you working when one hits its free daily limit. The sign-in prompt now shows the link to sign out of Cline in your browser (`/freeflow cline signout` prints it any time), which is what you need to approve the next account with a different email — or use a private window and keep the session you already have. `/freeflow cline accounts` shows each login's email so you can tell them apart.
+
+## 1.22.4
+
+### Patch Changes
+
+- Cline fixes after live testing with a real account. Restoring a signed-in Cline login could return a body that had already been discarded, so instead of Cline's actual error you got a bare "internal error" or an empty message; the real error text now reaches you. A login Cline itself rejects is now recognised as needing a fresh sign-in instead of being retried on every request forever. A request that finds no saved login no longer answers with a rate-limit status, so hosts stop treating "not signed in yet" as "wait and try later". Signing in through the browser no longer outlives its own code, survives a brief blip from the sign-in service, and a login added or removed while a request is running is no longer reverted. The model list now always includes every catalogued model even when a cached copy predates it, and `/freeflow cline accounts` and the remove picker show the account email so logins are easier to tell apart.
+
+## 1.22.3
+
+### Patch Changes
+
+- Cline free models now work for real: DeepSeek V4.1 Flash, Muse Spark 1.3, GLM 5.3 Flash, and Solar Pro 4 all answered live against a signed-in account, over both the chat and responses endpoints, with and without tools. Removed the account lockouts that turned one failed attempt into a long "accounts are cooling down" wait, so every request now tries your saved logins fresh and reports the real upstream error instead of a made-up one. Removing a login is now a picker (`/freeflow cline logout`) instead of typing an exact slot name, and model list correctly labels Cline models as `clinecode`.
+
+## 1.22.2
+
+### Patch Changes
+
+- Fix Cline login flow: the browser link and code now arrive in a single copy-paste block and stay pinned until login finishes, instead of the link scrolling away behind a separate waiting notice. Saved logins also refresh on their own again before expiring, and chatting with no logins saved tells you to add one instead of showing a rate-limit hint.
+
+## 1.22.1
+
+### Patch Changes
+
+- Correct Cline free-model specs: DeepSeek V4.1 Flash and GLM 5.3 Flash are 1M context (not 262K) with vision support and low/high/max thinking levels; Solar Pro 4 is 512K context with the full thinking range. Model selection and docs now show the right numbers.
+
+## 1.22.0
+
+### Minor Changes
+
+- Sign in to Cline right inside the extension: `/freeflow cline login` shows a browser link and code, approves your own Cline account, and saves it to a per-user pool on your machine — no pasting keys. Extra logins auto-name themselves (`default`, `slot-2`, …), saved logins refresh on their own, and requests roll across them when one hits its daily free limit. Pasting a key stays available behind `login --key`. Model selection labels every free model with its source ([OpenCode], [Kilo], [Cline]).
+
+## 1.21.0
+
+### Minor Changes
+
+- Use Cline free models with your own Cline login: `/freeflow cline login` signs in through your browser and saves it to a per-user pool on your machine, `/freeflow cline accounts` lists saved logins, and `/freeflow cline logout` removes one. Adds DeepSeek V4.1 Flash, Muse Spark 1.3, GLM 5.3 Flash, and Solar Pro 4 from Cline's free rotation, and labels every free model with its source ([OpenCode], [Kilo], [Cline]) in model selection. Requests roll across saved logins when one hits its daily free limit or fails.
+
+## 1.20.0
+
+### Minor Changes
+
+- Every tool from both supported hosts now works on every free model, including the models served on the dedicated responses endpoint. The proxy also tracks the latest client version in the background and always identifies itself with a supported one, so free-tier access keeps working as new releases come out.
+
+  Also new: a daily automated check watches for upstream changes (new releases, free-model list and pricing changes) and files an issue when anything drifts, plus an opt-in script that verifies all tools end-to-end against the live free tier.
+
 ## 1.19.0
 
 ### Minor Changes
@@ -12,11 +128,11 @@
 
 - OpenCode free-tier client fingerprinting: plain chat, subagent, evaluation, and background watchdog requests now pass upstream free-tier gates without error. The proxy automatically supplies compatibility tools and streaming conventions expected by the upstream gateway, while transparently converting responses to standard non-streaming format for callers that request it.
 
- ## 1.17.1
+## 1.17.1
 
- ### Patch Changes
+### Patch Changes
 
- - Assistant and subagent requests now stay working when the shared free-tier gateway refuses sessions: retried and resumed conversations automatically continue on a healthy fallback model instead of repeating the refusal, and normal routing resumes on its own once the gateway recovers.
+- Assistant and subagent requests now stay working when the shared free-tier gateway refuses sessions: retried and resumed conversations automatically continue on a healthy fallback model instead of repeating the refusal, and normal routing resumes on its own once the gateway recovers.
 
 ## 1.17.0
 
