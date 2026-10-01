@@ -14,8 +14,8 @@ All commands are available inside the OMP or Pi TUI via `/freeflow`:
 | `/freeflow label <index&vert;url> <name>` | Assign a friendly label to a relay |
 | `/freeflow remove <index&vert;url&vert;label>` | Remove a relay from the pool |
 | `/freeflow test <index&vert;url&vert;label>` | Probe a relay for reachability (HTTP 200 + latency) |
-| `/freeflow on &vert; off &vert; auto` | Toggle relay mode (auto = enabled for freeflow) |
-| `/freeflow deploy <platform>` | Guided relay deploy (vercel, cloudflare, deno) |
+| `/freeflow on &vert; off &vert; auto &vert; spread` | Relay mode (auto = enabled for freeflow, spread = rotate across the healthy relays) |
+| `/freeflow deploy <platform>` | Guided relay deploy (cloudflare, deno, vercel — Cloudflare recommended, Vercel last resort) |
 | `/freeflow logs [lines]` | Inspect recent proxy logs |
 | `/freeflow trace [req-id]` | Tail logs filtered by request correlation ID |
 | `/freeflow refresh` | Force reload models from live upstream APIs |

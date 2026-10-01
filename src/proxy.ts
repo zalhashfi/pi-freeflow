@@ -71,7 +71,7 @@ import {
  isExpiredReasoningReference,
  isReasoningCallerMismatch,
 } from "./responses.ts";
-import { pipeUpstreamStream } from "./stream-pipe.ts";
+import { pipeUpstreamStream, type StreamCloakOptions } from "./stream-pipe.ts";
 import {
  decideZenRoute,
  isUnprovenSession,
@@ -109,7 +109,7 @@ export function _reset429HintForTest(): void { last429HintAt = 0; }
 
 /** Deploy guidance attached to a natural upstream 429 once the throttle allows. */
 const RATE_LIMIT_HINT =
- "Shared free-tier IP quota reached. Add your own relay egress: /freeflow deploy (Vercel 1M/mo recommended)";
+ "Shared free-tier IP quota reached. Add your own relay egress: /freeflow deploy (Cloudflare recommended, 100k req/day free)";
 
 /**
  * Attach the deploy hint to a natural upstream 429 JSON body. Anything else —
@@ -1050,6 +1050,12 @@ export function startProxy(
     callerInjected = fp.injected;
     bodyModified = true;
    }
+   // Streaming cloak: thread this request's placeholder records into the SSE
+   // pipe so streamed deltas get the same strip+restore as aggregated bodies.
+   // Kilo/Cline bypass the fingerprint, so their streams stay verbatim.
+   const streamCloak: StreamCloakOptions | undefined = !isKilo && !isCline && callerInjected !== undefined
+    ? { callerHadTools, caseRestore: callerCaseRestore, findGlob: callerFindGlob, injected: callerInjected, pathname: target.pathname }
+    : undefined;
 
    const isStream = clientRequestedStream;
 
@@ -1250,6 +1256,7 @@ export function startProxy(
            reqId,
            {
             preferred: typeof issuer === "string" ? issuer : undefined,
+            spreadKey: conversationKey ?? reqId,
             onServed: (relay) => {
              servedIssuer = relay;
              issuerReported = true;
@@ -1317,11 +1324,16 @@ export function startProxy(
           res,
           req,
           reqId,
-          relayState.url,
+          servedIssuer ?? "direct",
+          streamCloak,
          );
         } else {
          if (!response.ok) {
-          log("warn", `upstream ${response.status} for model ${String((parsedBody as Record<string, unknown> | null)?.model ?? "?")} via relay ${relayState.url || "pool"}`, { status: response.status, model: (parsedBody as Record<string, unknown> | null)?.model, path: req.url, relay: relayState.url }, reqId);
+          // Attribute the failure to the relay that actually served this turn,
+          // not the machine-wide sticky/affinity primary, which may be a
+          // different host entirely (logged the wrong relay before this).
+          const servedRelay = servedIssuer ?? "direct";
+          log("warn", `upstream ${response.status} for model ${String((parsedBody as Record<string, unknown> | null)?.model ?? "?")} via ${servedRelay === "direct" ? "direct upstream" : `relay ${servedRelay}`}`, { status: response.status, model: (parsedBody as Record<string, unknown> | null)?.model, path: req.url, relay: servedRelay }, reqId);
          }
          let rawText = await response.text();
          let ct =
@@ -1496,6 +1508,7 @@ export function startProxy(
         req,
         reqId,
         "direct",
+        streamCloak,
        );
       } else if (upstreamRes.body) {
        let rawText = await upstreamRes.text();

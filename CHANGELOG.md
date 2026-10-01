@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.30.0
+
+### Minor Changes
+
+- **Spread relay mode.** `/freeflow spread` sends each request to a rotating healthy relay instead of always starting at one sticky relay, so parallel sessions and subagents land on different egress IPs rather than crowding a single one. A conversation's reasoning issuer still outranks the rotation, so in-progress chats are never rerouted, and a relay that is cooling down is never preferred. The interactive relay menu and `/freeflow status` show the new mode.
+
+  **Helper tools the proxy injects for API compatibility can no longer reach your host.** On the messages API path those injected tool calls were passed straight through; they are now stripped on every path, and a host that declares no tools never receives tool calls at all.
+
+  **Injected file-search helper now matches the shape your host expects**, so a call to it executes instead of being rejected.
+
+## 1.29.0
+
+### Minor Changes
+
+- e119a71: Sync upstream tracking to v1.18.34 and land compatibility improvements: Vercel relays are now treated as a last resort behind Cloudflare with clear quota guidance, new relays show when a deployment is disabled by quota, and streamed responses plus tool-using callers stay compatible through the local proxy.
+
+## 1.28.1
+
+### Patch Changes
+
+- Retry relay reachability checks after deployment so edge routing propagation delays do not show a fresh relay as unreachable — the check retries with progress notices and only warns if the relay stays dark.
+
+  Fix upstream drift alerts to stop flagging commercial paid model families as free candidates, while known alpha and stealth free models keep their free status.
+
+## 1.28.0
+
+### Minor Changes
+
+- 526d43f: Refresh the free model catalog to the current live rotation (33 models).
+
+  - New: Space Bunny Alpha on the KiloCode Gateway free list (1M context window) — pick it with the short name `space-bunny-alpha`.
+  - Back: Step 3.7 Flash returns to the KiloCode Gateway free list after a live serving re-check.
+  - Retired from the picker: Nex N2.5 Pro, Nex N2.5 Mini, and GLM 5.2 free — all three are gone from the free list (only paid versions remain).
+
+- 526d43f: Add LongCat 2.5 Preview Free (`longcat-2.5-preview-free`) from OpenCode Zen with a 1M context window, reasoning, and vision.
+
+  Fix upstream drift detection to accurately recognize free and alpha models while excluding commercial paid model families from candidate suggestions.
+
+### Patch Changes
+
+- 526d43f: Retry relay reachability verification after deployment so edge DNS and routing propagation delays (such as newly created Cloudflare Workers routes) do not show a false unreachable warning.
+
 ## 1.27.0
 
 ### Minor Changes

@@ -12,7 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getClientPort, isJsRuntimeExecutable, resolveDaemonRuntime } from "./client.ts";
 import { refreshCatalog, setAliveCatalog } from "./catalog.ts";
-import { DAEMON_SPAWN_ENV, DEBUG_STATE_FILE, HOST, LOG_FILE, PORT, RELAY_STATE_FILE } from "./config.ts";
+import { DAEMON_SPAWN_ENV, DATA_DIR_ENV, DEBUG_STATE_FILE, HOST, LOG_FILE, PORT, RELAY_STATE_FILE } from "./config.ts";
 import {
  compareVersions,
  fetchLatestVersion,
@@ -95,6 +95,17 @@ export function tokenizeArgs(input: string): string[] {
   tokens.push((match[1] ?? match[2] ?? match[0]).trim());
  }
  return tokens.filter(Boolean);
+}
+
+let deployProbeRetries = 5;
+let deployProbeRetryDelayMs: number | null = null;
+
+/** Test-only: override post-deploy probe retry count and delay. */
+export function _setDeployProbeOptionsForTest(
+ opts: { retries?: number; retryDelayMs?: number } | null,
+): void {
+ deployProbeRetries = opts?.retries ?? 5;
+ deployProbeRetryDelayMs = opts?.retryDelayMs ?? null;
 }
 
 export interface StartupPlan {
@@ -516,10 +527,11 @@ export function createCommandSpec(
 ): Omit<RegisteredCommand, "name"> {
  return {
   description:
-   "Relay egress: auto | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update | deploy vercel | deploy cloudflare | deploy deno | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot]",
+   "Relay egress: auto | spread | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update | deploy cloudflare | deploy deno | deploy vercel | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot]",
   getArgumentCompletions: (prefix: string) =>
    [
     "auto",
+    "spread",
     "on",
     "off",
     "hide",
@@ -538,9 +550,9 @@ export function createCommandSpec(
     "test opencode",
     "url",
     "deploy",
-    "deploy vercel",
     "deploy cloudflare",
     "deploy deno",
+    "deploy vercel",
     "install-startup",
     "uninstall-startup",
     "cline",
@@ -668,20 +680,20 @@ export function createCommandSpec(
    };
 
    const DEPLOY_OPTIONS: Record<string, DeployPlatform> = {
-    "Vercel (1M req/mo — recommended)": "vercel",
-    "Cloudflare (100k req/day)": "cloudflare",
+    "Cloudflare (100k req/day — recommended)": "cloudflare",
     "Deno Deploy (100k req/day)": "deno",
+    "Vercel (last resort — Hobby 10GB origin cap)": "vercel",
    };
 
    const parseDeployPlatform = (raw?: string): DeployPlatform | null => {
     const v = (raw || "").trim().toLowerCase();
-    if (!v || v === "vercel") return "vercel";
-    if (v === "cloudflare" || v === "cf") return "cloudflare";
+    if (!v || v === "cloudflare" || v === "cf") return "cloudflare";
     if (v === "deno") return "deno";
+    if (v === "vercel") return "vercel";
     return null;
    };
 
-   const doDeploy = async (platform: DeployPlatform = "vercel") => {
+   const doDeploy = async (platform: DeployPlatform = "cloudflare") => {
     const defaultName = `relay-${Date.now().toString(36)}`;
     const label =
      platform === "cloudflare"
@@ -768,7 +780,18 @@ export function createCommandSpec(
      }
      let probeNote = "";
      try {
-      const probe = await probeRelay(finalUrl, auth);
+      const retryDelay =
+       deployProbeRetryDelayMs ?? (process.env[DATA_DIR_ENV] ? 10 : 2000);
+      const probe = await probeRelay(finalUrl, auth, {
+       retries: deployProbeRetries,
+       retryDelayMs: retryDelay,
+       onRetry: (attempt, total) => {
+        ctx.ui.notify(
+         `Waiting for edge routing to propagate (${attempt}/${total})…`,
+         "info",
+        );
+       },
+      });
       probeNote = probe.ok
        ? ` ✓ reachable (HTTP ${probe.status}, ${probe.latencyMs}ms)`
        : ` ⚠ deployed but unreachable (${probe.error || `HTTP ${probe.status}`}) — run /freeflow test ${finalUrl} to retry, or /freeflow remove ${finalUrl} to drop it`;
@@ -823,6 +846,10 @@ export function createCommandSpec(
      ctx.ui.notify("No saved relays (direct upstream mode)", "info");
      return;
     }
+    const isDeadParked = (url: string): boolean => {
+     const h = getRelayHealth(url);
+     return h != null && h.lastStatus === 402 && Date.now() < h.cooldownUntil;
+    };
     const lines = relayState.relays.map((r, idx) => {
      const star = r.url === relayState.url ? "★" : " ";
      const shortName = r.label ? `[${r.label}]` : `[${shortRelayLabel(r.url, relayState.relays)}]`;
@@ -830,11 +857,13 @@ export function createCommandSpec(
      const health = getRelayHealth(r.url);
      const isCooling = health && Date.now() < health.cooldownUntil;
      const remainingSec = isCooling ? Math.ceil((health.cooldownUntil - Date.now()) / 1000) : 0;
-     const healthBadge = isCooling
-      ? ` ⚠️ [cooling ${remainingSec}s: ${health.lastStatus ? `HTTP ${health.lastStatus}` : "error"}]`
-      : health?.lastLatencyMs != null && Number.isFinite(health.lastLatencyMs)
-       ? ` ✓ [${health.lastLatencyMs}ms]`
-       : " ✓";
+     const healthBadge = isDeadParked(r.url)
+      ? ` ✖ [dead — HTTP 402 disabled deployment, parked ${remainingSec}s]`
+      : isCooling
+       ? ` ⚠️ [cooling ${remainingSec}s: ${health.lastStatus ? `HTTP ${health.lastStatus}` : "error"}]`
+       : health?.lastLatencyMs != null && Number.isFinite(health.lastLatencyMs)
+        ? ` ✓ [${health.lastLatencyMs}ms]`
+        : " ✓";
      const counterText = health && (health.successCount != null || health.failureCount != null)
       ? ` ${health.successCount ?? 0} ok / ${health.failureCount ?? 0} fail`
       : "";
@@ -1068,6 +1097,18 @@ export function createCommandSpec(
     });
     persist();
     flash();
+   } else if (sub === "spread") {
+    applyRelayState((s) => {
+     s.mode = "spread";
+     s.enabled = true;
+     s.url = s.url || "";
+     if (s.url) {
+      ensureRelay(s, s.url);
+     }
+     return s;
+    });
+    persist();
+    flash();
    } else if (sub === "on") {
     applyRelayState((s) => {
      s.mode = "on";
@@ -1122,7 +1163,9 @@ export function createCommandSpec(
       ? "Mode: off (always direct)"
       : relayState.mode === "on"
        ? "Mode: on (always relay)"
-       : "Mode: auto (enabled on session, auto-rolls on 429/5xx)";
+       : relayState.mode === "spread"
+        ? "Mode: spread (rotates across healthy relays, auto-rolls on 429/5xx)"
+        : "Mode: auto (enabled on session, auto-rolls on 429/5xx)";
     const poolLine = `${relayState.relays.length} relay(s)${relayState.relays.length > 0
      ? ` | active: ${shortRelayLabel(relayState.url, relayState.relays)}`
      : ""
@@ -1137,7 +1180,14 @@ export function createCommandSpec(
      })
      .join(" | ");
     const clineLine = formatClineStatusSnippet(loadPool());
-    ctx.ui.notify(`${modeLine} | ${poolLine}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}`, "info");
+    const deadParked = relayState.relays.filter((r) => {
+     const h = getRelayHealth(r.url);
+     return h != null && h.lastStatus === 402 && Date.now() < h.cooldownUntil;
+    });
+    const deadLine = deadParked.length
+     ? `\nDead relays (HTTP 402 disabled deployment, parked): ${deadParked.map((r) => r.url).join(", ")} — delete the Vercel project, run /freeflow remove <url>, then deploy Cloudflare`
+     : "";
+    ctx.ui.notify(`${modeLine} | ${poolLine}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}${deadLine}`, "info");
    } else if (sub === "kill" || sub === "stop" || sub === "shutdown") {
     const port = getClientPort() || PORT;
     try {
@@ -1808,7 +1858,7 @@ export function createCommandSpec(
      const pf = parseDeployPlatform(rest);
      if (!pf) {
       ctx.ui.notify(
-       "Unknown platform. Use: vercel | cloudflare | deno",
+       "Unknown platform. Use: cloudflare | deno | vercel",
        "warning",
       );
      } else {
@@ -1833,12 +1883,13 @@ export function createCommandSpec(
      "Share relays (export file)…",
      "Load relays from file (import)…",
      "List saved relays",
-     "Deploy Vercel relay…",
      "Deploy Cloudflare relay…",
      "Deploy Deno relay…",
+     "Deploy Vercel relay (last resort)…",
      "Mode: AUTO (auto-detect on model select)",
      "Mode: ON (always relay)",
      "Mode: OFF (always direct)",
+     "Mode: SPREAD (rotate across healthy relays)",
     ]);
     if (choice === `Mode: ${currentMode} (${relayState.enabled ? "ON" : "OFF"}) → ${activeLabel}`) {
      flash();
@@ -1858,7 +1909,7 @@ export function createCommandSpec(
      await runImport(picked, "merge", false);
     } else if (choice === "List saved relays") {
      showList();
-    } else if (choice === "Deploy Vercel relay…") {
+    } else if (choice === "Deploy Vercel relay (last resort)…") {
      await doDeploy("vercel");
     } else if (choice === "Deploy Cloudflare relay…") {
      await doDeploy("cloudflare");
@@ -1892,6 +1943,18 @@ export function createCommandSpec(
      applyRelayState((s) => {
       s.mode = "off";
       s.enabled = false;
+      return s;
+     });
+     persist();
+     flash();
+    } else if (choice === "Mode: SPREAD (rotate across healthy relays)") {
+     applyRelayState((s) => {
+      s.mode = "spread";
+      s.enabled = true;
+      s.url = s.url || "";
+      if (s.url) {
+       ensureRelay(s, s.url);
+      }
       return s;
      });
      persist();

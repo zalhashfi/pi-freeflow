@@ -16,8 +16,8 @@ Thin by design: a model list, a relay proxy, and a log. The host (`pi-ai`) handl
 
 | Feature | What it does | Cost |
 | :--- | :--- | :--- |
-| **33 free models** | 9 from OpenCode Zen, 19 from KiloCode Gateway, 5 from Cline, context windows up to 1M. Full list below. | **$0** |
-| **Relay pool** | Route requests through your own Cloudflare Workers and Vercel Edge relays. Requests rotate across the pool. A relay that rate-limits, times out, or drops the connection cools down while healthy ones take its traffic. | **$0** beyond your platforms' free tiers |
+| **33 free models** | 10 from OpenCode Zen, 18 from KiloCode Gateway, 5 from Cline, context windows up to 1M. Full list below. | **$0** |
+| **Relay pool** | Route requests through your own Cloudflare Workers and Vercel Edge relays. Traffic spreads across the pool, or stays on one sticky relay. A relay that rate-limits, times out, or drops the connection cools down while healthy ones take its traffic. | **$0** beyond your platforms' free tiers |
 | **Automatic fallback** | When every relay is cooling down, requests go direct to upstream instead of failing. | **$0** |
 | **Short model names** | Every model has a slash-free, colon-free alias, plus an optional `:effort` suffix for thinking depth. You type `freeflow/<name>`. | **$0** |
 | **Shared local proxy** | One daemon on `127.0.0.1:28180` serves every session on the machine, so parallel subagents reuse it instead of opening their own connections. | **$0** |
@@ -82,17 +82,24 @@ stays in memory and is never written to disk.
 
 Manual fallback per platform:
 
-**Option A: Cloudflare Workers, auto deploy**
+**Option A: Cloudflare Workers, auto deploy (recommended)**
 ```bash
 /freeflow deploy cloudflare  # prompts token in-memory, auto-adds to pool
+# or shorthand: /freeflow deploy (defaults to Cloudflare)
 ```
 Manual fallback: `dash.cloudflare.com` → Workers → Create → Deploy → Edit code → paste the canonical worker source (see below) → Deploy → `/freeflow add https://your.workers.dev cf-worker-1`
 
-**Option B: Vercel Edge Relay, auto deploy**
+**Option B: Deno Deploy, auto deploy**
+```bash
+/freeflow deploy deno  # prompts token in-memory, auto-adds to pool
+```
+Manual fallback: `dash.deno.com` → New Project → Playground → paste the canonical worker source (see below) → Deploy → `/freeflow add https://your-project.deno.dev deno-relay-1`
+
+**Option C: Vercel Edge Relay (last resort, paid plan only)**
 ```bash
 /freeflow deploy vercel  # prompts token in-memory, auto-adds to pool
-# or shorthand: /freeflow deploy
 ```
+Only use with a paid plan: the Hobby plan caps Fast Origin Transfer at 10 GB (~1.2 MB per streaming turn, about 8,000 turns), then every deployment in the project returns HTTP 402 until the quota resets.
 Manual fallback: push 2 files (`api/relay.js` + `vercel.json`) to GitHub, then Import on `vercel.com`, then `/freeflow add https://your.vercel.app vercel-relay-1`
 
 For `api/relay.js`, use the canonical worker source (see below); `vercel.json` stays:
@@ -100,12 +107,6 @@ For `api/relay.js`, use the canonical worker source (see below); `vercel.json` s
 ```json
 { "rewrites": [{ "source": "/(.*)", "destination": "/api/relay" }] }
 ```
-
-**Option C: Deno Deploy, auto deploy**
-```bash
-/freeflow deploy deno  # prompts token in-memory, auto-adds to pool
-```
-Manual fallback: `dash.deno.com` → New Project → Playground → paste the canonical worker source (see below) → Deploy → `/freeflow add https://your-project.deno.dev deno-relay-1`
 
 **Canonical worker source (all platforms)**
 
@@ -166,7 +167,7 @@ The same command set works identically in OMP and Pi:
 /freeflow label <index|url> <name># Assign a friendly label to a relay
 /freeflow remove <index|url|label># Remove a relay from the pool
 /freeflow test <index|url|label>  # Probe a relay for reachability and latency
-/freeflow on | off | auto         # Toggle relay mode (auto = enabled for freeflow)
+/freeflow on|off|auto|spread     # Relay mode (auto = enabled for freeflow, spread = rotate pool)
 /freeflow deploy <platform>       # Guided relay deploy: vercel|cloudflare|deno, token in-memory, auto-adds
 /freeflow logs [lines]            # Inspect recent proxy logs
 /freeflow trace [req-id]          # Tail logs filtered by request correlation ID
@@ -184,13 +185,13 @@ The same command set works identically in OMP and Pi:
 
 ---
 
-### 33 models, one command
+### 31 models, one command
 
 ```bash
 /model → freeflow → pick
 ```
 
-#### OpenCode Zen (9 models), Responses and Chat API
+#### OpenCode Zen (10 models), Responses and Chat API
 
 Good defaults for long coding sessions and agentic work.
 
@@ -203,10 +204,10 @@ Good defaults for long coding sessions and agentic work.
 | `nemotron-3.5-lightning-free` | NVIDIA | **1M** (1.000.000) | **262K** (262.144) | `minimal … xhigh` | ❌ |
 | `nemotron-3-ultra-free` | NVIDIA | **1M** (1.000.000) | **128K** (128.000) | `minimal … xhigh` | ❌ |
 | `big-pickle` | Big Pickle | **200K** (200.000) | **32K** (32.000) | `high / max` | ❌ |
-| `ling-3.0-flash-fin-free` | Inclusion AI | **262K** (262.144) | **131K** (131.072) | `minimal … xhigh` | ❌ |
 | `space-bunny-free` | Stealth preview (lab undisclosed) | **1M** (1.048.576) | **512K** (524.288) | `low … max` | ✅ |
+| `longcat-2.5-preview-free` | Meituan LongCat | **1M** (1.000.000) | **131K** (131.072) | `minimal … max` | ✅ |
 
-#### KiloCode Gateway (19 models), OpenRouter compatible
+#### KiloCode Gateway (18 models), OpenRouter compatible
 
 Keyless access. Short aliases work for every row (the full ID is in parentheses).
 
@@ -224,13 +225,11 @@ Keyless access. Short aliases work for every row (the full ID is in parentheses)
 | `kilo-auto` (`kilo-auto/free`) | Kilo Gateway Auto | **256K** (256.000) | **10K** (10.000) | `minimal…xhigh`\* | ❌ |
 | `openrouter` (`openrouter/free`) | OpenRouter Free | **200K** (200.000) | **65K** (65.536) | `minimal…xhigh`\* | ✅ |
 | `content-safety` (`nvidia/...:free`) | NVIDIA | **128K** (128.000) | **8K** (8.192) | ❌ *(non-thinking)* | ✅ |
-| `ling-3.0-flash-fin` (`inclusionai/ling-3.0-flash-fin:free`) | Inclusion AI | **262K** (262.144) | **32K** (32.768) | `minimal…xhigh`\* | ❌ |
 | `ling-3.0-flash-sante` (`inclusionai/ling-3.0-flash-sante:free`) | Inclusion AI | **262K** (262.144) | **32K** (32.768) | `minimal…xhigh`\* | ❌ |
-| `nex-n2.5-pro` (`nex-agi/nex-n2.5-pro:free`) | Nex AGI | **262K** (262.144) | **235K** (235.929) | `minimal…xhigh`\* | ✅ |
-| `nex-n2.5-mini` (`nex-agi/nex-n2.5-mini:free`) | Nex AGI | **262K** (262.144) | **235K** (235.929) | `minimal…xhigh`\* | ✅ |
+| `step-3.7-flash` (`stepfun/...:free`) | StepFun | **262K** (262.144) | **262K** (262.144) | `minimal…xhigh`\* | ✅ |
+| `space-bunny-alpha` (`stealth/...`) | Stealth preview (lab undisclosed) | **1M** (1.000.000) | **512K** (524.288) | `minimal…xhigh`\* | ✅ |
 | `inkling-small` (`thinkingmachines/inkling-small:free`) | Thinking Machines | **1M** (1.048.576) | **262K** (262.144) | `minimal…xhigh`\* | ✅ |
 | `qwen3.8-27b` (`qwen/...:free`) | Alibaba Qwen | **262K** (262.144) | **235K** (235.929) | `minimal…xhigh`\* | ✅ |
-| `glm-5.2` (`z-ai/...:free`) | Zhipu AI | **32K** (32.768) | **29K** (29.491) | `minimal…xhigh`\* | ❌ |
 
 \* Levels are forwarded as-is through the OpenRouter-style nested `reasoning` parameter; effort mapping is decided by each model. MiMo collapses `minimal→low` and `xhigh→high` upstream, so its selector shows 5 labels but only 3 distinct effort values.
 
@@ -343,10 +342,10 @@ pnpm smoke       # verifies extensions/index.ts loads without crashing
 ```
 src/
 ├── index.ts          # extension entry, lifecycle hooks
-├── models.ts         # 33-model catalog definitions
+├── models.ts         # 31-model catalog definitions
 ├── catalog.ts        # model catalog cache (24h disk)
 ├── proxy.ts          # local proxy server (127.0.0.1:28180)
-├── relay.ts          # relay selection and round-robin
+├── relay.ts          # relay fetch, rolling on retryable failures
 ├── relay-state.ts    # relay pool state, health tracking
 ├── stream-pipe.ts    # SSE stream piping and truncation resilience
 ├── commands.ts       # /freeflow CLI subcommands

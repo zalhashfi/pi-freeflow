@@ -1,9 +1,9 @@
 /**
  * Static model definitions and upstream routing catalogs for pi-freeflow
  *
- * Defines the 33 verified free models:
- * - 9 OpenCode Zen models (2 Responses API + 7 Chat Completions)
- * - 19 KiloCode Keyless Gateway models (18 OpenRouter format + 1 Standard format)
+ * Defines the 33 verified free models (live-verified 2026-09-28):
+ * - 10 OpenCode Zen models (2 Responses API + 8 Chat Completions)
+ * - 18 KiloCode Keyless Gateway models (OpenRouter format)
  * - 5 Cline direct-only models (per-user pool)
  */
 
@@ -16,7 +16,7 @@ import type { ModelDef, ThinkingLevelMap, Upstream } from "./types.ts";
 export const OPENCODE_MODELS: ModelDef[] = [
  {
   id: "muse-spark-1.2-contributor-free",
-  name: "Muse Spark 1.2 (1M) [OpenCode]",
+  name: "Muse Spark 1.2 [OpenCode]",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 131_072,
@@ -34,7 +34,7 @@ export const OPENCODE_MODELS: ModelDef[] = [
  },
  {
   id: "muse-spark-1.3-contributor-free",
-  name: "Muse Spark 1.3 (1M) [OpenCode]",
+  name: "Muse Spark 1.3 [OpenCode]",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 131_072,
@@ -52,7 +52,7 @@ export const OPENCODE_MODELS: ModelDef[] = [
  },
  {
   id: "mimo-v2.5-free",
-  name: "MiMo V2.5 (1M) [OpenCode]",
+  name: "MiMo V2.5 [OpenCode]",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 131_072,
@@ -69,7 +69,7 @@ export const OPENCODE_MODELS: ModelDef[] = [
  },
  {
   id: "mimo-v2.6-flash-free",
-  name: "MiMo V2.6 Flash (1M) [OpenCode]",
+  name: "MiMo V2.6 Flash [OpenCode]",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 131_072,
@@ -86,7 +86,7 @@ export const OPENCODE_MODELS: ModelDef[] = [
  },
  {
   id: "nemotron-3-ultra-free",
-  name: "Nemotron 3 Ultra (1M) [OpenCode]",
+  name: "Nemotron 3 Ultra [OpenCode]",
   reasoning: true,
   contextWindow: 1_000_000,
   maxTokens: 128_000,
@@ -103,7 +103,7 @@ export const OPENCODE_MODELS: ModelDef[] = [
  },
  {
   id: "nemotron-3.5-lightning-free",
-  name: "Nemotron 3.5 Lightning (1M) [OpenCode]",
+  name: "Nemotron 3.5 Lightning [OpenCode]",
   reasoning: true,
   contextWindow: 1_000_000,
   maxTokens: 262_144,
@@ -136,25 +136,8 @@ export const OPENCODE_MODELS: ModelDef[] = [
   },
  },
  {
-  id: "ling-3.0-flash-fin-free",
-  name: "Ling 3.0 Flash Fin (256K) [OpenCode]",
-  reasoning: true,
-  contextWindow: 262_144,
-  maxTokens: 131_072,
-  input: ["text"],
-  thinkingLevelMap: {
-   off: null,
-   minimal: "minimal",
-   low: "low",
-   medium: "medium",
-   high: "high",
-   xhigh: "xhigh",
-   max: null,
-  },
- },
- {
   id: "space-bunny-free",
-  name: "Space Bunny Free (1M) [OpenCode]",
+  name: "Space Bunny Free [OpenCode]",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 524_288,
@@ -162,6 +145,23 @@ export const OPENCODE_MODELS: ModelDef[] = [
   thinkingLevelMap: {
    off: null,
    minimal: null,
+   low: "low",
+   medium: "medium",
+   high: "high",
+   xhigh: "xhigh",
+   max: "max",
+  },
+ },
+ {
+  id: "longcat-2.5-preview-free",
+  name: "LongCat 2.5 Preview [OpenCode]",
+  reasoning: true,
+  contextWindow: 1_000_000,
+  maxTokens: 131_072,
+  input: ["text", "image"],
+  thinkingLevelMap: {
+   off: null,
+   minimal: "minimal",
    low: "low",
    medium: "medium",
    high: "high",
@@ -214,7 +214,7 @@ export const KILO_MODELS: ModelDef[] = [
  },
  {
   id: "nvidia/nemotron-3-ultra-550b-a55b:free",
-  name: "Nemotron 3 Ultra 550B (1M) [Kilo]",
+  name: "Nemotron 3 Ultra 550B [Kilo]",
   reasoning: true,
   contextWindow: 1_000_000,
   maxTokens: 128_000,
@@ -311,38 +311,33 @@ export const KILO_MODELS: ModelDef[] = [
   input: ["text", "image"],
  },
  {
-  id: "inclusionai/ling-3.0-flash-fin:free",
-  name: "Ling 3.0 Flash Fin [Kilo]",
+  // Resurrected 2026-09-28: back on the live Kilo free list
+  // (isFree:true, 0/0 pricing, no expiry) + keyless chat 200.
+  id: "stepfun/step-3.7-flash:free",
+  name: "Step 3.7 Flash [Kilo]",
   reasoning: true,
   contextWindow: 262_144,
-  maxTokens: 32_768,
-  input: ["text"],
-  thinkingFormat: "openrouter",
-  thinkingLevelMap: KILO_REASONING_MAP,
- },
- {
-  id: "nex-agi/nex-n2.5-pro:free",
-  name: "Nex N2.5 Pro [Kilo]",
-  reasoning: true,
-  contextWindow: 262_144,
-  maxTokens: 235_929,
+  maxTokens: 262_144,
   input: ["text", "image"],
   thinkingFormat: "openrouter",
   thinkingLevelMap: KILO_REASONING_MAP,
  },
  {
-  id: "nex-agi/nex-n2.5-mini:free",
-  name: "Nex N2.5 Mini [Kilo]",
+  // Added 2026-09-28: live on the Kilo free list (isFree:true, 0/0
+  // pricing, 1M context, text+image in) + keyless chat 200. Passes
+  // isFreeCatalogId via MODEL_MAP (no :free suffix by design).
+  id: "stealth/space-bunny-alpha",
+  name: "Space Bunny Alpha [Kilo]",
   reasoning: true,
-  contextWindow: 262_144,
-  maxTokens: 235_929,
+  contextWindow: 1_000_000,
+  maxTokens: 524_288,
   input: ["text", "image"],
   thinkingFormat: "openrouter",
   thinkingLevelMap: KILO_REASONING_MAP,
  },
  {
   id: "thinkingmachines/inkling-small:free",
-  name: "Inkling Small (1M) [Kilo]",
+  name: "Inkling Small [Kilo]",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 262_144,
@@ -367,16 +362,6 @@ export const KILO_MODELS: ModelDef[] = [
   contextWindow: 262_144,
   maxTokens: 235_929,
   input: ["text", "image"],
-  thinkingFormat: "openrouter",
-  thinkingLevelMap: KILO_REASONING_MAP,
- },
- {
-  id: "z-ai/glm-5.2:free",
-  name: "GLM 5.2 [Kilo]",
-  reasoning: true,
-  contextWindow: 32_768,
-  maxTokens: 29_491,
-  input: ["text"],
   thinkingFormat: "openrouter",
   thinkingLevelMap: KILO_REASONING_MAP,
  },
@@ -431,7 +416,7 @@ export const CLINE_MODELS: ModelDef[] = [
  },
  {
   id: "cline-free/muse-spark-1.3-contributor",
-  name: "Muse Spark 1.3 (1M) [Cline]",
+  name: "Muse Spark 1.3 [Cline]",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 131_072,
@@ -496,15 +481,15 @@ export const MODEL_ALIASES: Record<string, string> = {
  "north-mini-code": "cohere/north-mini-code:free",
  "lfm-2.5": "liquid/lfm-2.5-2.6b:free",
  "content-safety": "nvidia/nemotron-3.5-content-safety:free",
- "ling-3.0-flash-fin": "inclusionai/ling-3.0-flash-fin:free",
  "ling-3.0-flash-sante": "inclusionai/ling-3.0-flash-sante:free",
- "nex-n2.5-pro": "nex-agi/nex-n2.5-pro:free",
- "nex-n2.5-mini": "nex-agi/nex-n2.5-mini:free",
+ "step-3.7-flash": "stepfun/step-3.7-flash:free",
+ "space-bunny-alpha": "stealth/space-bunny-alpha",
  "inkling-small": "thinkingmachines/inkling-small:free",
  "mimo-v2.6-flash": "mimo-v2.6-flash-free",
  "space-bunny": "space-bunny-free",
+ "longcat-2.5-preview": "longcat-2.5-preview-free",
+ "longcat": "longcat-2.5-preview-free",
  "qwen3.8-27b": "qwen/qwen3.8-27b:free",
- "glm-5.2": "z-ai/glm-5.2:free",
  // provider-prefixed short aliases (slash-normalized)
  "laguna-s-2.1:free": "poolside/laguna-s-2.1:free",
  "laguna-xs-2.1:free": "poolside/laguna-xs-2.1:free",
