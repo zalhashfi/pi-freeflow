@@ -2,10 +2,10 @@
  * Comprehensive End-to-End (E2E) Test Suite: New User Lifecycle & System Contracts
  *
  * Covers:
- * 1. Fresh bootstrap & provider registration (31 models on default port 28180)
+ * 1. Fresh bootstrap & provider registration (full static catalog on the resolved port)
  * 2. CLI exit safety (server.unref() allows installer/CLI commands to exit cleanly)
  * 3. Multi-session daemon reuse (zero-duplicate single-port architecture)
- * 4. Legacy migration & dual-probe backward compatibility (18080 fallback)
+ * 4. Single-port architecture (default port 28180)
  * 5. Self-healing daemon recovery (ensureDaemon restarts dead proxy)
  * 6. Dual-upstream routing matrix (OpenCode Zen vs KiloCode Gateway)
  * 7. Relay pool lifecycle (ensureRelay, removeRelay, mode toggles, atomic persistence)
@@ -13,6 +13,11 @@
  * 9. SSE stream truncation resilience (substantial >100KB -> incomplete vs small -> failed)
  * 10. Security & edge guardrails (SSRF, path traversal, header denylist, method whitelist)
  */
+// MUST be literal first import: it disables detached-daemon spawn before
+// src/config.ts is evaluated and supplies the fetch stub whose daemon answer
+// keeps activation attached (and the registry offline) during the two tests
+// below that boot the real extension.
+import { harnessFetchHandler } from "./user-flow-env.ts";
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -58,7 +63,10 @@ import type {
 
 // ── 1. Fresh Bootstrap & Static Catalog Registration ─────────────────────────
 
-test("E2E [1/10] fresh new user bootstrap registers 31 models with zero-latency catalog", async () => {
+test("E2E [1/10] fresh new user bootstrap registers the full static catalog with zero latency", async (t) => {
+ // Phantom daemon + offline registry: no detached daemon is spawned and no
+ // registry.npmjs.org request leaves the machine.
+ t.mock.method(globalThis, "fetch", harnessFetchHandler());
  let registeredProviderName = "";
  let registeredProviderConfig: ProviderConfig | undefined;
  const registeredCommands: Record<string, Omit<RegisteredCommand, "name">> = {};
@@ -92,13 +100,18 @@ test("E2E [1/10] fresh new user bootstrap registers 31 models with zero-latency 
  const hasXPreview = registeredProviderConfig.models.some((m) => m.id === "x-preview-f-free");
  const hasHy3 = registeredProviderConfig.models.some((m) => m.id === "hy3-free" || m.id === "tencent/hy3:free");
  const hasLongcat = registeredProviderConfig.models.some((m) => m.id === "meituan/longcat-2.0-free");
- const hasJev = registeredProviderConfig.models.some((m) => m.id === "jev-1.13-free");
- assert.equal(hasJev, false);
- assert.equal(hasV4Flash, false);
- assert.equal(hasXPreview, false);
- assert.equal(hasHy3, false);
- assert.equal(hasLongcat, false);
-
+	const hasJev = registeredProviderConfig.models.some((m) => m.id === "jev-1.13-free");
+	const hasMimoV25 = registeredProviderConfig.models.some((m) => m.id === "mimo-v2.5-free");
+	const hasBunnyAlpha = registeredProviderConfig.models.some((m) => m.id === "stealth/space-bunny-alpha");
+	const hasQwen38 = registeredProviderConfig.models.some((m) => m.id === "qwen/qwen3.8-27b:free");
+	assert.equal(hasJev, false);
+	assert.equal(hasMimoV25, false);
+	assert.equal(hasBunnyAlpha, false);
+	assert.equal(hasQwen38, false);
+	assert.equal(hasV4Flash, false);
+	assert.equal(hasXPreview, false);
+	assert.equal(hasHy3, false);
+	assert.equal(hasLongcat, false);
  // Slash command and lifecycle hooks registered
  assert.ok(registeredCommands["freeflow"], "/freeflow command must be registered");
  assert.ok(registeredEvents.session_start, "session_start hook must be registered");
@@ -212,7 +225,7 @@ test("E2E [6/10] model catalog accurately maps thinking formats and source routi
  // Canonical resolution
  assert.equal(resolveCanonicalModelId("muse-spark-1.2-contributor-free"), "muse-spark-1.2-contributor-free");
  assert.equal(resolveCanonicalModelId("muse-spark-1.3-contributor-free"), "muse-spark-1.3-contributor-free");
- assert.equal(resolveCanonicalModelId("mimo-v2.5-free"), "mimo-v2.5-free");
+	assert.equal(resolveCanonicalModelId("mimo-v2.6-flash-free"), "mimo-v2.6-flash-free");
 
  // Kilo models identification
  assert.equal(isKiloModel("dots-3-note-preview"), true);
@@ -230,8 +243,8 @@ test("E2E [6/10] model catalog accurately maps thinking formats and source routi
    source: "opencode",
   },
   {
-   id: "mimo-v2.5-free",
-   name: "Mimo",
+			id: "mimo-v2.6-flash-free",
+			name: "Mimo",
    contextWindow: 128000,
    maxTokens: 4096,
    reasoning: true,
@@ -379,7 +392,10 @@ test("E2E [10/10] proxy security whitelist strictly guards API paths and rejects
 
 // ── 11. Widget Status-Bar Click Opens Relay Picker ───────────────────────
 
-test("E2E [11/11] widget click on status bar triggers select relay picker via onStatusClick", async () => {
+test("E2E [11/11] widget click on status bar triggers select relay picker via onStatusClick", async (t) => {
+ // session_start drives the real extension: keep the daemon probe and the
+ // update check off the wire (no spawn, no port bind, no registry call).
+ t.mock.method(globalThis, "fetch", harnessFetchHandler());
  const existed = fs.existsSync(RELAY_STATE_FILE);
  const backup = existed ? fs.readFileSync(RELAY_STATE_FILE, "utf8") : "";
  const bakExisted = fs.existsSync(`${RELAY_STATE_FILE}.bak`);

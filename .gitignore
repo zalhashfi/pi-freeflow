@@ -1,6 +1,7 @@
 # ── Dependencies ──────────────────────────────────────────────────────
 node_modules/
 .pnpm-store/
+package-lock.json
 package-lock.json.bak
 
 # ── Build & Test Output ───────────────────────────────────────────────
@@ -83,3 +84,10 @@ Thumbs.db
 *.sublime-project
 *.sublime-workspace
 .history/
+bench-results/
+scripts/bench-results/
+*.check.mjs
+*.check.ts
+scripts/*.results.json
+scripts/bench-*.20*.json
+scripts/bench-quick.json

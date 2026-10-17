@@ -11,7 +11,7 @@ Instead of VPN tunnels, pi-freeflow uses standard edge worker scripts across **C
        │
        │ (1) Request with headers:
        │     x-relay-target: https://opencode.ai
-       │     x-relay-path: /zen/v1/chat/completions
+       │     x-relay-path: /inference/v1/chat/completions
        ▼
 [Edge Relay Proxy (Cloudflare / Vercel)]
        │
@@ -28,9 +28,13 @@ Instead of VPN tunnels, pi-freeflow uses standard edge worker scripts across **C
 | **HTTP 200 (OK)** | Success | In `auto` the winner becomes the sticky target; in `spread` the pool is left as-is |
 | **HTTP 429 (Rate Limit)** | Roll to next relay | IP quota exceeded; fresh egress IP per relay |
 | **Relay Edge 404 (Dead Deployment)** | Roll to next relay | Deployment missing or deleted on relay host; auto-failover |
+| **HTTP 408 (Request Timeout)** | Roll to next relay | Transient request timeout; treated as retriable like the other edge failures |
 | **HTTP 502 / 503** | Roll to next relay | Upstream edge transient error |
-| **HTTP 504** | Fast fallback to direct | Vercel Edge 25s execution timeout |
+| **HTTP 504** | Roll to next relay | The response already arrived, so there is no 25s wait to repeat; a sibling relay is worth trying before the direct fallback |
+| **HTTP 413 (Payload Too Large)** | Continue to next relay, no health penalty | The pool is heterogeneous — one platform caps request size lower than another, so a later relay may well accept it; a failure mark would wrongly report a healthy relay as failed |
 | **HTTP 520-530** | Roll to next relay | Cloudflare network/origin drops |
+| **HTTP 500 (Model Error)** | Retry once on next relay | Transient model-side failure; surfaces unchanged if the next relay fails too |
+| **Interrupted stream** | Resume once on next relay | Stream cut mid-answer retries a text-only turn; turns already running tools are never replayed |
 | **Socket / DNS error** | Roll to next relay | Relay host unreachable |
 | **Pool exhausted** | Direct upstream fallback | All relays failed; direct to provider |
 
@@ -71,3 +75,10 @@ Free tier: 100,000 requests/day. Deploy via `/freeflow deploy deno` or manual pl
 
 ### Vercel Edge Function (Last Resort)
 Only use with a paid plan or a spare Hobby project you can afford to lose: the Hobby plan caps Fast Origin Transfer at 10 GB, and a streaming relay burns roughly 1.2 MB per turn (about 8,000 turns total). Once the cap is hit, every deployment in the project returns HTTP 402 and the whole pool goes dark until the quota resets. Deploy via `/freeflow deploy vercel` (in-memory token, auto-adds to pool) or manual Git deploy with `api/relay.js` + `vercel.json`.
+
+### Self-Hosted VPS Relay with WARP (`warp-relay-pool`)
+For users with a Linux VPS who prefer a self-hosted relay instead of serverless edge functions:
+- **Repository**: [trefeon/warp-relay-pool](https://github.com/trefeon/warp-relay-pool)
+- **1GB VPS friendly**: Optimized lightweight footprint that runs smoothly on entry-level 1GB RAM instances.
+- **WARP egress rotation**: Uses Cloudflare WARP with automatic egress IP rotation to prevent upstream rate limits.
+- **Setup**: Run `warp-relay-pool` on your VPS, then register it in pi-freeflow with `/freeflow add https://your-vps:port [label]`.

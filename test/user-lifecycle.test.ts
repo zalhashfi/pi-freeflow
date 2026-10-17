@@ -7,13 +7,12 @@
  *   - newer daemon -> left running (downgrade case)
  *   - NO_KILL_ENV=1 -> never replaced, even if older + idle
  *   - matching version -> reused (no kill)
- * and the surrounding lifecycle surfaces: legacy 18080 reuse (skip when the
- * port is busy), catalog-cache TTL reuse / stale refresh / corrupt fallback,
+ * and the surrounding lifecycle surfaces: catalog-cache TTL reuse / stale refresh / corrupt fallback,
  * update-checker LINK-skip, and activation-time async catalog refresh merging
  * into the registered provider.
  *
  * The test port is forced by test/user-flow-env.ts (imported FIRST, a
- * side-effect module) so no real 28180/18080 daemon is ever reused; the
+ * side-effect module) so no real 28180 daemon is ever reused; the
  * sandbox (test/setup.mjs) re-roots every data file into a temp dir.
  */
 import { TEST_PROXY_PORT } from "./user-flow-env.ts";
@@ -34,7 +33,6 @@ import {
 	CATALOG_CACHE_TTL_MS,
 	NO_KILL_ENV,
 	UPDATE_CACHE_FILE,
-	LEGACY_PORT,
 	RELAY_STATE_FILE,
 	ONBOARDED_FLAG_FILE,
 	LOG_FILE,
@@ -159,9 +157,9 @@ async function activate(
 }
 
 function benignExternal(u: string): Response {
-	// Never let the loopback probe ports look daemon-alive: a phantom 18080/28180
+	// Never let the loopback probe port look daemon-alive: a phantom 28180
 	// daemon would be "reused" by the extension and hide the fresh-bind path.
-	if (u.includes("127.0.0.1:18080") || u.includes("127.0.0.1:28180")) {
+	if (u.includes("127.0.0.1:28180")) {
 		throw new Error("no daemon (test override)");
 	}
 	return new Response(JSON.stringify({ version: "1.4.12" }), {
@@ -451,47 +449,6 @@ test("lifecycle [e] matching version daemon is reused", async () => {
 	});
 });
 
-// ── 6. Legacy 18080 reuse (skip when the port is busy) ─────────────────────
-
-test("lifecycle [f] legacy 18080 daemon is reused when the test port is free", async (t: TestContext) => {
-	// Only run if 18080 is verifiably free — a real daemon may be running there.
-	const { promise: freeP, resolve: resolveFree } = Promise.withResolvers<boolean>();
-	const probe = net.createServer();
-	probe.once("error", () => resolveFree(false));
-	probe.listen(LEGACY_PORT, "127.0.0.1", () => probe.close(() => resolveFree(true)));
-	const free = await freeP;
-	if (!free) {
-		t.skip(`legacy port ${LEGACY_PORT} is busy`);
-		return;
-	}
-
-	await withIsolatedSandboxFiles(async () => {
-		clearSandboxFiles();
-		const server = await startFakeDaemon(LEGACY_PORT, { version: PKG_VERSION, activeRequests: 0 });
-		try {
-			const handle = await activate(
-				[TEST_PROXY_PORT, LEGACY_PORT],
-				(u: string) => benignExternal(u),
-			);
-			try {
-				// The test port has no daemon; the legacy 18080 daemon is reused.
-				const v = await getDaemonVersion(LEGACY_PORT);
-				assert.equal(v, PKG_VERSION, "legacy daemon must be reused while the test port is free");
-				assert.ok(server.listening, "legacy daemon must still be listening");
-				await flushUntil(() => handle.config !== undefined);
-				assert.equal(
-					handle.config?.baseUrl,
-					`http://127.0.0.1:${LEGACY_PORT}/v1`,
-					"provider must point at the reused legacy daemon",
-				);
-			} finally {
-				await handle.shutdown();
-			}
-		} finally {
-			await closeServer(server);
-		}
-	});
-});
 
 // ── 7. Catalog cache: TTL reuse ────────────────────────────────────────────
 

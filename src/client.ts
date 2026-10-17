@@ -32,7 +32,6 @@ import {
  DAEMON_WATCHDOG_MS,
  DAEMON_WATCHDOG_MS_ENV,
  HOST,
- LEGACY_PORT,
  LOG_FILE,
  NO_KILL_ENV,
  OPENCODE_VERSION_TTL_MS,
@@ -41,12 +40,14 @@ import {
  RECOVERY_BACKOFF_BASE_MS,
  RECOVERY_BACKOFF_CAP_MS,
  refreshOpenCodeUserAgent,
+ resolveDaemonSrcCacheDir,
 } from "./config.ts";
 import { logInfo, logWarn } from "./logger.ts";
 import {
  getDaemonHealth,
  getDaemonVersion,
  isProxyAlive,
+ isPortBound,
  killPortHolder,
  reprobeBasePortAlive,
  startProxy,
@@ -61,6 +62,11 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 let heartbeatPort = 0;
 let ensuring = false;
+/**
+ * In-flight ensureDaemon() attempt. Every concurrent caller awaits this same
+ * promise instead of guessing a port; ensureDaemon clears it on settle.
+ */
+let ensureInFlight: Promise<number> | null = null;
 let fallbackServer: http.Server | null = null;
 /** First tick (Date.now()) the daemon has looked continuously busy; 0 = idle. */
 let busySince = 0;
@@ -198,7 +204,8 @@ export function resolveDaemonRuntime(opts?: {
 }
 
 function daemonScriptPath(): string {
- return path.join(path.dirname(fileURLToPath(import.meta.url)), "daemon.ts");
+	const p = path.join(path.dirname(fileURLToPath(import.meta.url)), "daemon.ts");
+	return process.platform === "win32" ? p.replace(/\\/g, "/") : p;
 }
 
 function getHeartbeatMs(): number {
@@ -433,13 +440,24 @@ export function _resetRecoveryForTest(): void {
 export type HealthForRecovery = DaemonHealthSnapshot;
 
 /**
+ * Older-version guard: only a daemon strictly older than this build is worth
+ * recovering. shouldReplaceDaemon deliberately leaves a NEWER daemon running,
+ * so recovering from one could never succeed (watchdog → recover → refused →
+ * reattach → watchdog, until the breaker parks into the in-process fallback).
+ * Null/undefined version (pre-version daemon) is not older on its own.
+ */
+function isOlderDaemonVersion(version: string | null | undefined): boolean {
+ return version != null && compareVersions(version, PKG_VERSION) < 0;
+}
+
+/**
  * Watchdog decision matrix (pure, testable). Recover when the daemon is gone,
- * serves a stale version, or reports a degraded failed-SSE window. Missing
+ * serves an older version, or reports a degraded failed-SSE window. Missing
  * sseDegraded (pre-window daemon) never triggers on its own.
  */
 export function shouldRecoverOnHealth(health: HealthForRecovery): boolean {
  if (health === null) return true;
- if (health.version !== null && health.version !== PKG_VERSION) return true;
+ if (isOlderDaemonVersion(health.version)) return true;
  if (health.sseDegraded === true) return true;
  return false;
 }
@@ -458,38 +476,47 @@ async function ensureInProcessFallback(): Promise<number> {
 
 async function triggerRecovery(port: number, why: string): Promise<void> {
  if (ensuring) return;
- const now = Date.now();
- if (isBreakerHalted(now)) {
-  logWarn(`recovery breaker halted — serving in-process fallback meanwhile (${why})`);
-  void ensureInProcessFallback();
-  return;
- }
- const opened = recordRecoveryFailure(now);
- if (opened) {
-  void ensureInProcessFallback();
-  return;
- }
- const delay = computeRecoveryBackoffMs(backoffAttempt - 1);
- logWarn(`watchdog recovery (${why}) — backing off ${Math.round(delay)}ms before respawn`);
- stopHeartbeatInternal();
- heartbeatPort = 0;
- await new Promise<void>((r) => setTimeout(r, delay));
+ ensuring = true;
  try {
-  const health = await getDaemonHealth(port);
-  if (health && (health.activeRequests ?? 0) > 0) {
-   trackBusyEdge(health.activeRequests ?? 0, health.lastBytesAt ?? 0, Date.now());
-   if (!isStuckBusy(busySince, health.lastBytesAt ?? 0, Date.now())) {
-    logInfo(`watchdog recovery deferred — daemon busy (${health.activeRequests} active, waiting for 5min-stuck + 60s-quiet)`);
-    await attachTo(port);
-    return;
-   }
+  const now = Date.now();
+  if (isBreakerHalted(now)) {
+   logWarn(`recovery breaker halted — serving in-process fallback meanwhile (${why})`);
+   void ensureInProcessFallback();
+   return;
   }
-  const ver = health?.version ?? PKG_VERSION;
-  await killStaleDaemon(port, ver, "proxy daemon");
- } catch (e) {
-  logWarn("watchdog pre-respawn probe failed", { error: String(e) });
+  const opened = recordRecoveryFailure(now);
+  if (opened) {
+   void ensureInProcessFallback();
+   return;
+  }
+  const delay = computeRecoveryBackoffMs(backoffAttempt - 1);
+  logWarn(`watchdog recovery (${why}) — backing off ${Math.round(delay)}ms before respawn`);
+  stopHeartbeatInternal();
+  heartbeatPort = 0;
+  await new Promise<void>((r) => setTimeout(r, delay));
+  try {
+   const health = await getDaemonHealth(port);
+   if (health && (health.activeRequests ?? 0) > 0) {
+    trackBusyEdge(health.activeRequests ?? 0, health.lastBytesAt ?? 0, Date.now());
+    if (!isStuckBusy(busySince, health.lastBytesAt ?? 0, Date.now())) {
+     logInfo(`watchdog recovery deferred — daemon busy (${health.activeRequests} active, waiting for 5min-stuck + 60s-quiet)`);
+     await attachTo(port);
+     return;
+    }
+   }
+   const ver = health?.version ?? PKG_VERSION;
+   await killStaleDaemon(port, ver, "proxy daemon");
+  } catch (e) {
+   logWarn("watchdog pre-respawn probe failed", { error: String(e) });
+  }
+  // Release before delegating: ensureDaemon owns the flag from here (it
+  // early-returns while ensuring is true). The handoff is synchronous up
+  // to ensureDaemon's own ensuring=true, so no tick slips between.
+  ensuring = false;
+  await ensureDaemon();
+ } finally {
+  ensuring = false;
  }
- await ensureDaemon();
 }
 
 /**
@@ -524,7 +551,7 @@ export async function watchdogCheck(port: number): Promise<void> {
   return;
  }
  if (health && (health.activeRequests ?? 0) > 0 && !isStuckBusy(busySince, health.lastBytesAt ?? 0)) return;
- void triggerRecovery(port, health === null ? "daemon gone" : health.version !== PKG_VERSION ? `stale v${health.version}` : "failed-SSE degraded").catch((e) => logWarn("watchdog recovery failed", { error: String(e) }));
+ void triggerRecovery(port, health === null ? "daemon gone" : isOlderDaemonVersion(health.version) ? `stale v${health.version}` : "failed-SSE degraded").catch((e) => logWarn("watchdog recovery failed", { error: String(e) }));
 }
 
 async function shouldReplaceDaemon(port: number, remoteVer: string): Promise<boolean> {
@@ -572,17 +599,19 @@ async function killStaleDaemon(
   remoteVer,
   expected: PKG_VERSION,
  });
- await killPortHolder(port);
- for (let i = 0; i < 10; i++) {
-  await new Promise<void>((r) => setTimeout(r, 200));
-  if (!(await isProxyAlive(port))) return true;
- }
- logInfo(
-  `Reusing existing pi-freeflow proxy daemon on http://${HOST}:${port} (stale kill did not free port)`,
- );
- return false;
+	await killPortHolder(port);
+	for (let i = 0; i < 15; i++) {
+		await new Promise<void>((r) => setTimeout(r, 100));
+		if (!(await isProxyAlive(port))) {
+			lastSpawnAt = 0;
+			return true;
+		}
+	}
+	logInfo(
+		`Reusing existing pi-freeflow proxy daemon on http://${HOST}:${port} (stale kill did not free port)`,
+	);
+	return false;
 }
-
 /**
  * Open the shared log file for the detached daemon's stdout/stderr so a
  * native abort or crash leaves its reason on disk instead of vanishing into
@@ -599,42 +628,98 @@ export function openDaemonLogFd(): number | null {
 }
 
 export type DarkHolderProbe = {
- /** True when GET /v1/models answers on the port. */
+ /** True when GET /v1/models answers with a JSON catalog on the port. */
  alive: boolean;
- /** Full /_health snapshot, or null when the holder answers nothing. */
- health: HealthForRecovery;
+ /** True when a TCP connection to the port succeeds (something holds it). */
+ bound: boolean;
+ /**
+  * True when GET /_health answers in OUR daemon's shape. A stranger squatting
+  * the loopback port can answer `{}` or arbitrary JSON: that is not a daemon
+  * of ours, whatever it claims.
+  */
+ healthOurs: boolean;
 };
 
 /**
- * Pure decision: reclaim a base port whose holder answers neither /v1/models
- * nor /_health. A live daemon — stale, busy, even mid-stream — always answers
- * both from its event loop, so a dark holder cannot be serving traffic and
- * replacing it cannot interrupt a real stream.
+ * True when a /_health response body carries OUR daemon's shape: a JSON object
+ * whose numeric `port` names the port it is bound to (src/health.ts builds it
+ * from the listening socket). Anything else is a stranger on the loopback port
+ * — attaching to it would route the user's prompts into a process we do not
+ * own, so it must never be read as a daemon.
+ */
+export function isOurDaemonHealthBody(port: number, body: unknown): boolean {
+ if (!body || typeof body !== "object") return false;
+ const reported = (body as { port?: unknown }).port;
+ return typeof reported === "number" && reported === port;
+}
+
+/**
+ * Probe whatever holds `port` for the three facts the reclaim decision needs.
+ * Ordered cheap-to-expensive and short-circuiting exactly like the inline
+ * sequence it replaces: a models-answering daemon is live, a refused port is
+ * free, and only a bound-but-model-silent holder is asked for /_health.
+ */
+export async function probeDarkHolder(port: number): Promise<DarkHolderProbe> {
+ if (await isProxyAlive(port)) return { alive: true, bound: true, healthOurs: false };
+ if (!(await isPortBound(port))) return { alive: false, bound: false, healthOurs: false };
+ return { alive: false, bound: true, healthOurs: await probeOurHealth(port) };
+}
+
+/**
+ * Fetch /_health and keep the verdict only when the body is OUR daemon's
+ * shape. Same request and budget as proxy.getDaemonHealth, minus its snapshot
+ * mapping — which drops `port`, the one field that tells our daemon apart
+ * from a stranger answering arbitrary JSON.
+ */
+async function probeOurHealth(port: number): Promise<boolean> {
+ if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+ try {
+  const res = await fetch(`http://${HOST}:${port}/_health`, {
+   signal: AbortSignal.timeout(2500),
+  });
+  if (!res.ok) return false;
+  return isOurDaemonHealthBody(port, await res.json());
+ } catch {
+  return false;
+ }
+}
+
+/**
+ * Pure decision: reclaim a base port that is actually held (TCP connect
+ * succeeds) yet answers neither /v1/models nor /_health in OUR shape. A live
+ * daemon — stale, busy, even mid-stream — always answers both from its event
+ * loop, so a dark holder cannot be serving traffic and replacing it cannot
+ * interrupt a real stream. A FREE port is not a dark holder: treating it as
+ * one cost a blind ~2s kill-and-poll on every cold start (issue #52). A holder
+ * answering /_health with anything but our shape (a stranger's `{}`) is dark:
+ * it is not a daemon of ours, so it is reclaimed rather than attached to.
  */
 export function shouldReclaimDarkHolder(probe: DarkHolderProbe): boolean {
  if (probe.alive) return false;
- if (probe.health !== null) return false;
+ if (!probe.bound) return false;
+ if (probe.healthOurs) return false;
  return true;
 }
 
 /**
  * Dislodge a dark holder from the base port so a fresh daemon can bind it.
- * Returns true when a healthy proxy answers afterwards (attach to it);
- * false when the caller should spawn fresh (port presumably free).
- * Honors the no-kill env opt-out; a live holder is never touched here —
- * the stale-replace path owns versioned daemons.
+ * Returns true when a healthy proxy answers afterwards (attach to it); false
+ * when the caller should spawn fresh (the port is free — nothing to reclaim).
+ * Honors the no-kill env opt-out; a live holder is never touched here — the
+ * stale-replace path owns versioned daemons.
  */
 async function reclaimDarkHolder(port: number): Promise<boolean> {
- const alive = await isProxyAlive(port);
- const health = alive ? null : await getDaemonHealth(port);
- if (!shouldReclaimDarkHolder({ alive, health })) return true;
+ const probe = await probeDarkHolder(port);
+ if (probe.alive) return true;
+ if (!probe.bound) return false; // port is free — spawn fresh
+ if (!shouldReclaimDarkHolder(probe)) return true;
  if (NO_KILL_ENV && process.env[NO_KILL_ENV] === "1") {
   logInfo(
-   `proxy on :${port} answers neither health nor models — leaving it alone (replacement disabled by env)`,
+   `proxy on :${port} answers neither our health nor models — leaving it alone (replacement disabled by env)`,
   );
   return false;
  }
- logWarn(`proxy on :${port} holds the port but answers nothing — replacing dark holder`);
+ logWarn(`proxy on :${port} holds the port but answers nothing of ours — replacing dark holder`);
  await killPortHolder(port);
  for (let i = 0; i < 10; i++) {
   await new Promise<void>((r) => setTimeout(r, 200));
@@ -712,26 +797,185 @@ export async function ensureProxyReady(
  return { ok: false, port, reason: proxyDownMessage(port) };
 }
 
+/** True when any path segment of `filePath` is `node_modules`. Node refuses to
+ * strip types for files under such a path (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING),
+ * so a Node-spawned daemon must run from a staged copy elsewhere. */
+export function isUnderNodeModules(filePath: string): boolean {
+ return filePath.split(/[\\/]/).includes("node_modules");
+}
+
+function readPackageJsonObject(dir: string): Record<string, unknown> | null {
+ try {
+  const raw: unknown = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+  return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+ } catch {
+  return null;
+ }
+}
+
+/** Resolve a dependency's package directory the way Node would: walk up the
+ *  node_modules chain from the importing package's root. */
+function resolvePackageDir(name: string, fromDir: string): string | null {
+ let dir = fromDir;
+ for (; ;) {
+  const pkgJson = path.join(dir, "node_modules", name, "package.json");
+  if (fs.existsSync(pkgJson)) return path.dirname(pkgJson);
+  const parent = path.dirname(dir);
+  if (parent === dir) return null;
+  dir = parent;
+ }
+}
+
+/** Link (or copy, when linking is unavailable) each runtime dependency beside
+ *  the staged sources so bare imports such as `undici` still resolve. */
+function stageRuntimeDependencies(pkgRoot: string, pkgJson: Record<string, unknown>, stagedDir: string): void {
+ const deps = pkgJson.dependencies;
+ if (!deps || typeof deps !== "object") return;
+ const nodeModulesDir = path.join(stagedDir, "node_modules");
+ for (const name of Object.keys(deps as Record<string, unknown>)) {
+  const target = resolvePackageDir(name, pkgRoot);
+  if (target === null) {
+   logWarn("daemon dependency not found for staging", { dependency: name });
+   continue;
+  }
+  try {
+   fs.mkdirSync(nodeModulesDir, { recursive: true });
+   // Junction on Windows (no elevated privileges needed); dir symlink elsewhere.
+   fs.symlinkSync(target, path.join(nodeModulesDir, name), process.platform === "win32" ? "junction" : "dir");
+  } catch {
+   try {
+    fs.cpSync(target, path.join(nodeModulesDir, name), { recursive: true, dereference: true });
+   } catch (e) {
+    logWarn("daemon dependency staging failed", { dependency: name, error: String(e) });
+   }
+  }
+ }
+}
+
+/** Best-effort prune of staged daemon sources from earlier versions (1 day TTL). */
+function pruneStaleDaemonSrcDirs(root: string, currentVersion: string): void {
+ try {
+  const now = Date.now();
+  for (const entry of fs.readdirSync(root)) {
+   if (entry === currentVersion) continue;
+   const full = path.join(root, entry);
+   try {
+    if (now - fs.statSync(full).mtimeMs > 24 * 60 * 60 * 1000) {
+     fs.rmSync(full, { recursive: true, force: true });
+    }
+   } catch { }
+  }
+ } catch { }
+}
+
+/**
+ * Materialize the daemon's sources outside node_modules so a Node runtime can
+ * execute `src/daemon.ts` (Node refuses type stripping for any file under a
+ * node_modules path, and this package ships TypeScript sources). Copies
+ * `src/` + `package.json` into a per-version cache directory, stages the
+ * runtime dependencies beside them, and returns the staged daemon entry.
+ * Returns the input path unchanged when the script is already outside
+ * node_modules (dev checkouts) or the package root is unreadable.
+ */
+export function materializeDaemonSources(scriptPath: string, cacheDir?: string): string {
+ if (!isUnderNodeModules(scriptPath)) return scriptPath;
+ const pkgRoot = path.dirname(path.dirname(scriptPath));
+ const pkgJson = readPackageJsonObject(pkgRoot);
+ const version = pkgJson !== null && typeof pkgJson.version === "string" ? pkgJson.version : "";
+ if (pkgJson === null || !version) return scriptPath;
+
+ const root = cacheDir ?? resolveDaemonSrcCacheDir();
+ const finalDir = path.join(root, version);
+ const finalEntry = path.join(finalDir, "src", "daemon.ts");
+ if (fs.existsSync(finalEntry) && fs.existsSync(path.join(finalDir, "package.json"))) {
+  pruneStaleDaemonSrcDirs(root, version);
+  return finalEntry;
+ }
+
+ const tmpDir = `${finalDir}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`;
+ try {
+  fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+  fs.cpSync(path.join(pkgRoot, "src"), path.join(tmpDir, "src"), { recursive: true });
+  fs.copyFileSync(path.join(pkgRoot, "package.json"), path.join(tmpDir, "package.json"));
+  stageRuntimeDependencies(pkgRoot, pkgJson, tmpDir);
+  try {
+   fs.renameSync(tmpDir, finalDir);
+   logInfo(`staged proxy daemon sources outside node_modules at ${finalDir}`);
+  } catch (e) {
+   // A concurrent starter won the rename (or the dir appeared meanwhile):
+   // its copy is byte-identical for the same version, so reuse it.
+   try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+   } catch { }
+   if (!fs.existsSync(finalEntry)) {
+    logWarn("daemon source staging failed", { error: String(e), dir: finalDir });
+    return scriptPath;
+   }
+  }
+ } catch (e) {
+  try {
+   fs.rmSync(tmpDir, { recursive: true, force: true });
+  } catch { }
+  logWarn("daemon source staging failed — spawning from the installed path", { error: String(e), dir: tmpDir });
+  return scriptPath;
+ }
+ pruneStaleDaemonSrcDirs(root, version);
+ return finalEntry;
+}
+
+export interface DaemonChild {
+ pid?: number;
+ exitCode: number | null;
+ signalCode: string | null;
+ unref(): void;
+ on(event: "error", listener: (err: Error) => void): unknown;
+}
+
+export type DaemonSpawner = (
+ command: string,
+ args: string[],
+ options: Parameters<typeof spawn>[2],
+) => DaemonChild;
+
+let daemonSpawner: DaemonSpawner = spawn;
+/** Children that failed to launch (spawn error) — the ready-wait treats them as exited. */
+const failedDaemonSpawns = new WeakSet<DaemonChild>();
+
+/** Test seam: replace the child spawner used for detached daemon starts. */
+export function _setDaemonSpawnForTest(spawner: DaemonSpawner | null): void {
+ daemonSpawner = spawner ?? spawn;
+}
+
+/** True once a spawned daemon child has exited (exit code or signal). */
+export function hasChildExited(child: Pick<DaemonChild, "exitCode" | "signalCode">): boolean {
+ return child.exitCode !== null || child.signalCode !== null;
+}
+
 let lastSpawnAt = 0;
 const SPAWN_THROTTLE_MS = 2_000;
 
-function spawnDaemonProcess(): boolean {
+function spawnDaemonProcess(): DaemonChild | null {
  const now = Date.now();
  if (now - lastSpawnAt < SPAWN_THROTTLE_MS) {
   logWarn("daemon spawn throttled — recent spawn still pending");
-  return false;
+  return null;
  }
  const runtime = resolveDaemonRuntime();
  if (!runtime) {
   logWarn(
    `cannot spawn detached proxy daemon: no node or bun runtime found (process.execPath "${process.execPath}" is not a JS runtime) — falling back to in-process proxy`,
   );
-  return false;
+  return null;
  }
+ // Node refuses to strip types for files under node_modules, so stage the
+ // sources elsewhere before spawning with a Node runtime (issue #52).
+ const scriptArg = runtime.args[runtime.args.length - 1] ?? "";
+ const stagedScript = runtime.runtimeType === "node" ? materializeDaemonSources(scriptArg) : scriptArg;
+ const args = stagedScript === scriptArg ? runtime.args : [...runtime.args.slice(0, -1), stagedScript];
  lastSpawnAt = now;
  const logFd = openDaemonLogFd();
  try {
-  const child = spawn(runtime.execPath, runtime.args, {
+  const child = daemonSpawner(runtime.execPath, args, {
    detached: true,
    stdio: logFd === null ? "ignore" : ["ignore", logFd, logFd],
    windowsHide: true,
@@ -742,15 +986,16 @@ function spawnDaemonProcess(): boolean {
   });
   child.unref();
   logInfo(
-   `spawned proxy daemon process (pid ${child.pid ?? "unknown"}) using ${runtime.runtimeType} (${runtime.execPath}) for :${PORT}`,
+   `spawned proxy daemon process (pid ${child.pid ?? "unknown"}) using ${runtime.runtimeType} (${runtime.execPath}) for :${PORT}${stagedScript === scriptArg ? "" : " [staged sources]"}`,
   );
   child.on("error", (err) => {
+   failedDaemonSpawns.add(child);
    logWarn("daemon spawn failed", { error: String(err), execPath: runtime.execPath });
   });
-  return true;
+  return child;
  } catch (e) {
   logWarn("daemon spawn failed", { error: String(e), execPath: runtime.execPath });
-  return false;
+  return null;
  } finally {
   if (logFd !== null) {
    try {
@@ -760,29 +1005,41 @@ function spawnDaemonProcess(): boolean {
  }
 }
 
-async function waitForReady(port: number, timeoutMs: number): Promise<boolean> {
- const deadline = Date.now() + timeoutMs;
- while (Date.now() < deadline) {
-  if (await isProxyAlive(port)) return true;
-  await new Promise<void>((r) => setTimeout(r, 200));
- }
- return false;
+export async function waitForReady(
+	port: number,
+	timeoutMs: number,
+	child?: DaemonChild | null,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await isProxyAlive(port, 150)) return true;
+		if (child && (hasChildExited(child) || failedDaemonSpawns.has(child))) {
+			logWarn("daemon child exited before becoming ready", {
+				port,
+				exitCode: child.exitCode,
+				signalCode: child.signalCode,
+			});
+			return false;
+		}
+		await new Promise<void>((r) => setTimeout(r, 80));
+	}
+	return false;
 }
 
 async function probeAndMaybeReplace(
- port: number,
- label: string,
+	port: number,
+	label: string,
+	probeTimeoutMs = 150,
 ): Promise<number | null> {
- if (!(await isProxyAlive(port))) return null;
- const ver = await getDaemonVersion(port);
- if (ver !== null && ver !== PKG_VERSION) {
-  if (await killStaleDaemon(port, ver, label)) {
-   return null;
-  }
-  if (await isProxyAlive(port)) return port;
-  return null;
- }
- return port;
+	if (!(await isProxyAlive(port, probeTimeoutMs))) return null;
+	const ver = await getDaemonVersion(port);
+	if (ver !== null && ver !== PKG_VERSION) {
+		logWarn(`detected proxy daemon version mismatch: running v${ver}, required v${PKG_VERSION} — auto-restarting`);
+		await killStaleDaemon(port, ver, label);
+		lastSpawnAt = 0;
+		return null;
+	}
+	return port;
 }
 
 /**
@@ -790,42 +1047,46 @@ async function probeAndMaybeReplace(
  * Returns the port the caller should use for its ProviderConfig.
  */
 export async function ensureDaemon(): Promise<number> {
+ if (ensureInFlight) return ensureInFlight;
  if (ensuring) return attachedPort || PORT;
  ensuring = true;
+ const attempt = ensureDaemonAttempt();
+ ensureInFlight = attempt;
  try {
+  return await attempt;
+ } finally {
+  if (ensureInFlight === attempt) ensureInFlight = null;
+  ensuring = false;
+ }
+}
+
+/**
+ * One ensure/attach attempt: probe → attach → spawn → dark-holder reclaim →
+ * in-process fallback. Split out of ensureDaemon so concurrent callers share
+ * the same promise instead of reading a half-settled port. Keeps `ensuring`
+ * latched for the whole attempt so the heartbeat/watchdog/recovery ticks stay
+ * out of the way (they early-return on it).
+ */
+async function ensureDaemonAttempt(): Promise<number> {
   const primary = await probeAndMaybeReplace(PORT, "proxy daemon");
   if (primary !== null) {
    await attachTo(primary);
    return primary;
   }
 
-  if (PORT !== LEGACY_PORT) {
-   const legacy = await probeAndMaybeReplace(LEGACY_PORT, "legacy proxy daemon");
-   if (legacy !== null) {
-    await attachTo(legacy);
-    return legacy;
-   }
-  }
 
-  if (isSpawnEnabled()) {
-   // Cross-process race guard: a sibling session may be spawning right
-   // now (singleflight is per-process). Jitter + re-probe converts most
-   // cold-start races into attach instead of N detached spawns.
-   await new Promise<void>((r) => setTimeout(r, 100 + Math.random() * 200));
-   if (await isProxyAlive(PORT)) {
-    await attachTo(PORT);
-    return PORT;
-   }
-   const spawned = spawnDaemonProcess();
-   if (spawned) {
-    const ready = await waitForReady(PORT, DAEMON_READY_TIMEOUT_MS);
+		if (isSpawnEnabled()) {
+			const child = spawnDaemonProcess();
+   if (child) {
+    const ready = await waitForReady(PORT, DAEMON_READY_TIMEOUT_MS, child);
     if (ready) {
      const ver = await getDaemonVersion(PORT);
      if (ver !== null && ver !== PKG_VERSION) {
       if (await killStaleDaemon(PORT, ver, "proxy daemon")) {
        lastSpawnAt = 0; // kill-confirmed retry bypasses the spawn throttle
-       if (spawnDaemonProcess()) {
-        const retryReady = await waitForReady(PORT, DAEMON_READY_TIMEOUT_MS);
+       const retryChild = spawnDaemonProcess();
+       if (retryChild) {
+        const retryReady = await waitForReady(PORT, DAEMON_READY_TIMEOUT_MS, retryChild);
         if (retryReady) {
          await attachTo(PORT);
          return PORT;
@@ -840,13 +1101,14 @@ export async function ensureDaemon(): Promise<number> {
       return PORT;
      }
     } else {
-     // The spawn never answered: it crashed instantly or a dark holder owns
-     // the base port (bind fails, probes fail).
+     // The spawn never answered: the child exited before binding (e.g. Node
+     // refusing type stripping under a node_modules path) or a dark holder
+     // owns the base port (bind fails, probes fail).
      if (await reclaimDarkHolder(PORT)) {
       await attachTo(PORT);
       return PORT;
      }
-     logWarn("daemon spawn did not become ready — is the port blocked?");
+     logWarn("daemon spawn did not become ready — child exited or the port is blocked");
     }
    }
    // Fall through to the in-process fallback below — never hand the caller
@@ -877,9 +1139,6 @@ export async function ensureDaemon(): Promise<number> {
    logWarn("in-process fallback bind failed", { error: String(e) });
    return PORT;
   }
- } finally {
-  ensuring = false;
- }
 }
 
 export function getClientPort(): number {
@@ -904,7 +1163,9 @@ export function _resetClientForTest(): void {
  heartbeatPort = 0;
  attachedPort = 0;
  ensuring = false;
+ ensureInFlight = null;
  lastSpawnAt = 0;
+ daemonSpawner = spawn;
  _resetUaRefreshForTest();
  _resetRecoveryForTest();
  if (fallbackServer) {

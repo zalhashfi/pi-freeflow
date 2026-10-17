@@ -9,7 +9,11 @@ import {
  OPENCODE_MODELS,
  KILO_MODELS,
  CLINE_MODELS,
+ OVH_MODELS,
+ OVH_MODEL_PREFIX,
+ ovhUpstreamModelId,
  KILO_MODEL_IDS,
+ isOvhModel,
  getModelDef,
  isKiloModel,
  getModelUpstream,
@@ -17,13 +21,14 @@ import {
  getAllRegisteredModels,
 } from "../src/models.ts";
 
-test("catalog composition: OpenCode + Kilo + Cline lists make up the full catalog", () => {
+test("catalog composition: OpenCode + Kilo + Cline + OVH lists make up the full catalog", () => {
  // Composition over hardcoded counts — resilient to catalog growth while
  // still locking the invariant that every model belongs to exactly one source.
  assert.ok(OPENCODE_MODELS.length > 0, "OpenCode list must be non-empty");
  assert.ok(KILO_MODELS.length > 0, "Kilo list must be non-empty");
  assert.ok(CLINE_MODELS.length > 0, "Cline list must be non-empty");
- assert.equal(OPENCODE_MODELS.length + KILO_MODELS.length + CLINE_MODELS.length, ALL_MODELS.length);
+ assert.ok(OVH_MODELS.length > 0, "OVH list must be non-empty");
+ assert.equal(OPENCODE_MODELS.length + KILO_MODELS.length + CLINE_MODELS.length + OVH_MODELS.length, ALL_MODELS.length);
 });
 
 test("all model IDs are unique", () => {
@@ -50,24 +55,24 @@ test("1M context window models are properly configured", () => {
  // Known 1M models must exist with a >= 1M window (spec lock), and every
  // model in the catalog advertising >= 1M must be in that known list
  // (drift guard — no unaccounted-for 1M models).
- const oneMillionModels = [
-  "muse-spark-1.2-contributor-free",
-  "muse-spark-1.3-contributor-free",
-  "cline-free/muse-spark-1.3-contributor",
-  "cline-free/deepseek-v4.1-flash",
-  "cline-free/kimi-k3",
-  "z-ai/glm-5.3-flash",
-  "mimo-v2.5-free",
-  "mimo-v2.6-flash-free",
-  "space-bunny-free",
-  "longcat-2.5-preview-free",
-  "nemotron-3.5-lightning-free",
-  "nemotron-3-ultra-free",
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "nvidia/nemotron-3.5-lightning:free",
-  "thinkingmachines/inkling-small:free",
-  "stealth/space-bunny-alpha",
- ];
+	const oneMillionModels = [
+		"muse-spark-1.2-contributor-free",
+		"muse-spark-1.3-contributor-free",
+		"cline-free/muse-spark-1.3-contributor",
+		"z-ai/glm-5.3-flash",
+		"glm-5.3-flash-free",
+		"exo-free",
+		"mimo-v2.6-flash-free",
+		"deepseek-v4.1-flash-free",
+		"space-bunny-free",
+		"longcat-2.5-preview-free",
+		"nemotron-3.5-lightning-free",
+		"nemotron-3.5-super-vl-free",
+		"nemotron-3-ultra-free",
+		"nvidia/nemotron-3-ultra-550b-a55b:free",
+		"nvidia/nemotron-3.5-lightning:free",
+		"thinkingmachines/inkling-small:free",
+	];
 
  for (const id of oneMillionModels) {
   const m = getModelDef(id);
@@ -100,54 +105,80 @@ test("2026-09-22 and 2026-09-28 additions route to the correct upstream with ver
  assert.equal(mimo.contextWindow, 1_048_576);
  assert.equal(mimo.maxTokens, 131_072);
  assert.equal(mimo.reasoning, true);
- assert.deepEqual(mimo.input, ["text", "image"]);
+ assert.deepEqual(mimo.input, ["text", "image", "video"]);
  assert.equal(mimo.thinkingLevelMap?.minimal, "low");
  assert.equal(mimo.thinkingLevelMap?.xhigh, "high");
  assert.equal(getModelUpstream("mimo-v2.6-flash-free"), "opencode");
  assert.equal(getModelUpstream("mimo-v2.6-flash"), "opencode");
- // Qwen 3.8 27B is a vision-language Kilo reasoning model
- const qwen = getModelDef("qwen/qwen3.8-27b:free");
- assert.ok(qwen);
- assert.equal(qwen.contextWindow, 262_144);
- assert.equal(qwen.maxTokens, 235_929);
- assert.equal(qwen.reasoning, true);
- assert.deepEqual(qwen.input, ["text", "image"]);
- assert.equal(qwen.thinkingFormat, "openrouter");
- assert.equal(getModelUpstream("qwen/qwen3.8-27b:free"), "kilo");
- assert.equal(getModelUpstream("qwen3.8-27b"), "kilo");
- // Step 3.7 Flash is back on the Kilo free list (resurrected 2026-09-28)
- const step = getModelDef("stepfun/step-3.7-flash:free");
- assert.ok(step);
- assert.equal(step.contextWindow, 262_144);
- assert.equal(step.maxTokens, 262_144);
- assert.equal(step.reasoning, true);
- assert.deepEqual(step.input, ["text", "image"]);
- assert.equal(step.thinkingFormat, "openrouter");
- assert.equal(getModelUpstream("stepfun/step-3.7-flash:free"), "kilo");
- assert.equal(getModelUpstream("step-3.7-flash"), "kilo");
- // Space Bunny Alpha is a Kilo-native stealth ID with no :free suffix —
- // it passes the free gate through the static entry, like big-pickle
- const bunny = getModelDef("stealth/space-bunny-alpha");
- assert.ok(bunny);
- assert.equal(bunny.contextWindow, 1_000_000);
- assert.equal(bunny.maxTokens, 524_288);
- assert.equal(bunny.reasoning, true);
- assert.deepEqual(bunny.input, ["text", "image"]);
- assert.equal(getModelUpstream("stealth/space-bunny-alpha"), "kilo");
- assert.equal(getModelUpstream("space-bunny-alpha"), "kilo");
+	// Glyph Cluster is new on the Kilo free list (2026-10-09)
+	const glyph = getModelDef("stealth/glyph-cluster");
+	assert.ok(glyph);
+	assert.equal(glyph.contextWindow, 256_000);
+	assert.equal(glyph.maxTokens, 256_000);
+	assert.equal(glyph.reasoning, true);
+	assert.deepEqual(glyph.input, ["text"]);
+	assert.equal(getModelUpstream("stealth/glyph-cluster"), "kilo");
+	assert.equal(getModelUpstream("glyph-cluster"), "kilo");
 });
+	test("2026-10-16 Zen drift additions carry verified specs (issue #71)", () => {
+		const glm = getModelDef("glm-5.3-flash-free");
+		assert.ok(glm);
+		assert.equal(glm.reasoning, true);
+		assert.equal(glm.contextWindow, 1_000_000);
+		assert.equal(glm.maxTokens, 32_000);
+		assert.deepEqual(glm.input, ["text", "image"]);
+		assert.equal(glm.thinkingLevelMap?.minimal, "minimal");
+		assert.equal(glm.thinkingLevelMap?.max, "max");
+		assert.equal(getModelUpstream("glm-5.3-flash-free"), "opencode");
+		assert.equal(getModelUpstream("glm-5.3-flash"), "opencode");
+		const alpha = getModelDef("ll-alpha-free");
+		assert.ok(alpha);
+		assert.equal(alpha.reasoning, true);
+		assert.equal(alpha.contextWindow, 262_144);
+		assert.equal(alpha.maxTokens, 65_536);
+		assert.deepEqual(alpha.input, ["text"]);
+		assert.equal(alpha.thinkingLevelMap?.minimal, null);
+		assert.equal(alpha.thinkingLevelMap?.low, "low");
+		assert.equal(alpha.thinkingLevelMap?.max, "max");
+		assert.equal(getModelUpstream("ll-alpha-free"), "opencode");
+		assert.equal(getModelUpstream("ll-alpha"), "opencode");
+		const exo = getModelDef("exo-free");
+		assert.ok(exo);
+		assert.equal(exo.reasoning, true);
+		assert.equal(exo.contextWindow, 1_048_576);
+		assert.equal(exo.maxTokens, 131_072);
+		assert.deepEqual(exo.input, ["text", "image"]);
+		assert.equal(exo.thinkingLevelMap?.high, "high");
+		assert.equal(exo.thinkingLevelMap?.minimal, null);
+		assert.equal(exo.thinkingLevelMap?.max, null);
+		assert.equal(getModelUpstream("exo-free"), "opencode");
+		assert.equal(getModelUpstream("exo"), "opencode");
+	});
 
 test("2026-09-28 pruned models stay out of the static catalog", () => {
  // Gone from the live Kilo free list: :free IDs absent, keyless 404.
  // Only paid counterparts remain (isFree:false), so nothing registers.
- for (const id of ["nex-agi/nex-n2.5-pro:free", "nex-agi/nex-n2.5-mini:free", "z-ai/glm-5.2:free"]) {
-  assert.equal(getModelDef(id), undefined, `${id} must not resolve`);
-  assert.equal(MODEL_MAP.get(id), undefined, `${id} must not be in MODEL_MAP`);
- }
+	for (const id of [
+		"nex-agi/nex-n2.5-pro:free",
+		"nex-agi/nex-n2.5-mini:free",
+		"z-ai/glm-5.2:free",
+		"mimo-v2.5-free",
+		"stealth/space-bunny-alpha",
+		"qwen/qwen3.8-27b:free",
+		"fledge-alpha-free",
+		"inclusionai/ling-3.0-flash-sante:free",
+		"stepfun/step-3.7-flash:free",
+	]) {
+		assert.equal(getModelDef(id), undefined, `${id} must not resolve`);
+		assert.equal(MODEL_MAP.get(id), undefined, `${id} must not be in MODEL_MAP`);
+	}
  // Pruned aliases fall through to the verbatim ID (no cross-lab residue)
- assert.equal(resolveCanonicalModelId("nex-n2.5-pro"), "nex-n2.5-pro");
- assert.equal(resolveCanonicalModelId("nex-n2.5-mini"), "nex-n2.5-mini");
- assert.equal(resolveCanonicalModelId("glm-5.2"), "glm-5.2");
+	assert.equal(resolveCanonicalModelId("nex-n2.5-pro"), "nex-n2.5-pro");
+	assert.equal(resolveCanonicalModelId("nex-n2.5-mini"), "nex-n2.5-mini");
+	assert.equal(resolveCanonicalModelId("glm-5.2"), "glm-5.2");
+	assert.equal(resolveCanonicalModelId("fledge-alpha"), "fledge-alpha");
+	assert.equal(resolveCanonicalModelId("step-3.7-flash"), "step-3.7-flash");
+	assert.equal(resolveCanonicalModelId("ling-3.0-flash-sante"), "ling-3.0-flash-sante");
 });
 
 test("model aliases resolve correctly to canonical IDs", () => {
@@ -204,9 +235,17 @@ test("catalog spec lock: live-verified ctx/max/reasoning per model", () => {
  // error messages). Change only with a fresh live verification.
  const locked: Record<string, { ctx: number; max: number; reasoning: boolean }> = {
   // OpenCode Zen
+  // Added 2026-10-13 (live: Zen listing + keyless chat 200; chat-only,
+  // /v1/responses answers 400). Efforts re-probed 2026-10-16: low..max all
+  // answer 200; minimal/none/bogus answer 400 with the supported set
+  // (max/xhigh/high/medium/low) enumerated in the error.
+  // Context is 262_144 — the published value, matching where recall actually
+  // fails: the needle is recalled at 248,232 prompt tokens and lost at 250,272,
+  // while the gateway keeps answering 200 all the way to ~1M and truncates
+  // silently. Acceptance is not capability; do not raise this from a 200.
+  "cat-jam-free": { ctx: 262_144, max: 131_072, reasoning: true },
   "muse-spark-1.2-contributor-free": { ctx: 1_048_576, max: 131_072, reasoning: true },
   "muse-spark-1.3-contributor-free": { ctx: 1_048_576, max: 131_072, reasoning: true },
-  "mimo-v2.5-free": { ctx: 1_048_576, max: 131_072, reasoning: true },
   // Added 2026-09-22 (live: Zen /v1/models + keyless chat 200 on mimo-v2.6-flash-free)
   "mimo-v2.6-flash-free": { ctx: 1_048_576, max: 131_072, reasoning: true },
   // Added 2026-09-23 (live: Zen listing + keyless chat 200; models.dev 1M ctx / 512K out)
@@ -215,7 +254,34 @@ test("catalog spec lock: live-verified ctx/max/reasoning per model", () => {
   "longcat-2.5-preview-free": { ctx: 1_000_000, max: 131_072, reasoning: true },
   "nemotron-3-ultra-free": { ctx: 1_000_000, max: 128_000, reasoning: true },
   "nemotron-3.5-lightning-free": { ctx: 1_000_000, max: 262_144, reasoning: true },
+  // Added 2026-10-16 (issue #62): live Zen /v1/models listing + chat 200 through
+  // the fingerprint path; context per the models.dev opencode twin and the
+  // NVIDIA family origin (declared 1,000,000, round and conservative), output
+  // 131,072 per models.dev.
+  "nemotron-3.5-super-vl-free": { ctx: 1_000_000, max: 131_072, reasoning: true },
   "big-pickle": { ctx: 200_000, max: 32_000, reasoning: true },
+	// Added 2026-10-16 (issue #71): Zen v1.19.2 free id, chat 200 through the
+	// fingerprint path; models.dev's 200,000 ctx contradicted by probe (recall
+	// at ~250K words, hard 400 only above ~1M words) — 1,000,000 declared like
+	// the Kilo twin (z-ai/glm-5.3-flash).
+	"glm-5.3-flash-free": { ctx: 1_000_000, max: 32_000, reasoning: true },
+	// Added 2026-10-16 (issue #71): pi.dev + models.dev agree on 262,144/65,536,
+	// text-only; boundary probe matches (recall ~220K words, 400 at ~250K).
+	"ll-alpha-free": { ctx: 262_144, max: 65_536, reasoning: true },
+	// Added 2026-10-16 (recheck): revived upstream the same day - back on
+	// the official free lineup, chat 200 with tools/stream/reasoning/vision;
+	// dual-canary recall at ~520K tokens and the 1.2M-word empty-400 wall
+	// bracket the published 1,048,576.
+	"exo-free": { ctx: 1_048_576, max: 131_072, reasoning: true },
+  // Added 2026-10-15 (live: Zen /v1/models listing + gated-lane 200 carrying the
+  // full fingerprint; chat-only, /v1/responses answers 400 ModelProtocolUnsupported).
+  // Context measured, NOT published: the catalog entry for this exact free id
+  // claims 200,000 and the gateway carries a marker planted mid-prompt far past
+  // it — recall holds through prompt_tokens=1,030,800, and an oversized request
+  // is refused with an empty-bodied 400 somewhere above ~1.05M. The published
+  // 200k belongs to the paid deepseek-v4-flash-free, a different model.
+  // Output 384,000 per https://models.dev/models/deepseek/deepseek-v4.1-flash/ and gateway probe
+  "deepseek-v4.1-flash-free": { ctx: 1_000_000, max: 384_000, reasoning: true },
   // KiloCode Gateway
   "dots-studio/dots-3-note-preview:free": { ctx: 512_000, max: 512_000, reasoning: true },
   "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": { ctx: 256_000, max: 131_072, reasoning: true },
@@ -228,23 +294,26 @@ test("catalog spec lock: live-verified ctx/max/reasoning per model", () => {
   "liquid/lfm-2.5-2.6b:free": { ctx: 65_536, max: 32_768, reasoning: true },
   "kilo-auto/free": { ctx: 256_000, max: 10_000, reasoning: true },
   "openrouter/free": { ctx: 200_000, max: 65_536, reasoning: true },
-  "nvidia/nemotron-3.5-content-safety:free": { ctx: 128_000, max: 8_192, reasoning: false },
-  // Added 2026-08-30 (live-verified)
-  "inclusionai/ling-3.0-flash-sante:free": { ctx: 262_144, max: 32_768, reasoning: true },
-  "thinkingmachines/inkling-small:free": { ctx: 1_048_576, max: 262_144, reasoning: true },
-  // Resurrected 2026-09-28 (live: Kilo free list isFree:true + keyless chat 200)
-  "stepfun/step-3.7-flash:free": { ctx: 262_144, max: 262_144, reasoning: true },
-  // Added 2026-09-28 (live: Kilo free list isFree:true + keyless chat 200; 1M ctx)
-  "stealth/space-bunny-alpha": { ctx: 1_000_000, max: 524_288, reasoning: true },
-  // Added 2026-09-22 (live: Kilo /api/gateway/models context_length/max_completion_tokens)
-  "qwen/qwen3.8-27b:free": { ctx: 262_144, max: 235_929, reasoning: true },
+	"thinkingmachines/inkling-small:free": { ctx: 1_048_576, max: 262_144, reasoning: true },
+	// Retired 2026-10-09 (demoted to paid upstream — :free IDs 404 keyless)
+	// Added 2026-10-09 (live: Kilo free list isFree:true + keyless chat served; 256K/1M ctx)
+	"stealth/glyph-cluster": { ctx: 256_000, max: 256_000, reasoning: true },
   // Cline direct-only (per-user pool — https://api.cline.bot)
-  "cline-free/deepseek-v4.1-flash": { ctx: 1_000_000, max: 384_000, reasoning: true },
   "cline-free/muse-spark-1.3-contributor": { ctx: 1_048_576, max: 131_072, reasoning: true },
-  "z-ai/glm-5.3-flash": { ctx: 1_000_000, max: 131_072, reasoning: true },
-  // Added 2026-09-22 (live: desktop-identity free list + chat probe)
-  "cline-free/kimi-k3": { ctx: 1_048_576, max: 131_072, reasoning: true },
-  "cline-free/solar-pro4": { ctx: 524_288, max: 131_072, reasoning: true },
+  "z-ai/glm-5.3-flash": { ctx: 1_048_576, max: 131_072, reasoning: true },
+  // OVHcloud AI Endpoints, keyless direct-only. Added 2026-10-13: live
+  // /v1/models listing + keyless chat 200 + SSE with real tool_calls. max is
+  // the conservative FLOOR across twin providers (per-provider caps for the
+  // same model range 4K..256K); reasoning read off a populated `reasoning`
+  // field on a non-tool answer.
+  "ovh-free/gpt-oss-120b": { ctx: 131_072, max: 32_768, reasoning: true },
+  "ovh-free/gpt-oss-20b": { ctx: 131_072, max: 32_768, reasoning: true },
+  "ovh-free/Qwen3.5-397B-A17B": { ctx: 262_144, max: 65_536, reasoning: true },
+  "ovh-free/Qwen3.5-9B": { ctx: 262_144, max: 65_536, reasoning: true },
+  "ovh-free/Qwen3.6-27B": { ctx: 262_144, max: 65_536, reasoning: true },
+  "ovh-free/Qwen3.8-27B": { ctx: 262_144, max: 32_768, reasoning: true },
+  "ovh-free/Mistral-Small-3.2-24B-Instruct-2506": { ctx: 131_072, max: 16_384, reasoning: false },
+  "ovh-free/Meta-Llama-3_3-70B-Instruct": { ctx: 131_072, max: 16_384, reasoning: false },
  };
  for (const [id, { ctx, max, reasoning }] of Object.entries(locked)) {
   const m = getModelDef(id);
@@ -256,16 +325,186 @@ test("catalog spec lock: live-verified ctx/max/reasoning per model", () => {
  assert.equal(Object.keys(locked).length, ALL_MODELS.length, "every catalog model is spec-locked");
 });
 
+test("2026-10-15 Zen DeepSeek V4.1 Flash carries probe-measured specs", () => {
+ // The published entry for this exact free id claims 200,000 context and
+ // text-only input; live probes contradicted both. A static entry must
+ // override the enrichment heuristic, which would guess 262K / text-only off
+ // the substring rules ("deepseek" and "flash" both match).
+ const ds = getModelDef("deepseek-v4.1-flash-free");
+ assert.ok(ds);
+ assert.equal(ds.reasoning, true);
+ assert.equal(ds.contextWindow, 1_000_000);
+ assert.equal(ds.maxTokens, 384_000);
+ assert.deepEqual(ds.input, ["text", "image"]);
+ // Chat-only upstream: a Responses request is refused, so no api override.
+ assert.equal(ds.api, undefined);
+ // Every effort level is accepted live, so none may be locked off.
+ for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+  assert.equal(ds.thinkingLevelMap?.[level], level, `${level} must stay selectable`);
+ }
+ assert.equal(ds.thinkingLevelMap?.off, null);
+ assert.equal(getModelUpstream("deepseek-v4.1-flash-free"), "opencode");
+});
+
+test("2026-10-16 issue #62: cat-jam exposes the live max effort; Nemotron 3.5 Super VL is a locked static entry", () => {
+ // (a) cat-jam-free: the gateway accepts reasoning_effort "max" (200 with a
+ // populated reasoning stream) and rejects minimal/none/bogus with a 400 that
+ // enumerates max/xhigh/high/medium/low as the supported set. A null `max`
+ // in the map hid a real, selectable level from the picker.
+ const catJam = getModelDef("cat-jam-free");
+ assert.ok(catJam);
+ assert.equal(catJam.thinkingLevelMap?.max, "max", "max is accepted upstream and must be selectable");
+ assert.equal(catJam.thinkingLevelMap?.xhigh, "xhigh");
+ assert.equal(catJam.thinkingLevelMap?.minimal, null, "minimal 400s upstream and must stay hidden");
+
+ // (b) nemotron-3.5-super-vl-free: on the live Zen free list but absent from
+ // the static catalog, so the dynamic merge registered it through the
+ // enrichModelDef heuristic — reasoning:false, no effort map, no picker levels.
+ const superVl = getModelDef("nemotron-3.5-super-vl-free");
+ assert.ok(superVl, "nemotron-3.5-super-vl-free must be a static catalog entry");
+ assert.equal(superVl.reasoning, true);
+ assert.deepEqual(superVl.input, ["text", "image"]);
+ assert.deepEqual(superVl.thinkingLevelMap, {
+  off: null,
+  minimal: "minimal",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: null,
+ });
+ assert.equal(superVl.contextWindow, 1_000_000);
+ assert.equal(superVl.maxTokens, 131_072);
+ assert.equal(getModelUpstream("nemotron-3.5-super-vl-free"), "opencode");
+ assert.equal(resolveCanonicalModelId("nemotron-3.5-super-vl"), "nemotron-3.5-super-vl-free");
+ // Chat is the only native shape (/v1/responses answers 400 protocol error).
+ assert.equal(superVl.api, undefined);
+});
+
 test("new alias map resolves to canonical kilo ids", () => {
  assert.equal(resolveCanonicalModelId("inkling-small"), "thinkingmachines/inkling-small:free");
- assert.equal(resolveCanonicalModelId("ling-3.0-flash-sante"), "inclusionai/ling-3.0-flash-sante:free");
- assert.equal(resolveCanonicalModelId("step-3.7-flash"), "stepfun/step-3.7-flash:free");
- assert.equal(resolveCanonicalModelId("space-bunny-alpha"), "stealth/space-bunny-alpha");
- assert.equal(resolveCanonicalModelId("mimo-v2.6-flash"), "mimo-v2.6-flash-free");
- assert.equal(resolveCanonicalModelId("qwen3.8-27b"), "qwen/qwen3.8-27b:free");
+	assert.equal(resolveCanonicalModelId("glyph-cluster"), "stealth/glyph-cluster");
+	assert.equal(resolveCanonicalModelId("mimo-v2.6-flash"), "mimo-v2.6-flash-free");
+	assert.equal(resolveCanonicalModelId("glm-5.3-flash"), "glm-5.3-flash-free");
+	assert.equal(resolveCanonicalModelId("ll-alpha"), "ll-alpha-free");
+	assert.equal(resolveCanonicalModelId("exo"), "exo-free");
 });
 
 test("union-alpha is pruned from the static catalog", () => {
  assert.equal(MODEL_MAP.get("union-alpha"), undefined, "union-alpha must not be in MODEL_MAP");
  assert.equal(ALL_MODELS.some((m) => m.id === "union-alpha"), false, "union-alpha must not be in ALL_MODELS");
+});
+
+test("ling-3.1-flash-free is pruned from the static catalog", () => {
+	assert.equal(MODEL_MAP.get("ling-3.1-flash-free"), undefined, "ling-3.1-flash-free must not be in MODEL_MAP");
+	assert.equal(ALL_MODELS.some((m) => m.id === "ling-3.1-flash-free"), false, "ling-3.1-flash-free must not be in ALL_MODELS");
+});
+
+test("step-5-preview-free and its Kilo lane are pruned from the static catalog", () => {
+	for (const id of ["step-5-preview-free", "stepfun/step-5-preview-free"]) {
+		assert.equal(MODEL_MAP.get(id), undefined, id + " must not be in MODEL_MAP");
+		assert.equal(ALL_MODELS.some((m) => m.id === id), false, id + " must not be in ALL_MODELS");
+	}
+});
+
+test("2026-10-13 OVH lane: every id routes to the ovh upstream, never Zen", () => {
+ // Lane resolution is the load-bearing assertion: a miss here sends the
+ // request into the Zen branch, where the free-tier fingerprint and the
+ // relay pool would both be applied to a keyless OVH endpoint.
+ for (const m of OVH_MODELS) {
+  assert.equal(getModelUpstream(m.id), "ovh", `${m.id} must resolve to the ovh upstream`);
+  assert.equal(isOvhModel(m.id), true, `${m.id} must be recognized as an OVH id`);
+  assert.equal(isOvhModel(resolveCanonicalModelId(m.id)), true, `${m.id} must be recognized through alias resolution`);
+  assert.equal(isKiloModel(m.id), false, `${m.id} must never resolve to Kilo`);
+ }
+ // A Zen/Kilo/Cline id must never leak into the OVH lane.
+ assert.equal(isOvhModel("muse-spark-1.3-contributor-free"), false);
+ assert.equal(isOvhModel("dots-studio/dots-3-note-preview:free"), false);
+ assert.equal(isOvhModel("z-ai/glm-5.3-flash"), false);
+ assert.equal(getModelUpstream("muse-spark-1.3-contributor-free"), "opencode");
+});
+test("2026-10-13 OVH aliases resolve to the ovh-free catalog ids", () => {
+ const aliases: Record<string, string> = {
+  "gpt-oss-120b": "ovh-free/gpt-oss-120b",
+  "gpt-oss-20b": "ovh-free/gpt-oss-20b",
+  "qwen3.5-397b": "ovh-free/Qwen3.5-397B-A17B",
+  "qwen3.5-9b": "ovh-free/Qwen3.5-9B",
+  "qwen3.6-27b": "ovh-free/Qwen3.6-27B",
+  "qwen3.8-27b": "ovh-free/Qwen3.8-27B",
+  "mistral-small-3.2": "ovh-free/Mistral-Small-3.2-24B-Instruct-2506",
+  "llama-3.3-70b": "ovh-free/Meta-Llama-3_3-70B-Instruct",
+ };
+ for (const [alias, canonical] of Object.entries(aliases)) {
+  assert.equal(resolveCanonicalModelId(alias), canonical, `${alias} alias`);
+  assert.ok(getModelDef(alias), `${alias} must resolve to a model definition`);
+  assert.equal(getModelUpstream(alias), "ovh", `${alias} must route to OVH`);
+ }
+});
+
+test("2026-10-13 OVH ids resolve to the bare wire id, prefix stripped after canonicalisation", () => {
+ // OVH rejects the namespaced id with 404 model_not_found (live 2026-10-13),
+ // and the suffix is case-sensitive on the wire, so the strip must be
+ // exact-prefix-only and must not lowercase anything.
+ for (const m of OVH_MODELS) {
+  assert.ok(m.id.startsWith(OVH_MODEL_PREFIX), `${m.id} must carry the lane prefix`);
+  const upstream = ovhUpstreamModelId(m.id);
+  assert.ok(upstream.length > 0, `${m.id} must yield a non-empty upstream id`);
+  assert.equal(upstream, upstream.replace(OVH_MODEL_PREFIX, ""), `${m.id}: prefix removed exactly once`);
+  assert.equal(upstream, upstream.trim(), `${m.id}: no whitespace around the upstream id`);
+  assert.ok(!upstream.includes("/"), `${m.id}: the wire id must carry no path separator`);
+ }
+ assert.equal(ovhUpstreamModelId("ovh-free/Qwen3.5-397B-A17B"), "Qwen3.5-397B-A17B");
+ assert.equal(ovhUpstreamModelId("ovh-free/Meta-Llama-3_3-70B-Instruct"), "Meta-Llama-3_3-70B-Instruct");
+ // Regression: a short alias must resolve BEFORE the prefix comes off. The
+ // rewrite used to run on the raw body value, so `llama-3.3-70b` reached OVH
+ // unrecognised and answered 404 model_not_found, even though lane detection
+ // had already routed it correctly.
+ assert.equal(ovhUpstreamModelId("llama-3.3-70b"), "Meta-Llama-3_3-70B-Instruct");
+ assert.equal(ovhUpstreamModelId("gpt-oss-120b"), "gpt-oss-120b");
+ assert.equal(ovhUpstreamModelId("qwen3.5-397b"), "Qwen3.5-397B-A17B");
+ assert.equal(ovhUpstreamModelId("mistral-small-3.2"), "Mistral-Small-3.2-24B-Instruct-2506");
+ // Every catalog id and every alias must produce a bare, prefix-free id.
+ for (const m of OVH_MODELS) {
+  for (const candidate of [m.id, resolveCanonicalModelId(m.id)]) {
+   assert.equal(ovhUpstreamModelId(candidate), ovhUpstreamModelId(m.id), `${candidate} must resolve to the same wire id`);
+  }
+ }
+});
+test("2026-10-13 OVH spec-drift guard: context windows change only with a deliberate edit", () => {
+ // OVH publishes one advertised context per model; a silent change upstream
+ // must fail here so the catalog is edited on purpose instead of drifting.
+ const lockedCtx: Record<string, number> = {
+  "ovh-free/gpt-oss-120b": 131_072,
+  "ovh-free/gpt-oss-20b": 131_072,
+  "ovh-free/Qwen3.5-397B-A17B": 262_144,
+  "ovh-free/Qwen3.5-9B": 262_144,
+  "ovh-free/Qwen3.6-27B": 262_144,
+  "ovh-free/Qwen3.8-27B": 262_144,
+  "ovh-free/Mistral-Small-3.2-24B-Instruct-2506": 131_072,
+  "ovh-free/Meta-Llama-3_3-70B-Instruct": 131_072,
+ };
+ for (const [id, ctx] of Object.entries(lockedCtx)) {
+  const m = getModelDef(id);
+  assert.ok(m, `drift-guard model ${id} exists`);
+  assert.equal(m!.contextWindow, ctx, `${id}: context window drifted — re-probe OVH and edit the catalog deliberately`);
+  // A window that silently grew to the 1M tier would let the host build a
+  // prompt OVH refuses; that is the failure mode this guard exists to stop.
+  assert.ok(m!.contextWindow < 1_000_000, `${id}: no OVH model may claim the 1M tier`);
+ }
+ assert.equal(Object.keys(lockedCtx).length, OVH_MODELS.length, "every OVH model is drift-guarded");
+});
+
+test("2026-10-13 OVH reasoning models lock the two confirmed effort levels", () => {
+ for (const m of OVH_MODELS) {
+  if (!m.reasoning) {
+   assert.equal(m.thinkingLevelMap, undefined, `${m.id} non-reasoning must declare no map`);
+   continue;
+  }
+  const map = m.thinkingLevelMap!;
+  assert.deepEqual(map, { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null }, `${m.id} effort map`);
+  // An omitted key leaves the level selectable in the host, so every level
+  // must be present explicitly — minimal included.
+  assert.ok("minimal" in map, `${m.id}: minimal must be an explicit null, not omitted`);
+  assert.ok("medium" in map && "xhigh" in map && "max" in map, `${m.id}: unconfirmed levels must be explicit nulls`);
+ }
 });

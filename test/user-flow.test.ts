@@ -3,7 +3,7 @@
  *
  * Drives the whole fresh-user journey against mocks, no real network, no real
  * ports 28180/18080:
- *   1. Fresh install — activation registers 31 models, binds a proxy, onboards
+ *   1. Fresh install — activation registers the full static catalog, binds a proxy, onboards
  *      exactly once (flag-gated), no re-notify on a second session.
  *   2. Direct-mode chat — POST /v1/chat/completions streams SSE chunks + a
  *      terminal event through the running proxy; request hits the sandbox log.
@@ -162,7 +162,7 @@ const mockPi: ExtensionAPI = {
 
 // ── 1. Fresh install ────────────────────────────────────────────────────────
 
-test("user flow [1/6] fresh install registers 31 models, binds a proxy, and onboards exactly once", async () => {
+test("user flow [1/6] fresh install registers the full static catalog, binds a proxy, and onboards exactly once", async () => {
  await withIsolatedSandboxFiles(async () => {
   clearSandboxFiles();
 
@@ -193,9 +193,9 @@ test("user flow [1/6] fresh install registers 31 models, binds a proxy, and onbo
    async (url: unknown, init?: RequestInit) => {
     const u = String(url);
     if (u.startsWith(localPrefix)) return realFetch(u, init);
-    // Force the legacy/default port probes to see "no daemon" so a
+    // Force the default port probe to see "no daemon" so a
     // possibly-running real daemon is never reused by the extension.
-    if (u.includes("127.0.0.1:18080") || u.includes("127.0.0.1:28180")) {
+    if (u.includes("127.0.0.1:28180")) {
      throw new Error("no daemon (test override)");
     }
     // Everything else external (registry/catalog): benign response.
@@ -215,7 +215,7 @@ test("user flow [1/6] fresh install registers 31 models, binds a proxy, and onbo
    assert.equal(
     registeredConfig.models.length,
     ALL_MODELS.length,
-    "all 31 static models must be registered",
+				`all ${ALL_MODELS.length} static models must be registered`,
    );
    assert.match(registeredConfig.baseUrl, /127\.0\.0\.1/, "baseUrl must point to loopback");
 
@@ -231,9 +231,12 @@ test("user flow [1/6] fresh install registers 31 models, binds a proxy, and onbo
    assert.equal(msgs.length, 1, "first run must notify exactly once");
    assert.ok(fs.existsSync(ONBOARDED_FLAG_FILE), "onboarded flag must be created");
    assert.equal(fs.readFileSync(ONBOARDED_FLAG_FILE, "utf8"), "1");
-   assert.match(
-    msgs[0],
-    /^freeflow ready: 31 free models via local proxy 127\.0\.0\.1:28180\. /,
+   // The welcome must name the port the proxy is actually bound on —
+   // TEST_PROXY_PORT here, never the hardcoded default.
+   assert.ok(
+    msgs[0].startsWith(
+     `freeflow ready: ${ALL_MODELS.length} free models via local proxy 127.0.0.1:${TEST_PROXY_PORT}. `,
+    ),
     "welcome must announce the local proxy",
    );
 
@@ -407,7 +410,7 @@ test("user flow [4/6] /freeflow deploy vercel adds a relay, activates it, and pr
      );
     }
     if (url.startsWith("https://relay-test.vercel.app")) {
-     // probeRelay round-trip (x-relay-path=/zen/v1/models)
+     // probeRelay round-trip (x-relay-path=/inference/v1/models)
      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     }
     throw new Error(`unexpected fetch in deploy flow: ${url}`);

@@ -13,13 +13,14 @@ import {
  enrichModelDef,
  isFreeCatalogId,
  mergeCatalog,
+ sanitizeCatalogModels,
  readCatalogCache,
  refreshCatalog,
  setAliveCatalog,
  writeCatalogCache,
 } from "../src/catalog.ts";
 import { CATALOG_CACHE_FILE, CATALOG_CACHE_TTL_MS } from "../src/config.ts";
-import { ALL_MODELS } from "../src/models.ts";
+import { ALL_MODELS, OVH_MODELS } from "../src/models.ts";
 import type { RegisteredModel } from "../src/types.ts";
 
 /** Baseline static models as RegisteredModel entries. */
@@ -131,7 +132,7 @@ test("refreshCatalog 200 with empty data is a no-op returning the alive catalog"
  });
 });
 
-test("refreshCatalog 200 maps the /zen/v1/models free list onto catalog flags, dropping paid and dead", async () => {
+test("refreshCatalog 200 maps the /inference/v1/models free list onto catalog flags, dropping paid and dead", async () => {
  await withCacheFileIsolation(async () => {
   fs.rmSync(CATALOG_CACHE_FILE, { force: true });
   const baseline = baselineModels();
@@ -244,18 +245,54 @@ test("mergeCatalog drops paid upstream ids like claude-fable-5-1 (issue #6)", ()
 });
 
 test("isFreeCatalogId accepts -free, :free, /free and known ids, rejects paid and dead", () => {
- assert.equal(isFreeCatalogId("mimo-v2.5-free"), true);
- assert.equal(isFreeCatalogId("thinkingmachines/inkling-small:free"), true);
- assert.equal(isFreeCatalogId("stepfun/step-3.7-flash:free"), true);
- assert.equal(isFreeCatalogId("lab/new-model/free"), true);
- assert.equal(isFreeCatalogId("big-pickle"), true);
- assert.equal(isFreeCatalogId("stealth/space-bunny-alpha"), true);
+	assert.equal(isFreeCatalogId("mimo-v2.6-flash-free"), true);
+	assert.equal(isFreeCatalogId("mimo-v2.5-free"), false);
+	assert.equal(isFreeCatalogId("thinkingmachines/inkling-small:free"), true);
+	// stepfun/step-5-preview-free was demoted to paid on Kilo (2026-10-16).
+	assert.equal(isFreeCatalogId("stepfun/step-5-preview-free"), false);
+	assert.equal(isFreeCatalogId("lab/new-model/free"), true);
+	assert.equal(isFreeCatalogId("big-pickle"), true);
+	assert.equal(isFreeCatalogId("inclusionai/ling-3.1-flash"), false);
+	assert.equal(isFreeCatalogId("stealth/space-bunny-alpha"), false);
  assert.equal(isFreeCatalogId("claude-fable-5-1"), false);
  assert.equal(isFreeCatalogId("nex-agi/nex-n2.5-pro:free"), false);
  assert.equal(isFreeCatalogId("z-ai/glm-5.2:free"), false);
  assert.equal(isFreeCatalogId("hy3-free"), false);
  assert.equal(isFreeCatalogId("thinkingmachines/inkling:free"), false);
+	assert.equal(isFreeCatalogId("cline-free/deepseek-v4.1-flash"), false);
+	assert.equal(isFreeCatalogId("cline-free/kimi-k3"), false);
+	assert.equal(isFreeCatalogId("cline-free/solar-pro4"), false);
+	// OVH lane: the `ovh-free/` prefix carries `-free`, so every namespaced
+	// id stays allowed while an unnamespaced OVH id that is not in the
+	// catalog does not (otherwise a paid OVH id could ride the picker).
+	assert.equal(isFreeCatalogId("ovh-free/gpt-oss-120b"), true);
+	assert.equal(isFreeCatalogId("ovh-free/gpt-oss-20b"), true);
+	assert.equal(isFreeCatalogId("ovh-free/Qwen3.5-397B-A17B"), true);
+	assert.equal(isFreeCatalogId("ovh-free/Qwen3.5-9B"), true);
+	assert.equal(isFreeCatalogId("ovh-free/Qwen3.6-27B"), true);
+	assert.equal(isFreeCatalogId("ovh-free/Qwen3.8-27B"), true);
+	assert.equal(isFreeCatalogId("ovh-free/Mistral-Small-3.2-24B-Instruct-2506"), true);
+	assert.equal(isFreeCatalogId("ovh-free/Mistral-7B-Instruct-v0.3"), false);
+	assert.equal(isFreeCatalogId("ovh-free/Meta-Llama-3_3-70B-Instruct"), true);
+	assert.equal(isFreeCatalogId("ovh/Mistral-Nemo-Instruct-2407"), false, "an unnamespaced OVH id is not in the catalog");
  assert.equal(isFreeCatalogId(""), false);
+});
+
+test("sanitizeCatalogModels keeps every OVH id and repairs its source", () => {
+	// A stale disk cache carries a `source` label; sanitize must re-derive it
+	// from the static definition so an OVH model can never register as a
+	// Zen model, and must never drop one of the eight.
+	const seeded: RegisteredModel[] = OVH_MODELS.map((m) => ({
+		...m,
+		source: "opencode" as const,
+	}));
+	const merged = sanitizeCatalogModels(seeded);
+	assert.equal(merged.length, OVH_MODELS.length);
+	for (const m of merged) {
+		assert.equal(m.source, "ovh", `${m.id}: source must be re-derived as ovh`);
+		assert.equal(m.contextWindow > 0, true, `${m.id}: specs survive sanitize`);
+	}
+	assert.deepEqual(merged.map((m) => m.id).sort(), OVH_MODELS.map((m) => m.id).sort());
 });
 
 test("sanitizeCatalogModels repairs stale spark api to openai-responses (issue #6)", () => {

@@ -1,5 +1,271 @@
 # Changelog
 
+## 1.38.2
+
+### Patch Changes
+
+- Add Exo to the OpenCode free tier — a live preview model with chat, tools, reasoning, and image input that the official free lineup lists.
+- Add GLM-5.3 Flash and LL Alpha to the OpenCode free tier, and retire Step 5 Preview — it is gone from the Zen lineup and demoted to paid on the Kilo lane, so those entries can no longer be selected.
+
+## 1.38.1
+
+### Patch Changes
+
+- Add the Nemotron 3.5 Super VL free model and enable the max thinking level on Cat Jam — both live-verified through the proxy; align the README and docs with the shipped catalog.
+- The first-run welcome now names the local proxy port actually in use instead of the default port.
+- Streaming requests now pass through replies that arrive in a non-streaming format instead of dropping the answer, concurrent startups share a single connection attempt instead of racing, and a foreign process squatting the local proxy port is no longer mistaken for the daemon we own.
+- Following logs now reads only the lines appended since the last tick instead of re-reading the whole log file every second, so `/freeflow logs --follow` stays light even on large logs.
+- Fix a batch of verified edge cases: non-ASCII streaming text is no longer corrupted when a character spans network chunks, assistant text stays visible on the responses path when it is served from a chat-only upstream, tool-argument repair also works on strict tool schemas, a relay that rejects our auth rolls to the next egress instead of being marked healthy, the update flow restarts the proxy it is actually attached to, and daemon/health state handling no longer loops or reads stale data.
+
+## 1.38.0
+
+### Minor Changes
+
+- Follow pi's config-dir global: data files (relay state, logs, caches — including the staged daemon sources) now root at `PI_CODING_AGENT_DIR` when set, instead of always `~/.pi/agent`. CI and containers can relocate pi's config dir once and the extension writes alongside it. A leading `~` in either override expands to the home directory, and `PI_FREEFLOW_DATA_DIR` still overrides everything.
+
+### Patch Changes
+
+- Startup no longer stalls for several seconds when the extension is installed as a package and runs under Node.js: the detached proxy daemon is now launched from a staged copy of its sources (Node refuses to strip types for files under `node_modules`), a daemon that exits immediately is detected instead of being awaited for the full ready timeout, and a free base port is no longer mistaken for an unresponsive port holder.
+
+## 1.37.1
+
+### Patch Changes
+
+- **DeepSeek V4.1 Flash (`deepseek-v4.1-flash-free`)**: Added to the OpenCode Zen lane (catalog 34 → 35 models). Configured with full **1,000,000 context window**, **384,000 max output tokens**, vision support (`input: ["text", "image"]`), and reasoning ladder (`minimal..max`).
+- **Sources of Truth & Highest-Spec Twin Policy**: Documented model reconciliation against [models.dev](https://models.dev/), [OpenRouter](https://openrouter.ai/), and OMP's built-in catalog, ensuring models are configured to the highest capability across twin models rather than artificially truncated limits.
+- **Automated OpenCode Model Health Bot**: Added dedicated GitHub Actions workflow and probe engine to continuously detect affected or degraded OpenCode free-tier models.
+
+## 1.37.0
+
+### Minor Changes
+
+- **Auto-Update Capability**: Added the `/freeflow autoupdate on|off` command (and `/freeflow update auto on|off`). When enabled, background update checks automatically download and install new versions, seamlessly restarting the proxy daemon.
+- **Automatic Daemon Recovery on Version Mismatch**: When the client detects an outdated running proxy daemon (or after an update), it automatically stops the stale daemon and restarts with the current package version, eliminating manual intervention and stale port locks.
+- **Documentation Sync**: Synchronized all documentation, specs, and routing tables to reflect the 34 verified free models across OpenCode Zen (10), KiloCode Gateway (14), Cline (2), and OVHcloud AI Endpoints (8).
+- **Self-Hosted VPS Relay Option**: Added setup guidance and documentation for self-hosting an egress relay pool on a VPS using [trefeon/warp-relay-pool](https://github.com/trefeon/warp-relay-pool).
+
+## 1.36.3
+
+### Patch Changes
+
+- Restore OpenCode free models following upstream endpoint and gate migration
+
+  OpenCode free models were failing with HTTP 403 FreeTierError after upstream deprecated the older endpoint and moved free inference traffic to the v1 inference gateway. Upstream also requires public authorization and non-empty schema declarations on compatibility tools.
+
+  Requests now route to the active endpoint with the required public credentials and schema declarations, restoring free model access across both direct connections and deployed relays.
+
+## 1.36.2
+
+### Patch Changes
+
+- Auto-recover OpenCode Zen 403 FreeTierError: when upstream OpenCode Zen refuses a session with `403 FreeTierError` ("OpenCode's free tier can only be used from within OpenCode"), the local proxy now catches the gate error in-flight and transparently fails over to a healthy KiloCode fallback model on the same wire API, rather than bubbling the 403 back to the coding agent.
+- Prune decommissioned `ling-3.1-flash-free` from the active catalog and add it to the exclusion list, locking the verified catalog to 36 models.
+- Update OpenCode version fallback to 1.19.0.
+
+## 1.36.1
+
+### Patch Changes
+
+- Fix tool calls being rejected as invalid JSON on every model, and tool names coming back under a name the host never registered.
+
+  - A tool whose arguments arrived carrying the tail of the previous call is now repaired for **every** tool, not only tools declaring a nested object or array. The most-used tool, the shell command tool, declares nothing but scalars, so it was never repaired at all — the call was rejected and the turn looped on the same broken payload.
+  - Buffered tool arguments are released when a stream ends without its normal ending event, instead of being dropped: a truncated stream used to deliver a call with no arguments at all.
+  - The tool-name restore now runs on the Cline and OVH lanes too. Those lanes send a renamed tool upstream but never took it back, so a client received a call for a tool it does not have.
+  - A caller that declares both file-pattern and semantic-search tools now keeps both. The two share a name across hosts but are different tools, and collapsing them handed the model one tool under the other's shape.
+  - A truncated number is refused rather than completed, and an inner object is never promoted over the wrapper that declares it.
+  - A non-streaming answer from the Kilo lane is repaired like a streamed one.
+  - The free tier is the only lane that renames a tool now. The other lanes carry
+    the caller's own names in both directions, so the host dispatches natively
+    instead of waiting for a name that never comes back.
+  - Tools that declare an optional value as "value or nothing" are repaired
+    again. Both hosts describe optional settings that way when a tool is declared
+    strictly, and reading that as "always send it" silently switched repair off
+    for the shell command tool — the one that matters most.
+  - A model answering an optional setting with the word "none" as text, instead of
+    leaving it empty, is now corrected rather than rejected. Affects roughly one
+    model in nine.
+  - A streamed Anthropic-format answer is now repaired and mapped like the other
+    two formats. It was forwarded untouched.
+  - A stream that ends without an answer says so, instead of reporting an empty
+    successful one.
+
+## 1.36.0
+
+### Minor Changes
+
+- bf358da: A new free model on the OpenCode Zen lane: Cat Jam
+
+  `cat-jam-free` joins the picker, bringing the catalog to 37 models (11 OpenCode, 15 Kilo, 2 Cline, 9 OVHcloud). No account, no key, no setup — it is keyless like every other Zen free model.
+
+  It thinks, and it has a 262,144-token window. That number was measured the hard way: the gateway happily accepts prompts four times that size and answers normally, but the model can no longer read them. A marker planted at the end of a 248,232-token prompt comes back; at 250,272 tokens it does not. So the advertised window is what the model can actually use, not merely what the service tolerates.
+
+  Two honest limits worth knowing before you pick it:
+
+  - **It is not available on the Responses API.** Requests sent that way are refused with a protocol error. It works on chat completions, which is what hosts use by default, but a host pinned specifically to Responses will not see it.
+  - **Thinking depth starts at "low".** The lowest setting is refused, so "minimal" is not offered; low, medium, high and extra-high all work.
+
+  The output budget is 131,072, the published figure for this model.
+
+### Patch Changes
+
+- bf358da: Long sessions no longer stall on a tool call whose arguments arrived spliced
+
+  Some models open their next tool call by echoing the tail of the one they had just seen, and occasionally stop before the closing brace. The result is a single argument string carrying both faults at once: the previous call's leftover text in front, and the last brace missing. The whole call was then rejected, the turn failed, and the host retried — which resent the same broken payload, so a long session could get stuck repeating it.
+
+  Both faults are now repaired together, so the caller's own arguments arrive intact.
+
+  The repair stays deliberately narrow. It only fires when a leftover fragment is actually present in front of the object, which is the evidence that the model was mid-call rather than that the request itself was malformed, and only when what follows is a complete object merely missing its closing brace. Arguments cut off part-way through a value are still refused untouched, because completing those would silently shorten them — and these arguments carry shell commands.
+
+  Tool calls that were already well-formed are unaffected and pass through byte-identically.
+
+## 1.35.0
+
+### Minor Changes
+
+- 9085408: Nine more free models, from OVHcloud's AI Endpoints — and no account needed
+
+  The picker now offers nine open-weight models served by OVHcloud AI Endpoints, bringing the catalog to 36: GPT-OSS 120B and 20B, four Qwen models (3.5 397B, 3.5 9B, 3.6 27B, 3.8 27B), Mistral Small 3.2 and Mistral 7B, and Meta Llama 3.3 70B. The four Qwens and Mistral Small 3.2 also read images.
+
+  Access is anonymous and keyless. There is nothing to sign up for and no key to paste — no login step, no saved credential, no setup of any kind. Pick a model and it works.
+
+  The honest caveat: OVH rate-limits anonymous callers per IP address. A burst of parallel subagents can run into `API rate limit exceeded`, the same way a shared OpenCode or Kilo quota does. Wait it out or spread the work across models. Requests to these models always go straight to OVH from your machine, never through your relay pool — there is no per-IP gate for a relay to route around.
+
+  Thinking depth is limited to the two levels OVH confirms, `low` and `high`, on the six models that reason. The output budgets are deliberately conservative: they are the smallest cap any provider offers for the same underlying model, so a turn never asks for more than OVH will give.
+
+### Patch Changes
+
+- 3408dad: Stop conversations from dying on request shapes the provider rejects
+
+  Three shapes that the provider answers with `400 invalid parameters` are now reshaped on the way out instead of failing the whole turn.
+
+  - **A model narrates a tool call instead of making one.** The reply is recorded as pre-tool commentary, and every later message replayed that turn back to the provider was rejected — the session could not continue or be resumed, because each retry sent the same history again.
+  - **A host asks for a specific tool or forces a tool call.** The free provider accepts only automatic tool selection, so an unsupported choice is dropped rather than sent. Nothing is imposed on a host that did not ask.
+  - **A tool name carries a character the provider rejects.** Spaces, colons and slashes are folded for the trip out and the caller's own name is restored on the way back, so the tool still runs under the name it was registered with. Names that are already accepted are sent exactly as they always were.
+
+  Measured on Muse Spark 1.3: the same three requests that each failed with an error now answer normally, and a well-formed tool set reaches the model byte-identical to before.
+
+- 9085408: Three free models that no longer answer are gone from the picker
+
+  `cline-free/deepseek-v4.1-flash`, `cline-free/kimi-k3` and `cline-free/solar-pro4` were retired upstream, so every turn on them failed. All three were probed twice against the live service on 2026-10-13 and each time answered `404 model not found` ("Cline has no such model. Refresh the model list and retry."), while the two Cline models that survive — `cline-free/muse-spark-1.3-contributor` and `z-ai/glm-5.3-flash` — answered 200 with the same login and request shape. The login, the quota rollover and every other model are unchanged; the picker is now 36 models (10 OpenCode, 15 Kilo, 2 Cline, 9 OVH).
+
+## 1.34.0
+
+### Minor Changes
+
+- aa6f259: Three new free models, picked the same way as the rest (`/model` → `freeflow` → pick):
+
+  - **Step 5 Preview** on OpenCode Zen (`step-5-preview-free`, short name `step-5-preview`) — 1M context, answers with vision.
+  - **Step 5 Preview** on KiloCode (`stepfun/step-5-preview-free`, short name `step-5-preview:kilo`) — 1M context, answers with vision.
+  - **Glyph Cluster** on KiloCode (`stealth/glyph-cluster`, short name `glyph-cluster`) — 256K context, text answers.
+
+### Patch Changes
+
+- 50981fb: Align nine model entries with the specs their upstream catalogs publish. Models now advertise video input where the vendor lists it, two entries pick up a larger context window, and Step 5 Preview on KiloCode reports the full 64K output allowance.
+- f637c58: Recover tool calls that arrive with the tail of the previous call stuck to the
+  front. Some models open a new call by echoing the end of the one they have just
+  seen, so a single call is delivered as `<tail of previous>{"…this call…"}` and
+  the host refuses it as invalid JSON. When such a payload does not parse, the
+  proxy now locates the complete call behind the stray text and hands that back.
+
+  Only payloads that already fail to parse are rescanned, and only a position that
+  yields a complete object is accepted — a well-formed call is never rewritten,
+  and a truncated one is still refused rather than completed.
+
+  Also adds a whole-inventory fidelity test covering every tool either host can
+  declare, across all three API shapes.
+
+- aa6f259: Remove three free models that stopped serving upstream, so they no longer appear in the model list:
+
+  - **Fledge Alpha** on OpenCode (`fledge-alpha-free`) — withdrawn upstream and no longer listed.
+  - **Ling 3.0 Flash Sante** on KiloCode (`inclusionai/ling-3.0-flash-sante:free`) — the free variant is gone; only the paid one remains.
+  - **Step 3.7 Flash** on KiloCode (`stepfun/step-3.7-flash:free`) — the free variant is gone; only the paid one remains.
+
+  All three are excluded permanently, so a stale on-disk catalog or a later catalog refresh cannot bring them back.
+
+- 50981fb: Correct the OpenCode Zen Step 5 Preview entry: it is a reasoning model with 1M context, 64K max output, text/image/video input, and only `low`/`medium`/`high` thinking levels (`minimal` is explicitly disabled). Previously the entry mirrored the Kilo sibling and the fallback heuristic, so the picker showed no thinking support.
+
+## 1.33.3
+
+### Patch Changes
+
+- Fix tool calls being rejected with an invalid-arguments error when a model makes several calls in one turn. Some models label every parallel call `0`, so the pieces of different calls were joined together and arrived as one unreadable blob — a planning tool could then reject every update, even a minimal one, and leave its task list stuck mid-turn. Calls are now kept apart by their own identifier, and a call whose text arrives in several pieces still reassembles whole.
+
+## 1.33.2
+
+### Patch Changes
+
+- Document how the OpenCode free tier decides whether to answer a request: which request properties open the gate, which commonly repeated assumptions about it are wrong, and how to reproduce a check locally.
+- Fix tool calls breaking down on free models.
+
+  When a request carries a full set of agent tools, free models often return tool arguments that do not match the tool's declared shape. A planning tool asked for phased tasks could come back with the phases buried inside a JSON-encoded list under the wrong field, wrapped in an extra object, or under names the tool never declared — so the host rendered each phase as one long raw JSON string instead of real task lines.
+
+  The proxy now checks returned arguments against the tool schema the caller declared and repairs them when the intended shape is unambiguous, across all three API shapes, streamed and non-streamed, and for every supported model provider. Well-formed calls, calls for tools without structured parameters, and arguments that were cut off mid-stream all pass through untouched.
+
+## 1.33.1
+
+### Patch Changes
+
+- Removed one free model from the catalog that could never be used in a coding session. It answers a plain chat request fine, but rejects any request that carries tool definitions — and coding agents always send tools, so picking it failed on every turn with a "no endpoints found that support tool use" error. The catalog is now 30 models.
+
+## 1.33.0
+
+### Minor Changes
+
+- One new free model, picked the same way as the rest (`/model` → `freeflow` → pick):
+
+  - **Ling 3.1 Flash** on KiloCode (`inclusionai/ling-3.1-flash`, short name `ling-3.1-flash:kilo`) — 262K context, text answers.
+
+### Patch Changes
+
+- Remove four free models that stopped serving upstream, so they no longer appear in the model list:
+
+  - **MiMo V2.5** on OpenCode (`mimo-v2.5-free`) — upstream answers `401 Model is not supported`.
+  - **Exo** on OpenCode (`exo-free`) — upstream answers `503 Endpoint is unavailable`.
+  - **Space Bunny Alpha** on KiloCode (`stealth/space-bunny-alpha`) — upstream answers `404 does not exist`.
+  - **Qwen 3.8 27B** on KiloCode (`qwen/qwen3.8-27b:free`) — upstream answers `404 currently unavailable`.
+
+  All four are excluded permanently, so a stale on-disk catalog or a later catalog refresh cannot bring them back.
+
+- Requests that ask for a thinking level a model does not offer no longer fail: the level is clamped to the highest level that model supports (previously only Muse Spark was covered — now every model is), and a chat-style `response_format` left on a responses request is dropped instead of rejected upstream.
+
+## 1.32.2
+
+### Patch Changes
+
+- Prevent JSON parse errors on interrupted responses: network packet boundaries split mid-delta no longer produce unterminated string syntax errors when a turn is retried or terminated.
+
+## 1.32.1
+
+### Patch Changes
+
+- Recover interrupted answers automatically: when a response stream cuts off mid-answer, the pending turn is retried once on the next healthy relay instead of stopping partway
+- Retry once automatically when the model briefly fails a request: a transient model-side error is now retried on the next relay instead of surfacing immediately, and health reporting distinguishes model failures from relay problems
+- 9b523e9: Keep relay connections warm across turns for faster repeat requests
+
+## 1.32.0
+
+### Minor Changes
+
+- Relay sessions now stick to their warm relay and release it after 20 minutes idle, so follow-up turns in one session reuse the fast path instead of paying a cold start.
+
+## 1.31.0
+
+### Minor Changes
+
+- de0a0fe: Two new free models on OpenCode Zen, picked the same way as the rest (`/model` → `freeflow` → pick):
+
+  - **Fledge Alpha Free** (`fledge-alpha-free`, short name `fledge-alpha`) — 1M context, answers with vision.
+  - **Ling 3.1 Flash Free** (`ling-3.1-flash-free`, short name `ling-3.1-flash`) — 262K context, text answers.
+
+### Patch Changes
+
+- 48eec6d: Remove two free models that had stopped serving upstream, so they no longer appear in the model list:
+
+  - **Ling 3.0 Flash Fin** on OpenCode (`ling-3.0-flash-fin-free`) — upstream answers `400 Endpoint is unavailable`.
+  - **Ling 3.0 Flash Fin** on KiloCode (`inclusionai/ling-3.0-flash-fin:free`) — upstream answers `404 does not exist`.
+
+  Both are excluded permanently, so a stale on-disk catalog or a later catalog refresh cannot bring them back. The short name `ling-3.0-flash-fin` no longer resolves; `ling-3.0-flash-sante` is unaffected and still works.
+
 ## 1.30.0
 
 ### Minor Changes

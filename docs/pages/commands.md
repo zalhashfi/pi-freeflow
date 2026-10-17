@@ -7,19 +7,30 @@ All commands are available inside the OMP or Pi TUI via `/freeflow`:
 | Command | Action |
 | :--- | :--- |
 | `/freeflow status` | View active relay URL, pool status (ON/OFF), candidates, and a Cline login summary (logins saved, most recently used login and model) |
+| `/freeflow hide` | Hide the status-bar widget (also `widget hide`) |
+| `/freeflow show` | Show the status-bar widget again (also `widget show`) |
 | `/freeflow list` | List all relays with health badges (✓ / ⚠️ cooling) |
 | `/freeflow use <url&vert;index&vert;label>` | Switch active relay |
 | `/freeflow url <url>` | Set the active relay URL directly |
 | `/freeflow add <url> [label]` | Add a new relay to the pool |
 | `/freeflow label <index&vert;url> <name>` | Assign a friendly label to a relay |
+| `/freeflow rename <index&vert;url> <name>` | Alias of `label` — assign a friendly label to a relay |
 | `/freeflow remove <index&vert;url&vert;label>` | Remove a relay from the pool |
+| `/freeflow export [path] [--include-secrets]` | Save the relay pool to a JSON file (relay passwords are stripped unless you ask for them) |
+| `/freeflow import <path> [--merge&vert;--replace] [--dry-run]` | Load a relay pool from a file — merged into the pool by default, or `--replace` to swap it out |
 | `/freeflow test <index&vert;url&vert;label>` | Probe a relay for reachability (HTTP 200 + latency) |
 | `/freeflow on &vert; off &vert; auto &vert; spread` | Relay mode (auto = enabled for freeflow, spread = rotate across the healthy relays) |
 | `/freeflow deploy <platform>` | Guided relay deploy (cloudflare, deno, vercel — Cloudflare recommended, Vercel last resort) |
+| `/freeflow install-startup` | Install the login-startup hook so the daemon comes up with your session |
+| `/freeflow uninstall-startup` | Remove the login-startup hook |
 | `/freeflow logs [lines]` | Inspect recent proxy logs |
+| `/freeflow log [lines]` | Alias of `logs` |
 | `/freeflow trace [req-id]` | Tail logs filtered by request correlation ID |
 | `/freeflow refresh` | Force reload models from live upstream APIs |
-| `/freeflow update` | Check for and install a package update |
+| `/freeflow reload` | Alias of `refresh` (`models` is accepted too) |
+| `/freeflow update` | Check for and install a package update (restarts daemon automatically on success) |
+| `/freeflow autoupdate [on &vert; off]` | Toggle or view automatic background updates (`/freeflow update auto on &vert; off` also works) |
+| `/freeflow kill` | Shut the proxy daemon down; the next freeflow request restarts it (aliases `stop`, `shutdown`) |
 | `/freeflow debug on &vert; off` | Toggle full HTTP lifecycle debug logging |
 | `/freeflow cline login` | Sign in through the browser, save to the per-user pool |
 | `/freeflow cline accounts` | List saved Cline logins with per-login usage (requests served, last model used) |
@@ -34,9 +45,10 @@ Logs are written to `~/.pi/agent/pi-freeflow.log` with auto-rotation at 10MB (10
 
 | Problem | Root Cause | Solution |
 | :--- | :--- | :--- |
-| **Port conflict on 28180** | Another app bound to the port | Set `FREEFLOW_PORT=29000` or terminate the conflicting process |
+| **Port conflict on 28180** | Another app bound to the port | Set `PI_FREEFLOW_PORT=29000` or terminate the conflicting process |
 | **Subagents fail to connect** | Local proxy daemon terminated prematurely | Restart OMP session — subagents re-probe and reuse the daemon |
-| **Vercel relay 504 timeout** | Prompt evaluation exceeded 25s limit | Auto-fallback to direct upstream triggered |
+| **Vercel relay 504 timeout** | Prompt evaluation exceeded 25s limit | Rolls to the next relay first; the direct upstream is only tried once the pool is exhausted |
 | **Model list not updating** | 24-hour disk cache TTL active | Run `/freeflow refresh` or delete the cache file |
 | **Relay 404 / broken URL** | Old or deleted edge deployment | Run `/freeflow remove <url>` to clean up |
 | **OpenCode 429 FreeUsageLimitError** | Daily OpenCode quota exhausted | Wait for UTC reset or route through an egress relay |
+| **Tool call renders as raw JSON** | Free model returned arguments that do not match the tool's declared shape | Automatic — the proxy repairs unambiguous packets against the tool schema. If it persists, the model invented an ambiguous shape; report it with the model name |

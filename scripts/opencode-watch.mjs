@@ -41,7 +41,7 @@ export const DEFAULT_CONFIG = {
    "https://opencode.ai/docs/zen",
   ],
  },
- modelsUrl: "https://opencode.ai/zen/v1/models",
+ modelsUrl: "https://opencode.ai/inference/v1/models",
  userAgent: "pi-freeflow-watcher/1.0",
 };
 

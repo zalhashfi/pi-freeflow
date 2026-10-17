@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ALL_MODELS, KILO_MODELS, OPENCODE_MODELS, CLINE_MODELS, MODEL_ALIASES, resolveCanonicalModelId, isKiloModel } from "../src/models.ts";
+import { ALL_MODELS, KILO_MODELS, OPENCODE_MODELS, CLINE_MODELS, OVH_MODELS, MODEL_ALIASES, resolveCanonicalModelId, isKiloModel } from "../src/models.ts";
 import { LOG_MAX_BYTES, LOG_MAX_FILES } from "../src/config.ts";
 import { VERCEL_RELAY_WORKER, CLOUDFLARE_RELAY_WORKER, DENO_RELAY_SCRIPT } from "../src/deploy.ts";
 import { isSubstantial } from "../src/stream-pipe.ts";
@@ -14,12 +14,13 @@ function extractResolveRelayTarget(worker: string): string {
  return worker;
 }
 
-test("catalog 31 = 9 OpenCode + 17 Kilo + 5 Cline", () => {
- assert.equal(OPENCODE_MODELS.length, 9);
- assert.equal(KILO_MODELS.length, 17);
- assert.equal(CLINE_MODELS.length, 5);
- assert.equal(ALL_MODELS.length, 31);
- assert.equal(new Set(ALL_MODELS.map((m) => m.id)).size, 31);
+test("catalog 37 = 14 OpenCode + 13 Kilo + 2 Cline + 8 OVH", () => {
+	assert.equal(OPENCODE_MODELS.length, 14);
+	assert.equal(KILO_MODELS.length, 13);
+	assert.equal(CLINE_MODELS.length, 2);
+	assert.equal(OVH_MODELS.length, 8);
+	assert.equal(ALL_MODELS.length, 37);
+	assert.equal(new Set(ALL_MODELS.map((m) => m.id)).size, 37);
 });
 
 test("aliases deduplicated and wrong removed", () => {
@@ -29,8 +30,9 @@ test("aliases deduplicated and wrong removed", () => {
  assert.equal(resolveCanonicalModelId("dots-3-note-preview:free"), "dots-3-note-preview:free");
  assert.equal(resolveCanonicalModelId("dots-3-note-preview"), "dots-studio/dots-3-note-preview:free");
  assert.equal(resolveCanonicalModelId("nemotron-3.5-lightning"), "nvidia/nemotron-3.5-lightning:free");
+ assert.equal(resolveCanonicalModelId("deepseek-v4.1-flash"), "deepseek-v4.1-flash-free");
  assert.equal(isKiloModel("dots-3-note-preview"), true);
- assert.equal(Object.keys(MODEL_ALIASES).length, 21);
+	assert.equal(Object.keys(MODEL_ALIASES).length, 30);
 });
 
 test("log rotation 10MB x10", () => {

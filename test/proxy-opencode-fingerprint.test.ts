@@ -220,7 +220,7 @@ test("proxy: OpenCode Responses request without tools (like advisor watchdog) re
 	}
 });
 
-test("proxy: upstream receives live UA + ses_/msg_ headers with stream:true and the full sextet", async () => {
+test("proxy: upstream receives live UA + ses_ headers with stream:true and the full sextet", async () => {
 	_resetUpstreamHealthForTest();
 	_resetFreeTierHintForTest();
 
@@ -287,15 +287,16 @@ test("proxy: upstream receives live UA + ses_/msg_ headers with stream:true and 
 		assert.equal(clientRes.status, 200);
 		assert.ok(clientRes.headers["content-type"]?.includes("application/json"), "SSE converted back for non-streaming client");
 
-		// Gate axes on the wire: UA, session/request IDs, tools, stream.
+		// Gate axes on the wire: UA, session ID, tools, stream (no x-opencode-request).
 		assert.ok(/^opencode\/\d+\.\d+\.\d+$/.test(upstreamHeaders["user-agent"] ?? ""), `live UA header: ${upstreamHeaders["user-agent"]}`);
 		assert.ok(
 			/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(upstreamHeaders["x-opencode-session"] ?? ""),
 			`ses_ header shape: ${upstreamHeaders["x-opencode-session"]}`,
 		);
-		assert.ok(
-			/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(upstreamHeaders["x-opencode-request"] ?? ""),
-			`msg_ header shape: ${upstreamHeaders["x-opencode-request"]}`,
+		assert.equal(
+			upstreamHeaders["x-opencode-request"],
+			undefined,
+			"real OpenCode omits x-opencode-request; emitting it FreeTier-403s",
 		);
 		assert.equal(upstreamHeaders["x-opencode-client"], "cli");
 		const received: unknown = upstreamReceivedBody;

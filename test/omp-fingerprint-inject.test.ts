@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+ COMPAT_FINGERPRINT_SCHEMAS,
  COMPAT_TOOL_DESCRIPTION,
  OMP_FINGERPRINT_DEFS,
  OPENCODE_FINGERPRINT_TOOLS,
  canonicalizeTool,
- injectFingerprintTools,
+ type FingerprintToolName,
  isOmpLikeCaller,
 } from "../src/tool-translation.ts";
+import { withFingerprintTools } from "./_fingerprint.ts";
 import { enforceOpencodeFingerprint, sseToResponsesJson } from "../src/opencode-fingerprint.ts";
 
 function responsesTool(name: string, description: string, parameters: unknown): Record<string, unknown> {
@@ -48,14 +50,14 @@ test("OMP_FINGERPRINT_DEFS: real schemas for five slots, edit excluded (no stati
  assert.ok(!("required" in (OMP_FINGERPRINT_DEFS.glob.parameters as Record<string, unknown>)), "injected glob is all-optional");
 });
 
-test("injectFingerprintTools: partial OMP [ask,glob] on responses yields real schemas, edit stays cloaked", () => {
+test("fingerprint injection: partial OMP [ask,glob] on responses yields real schemas, edit stays cloaked", () => {
  const askParams = { type: "object", properties: { question: { type: "string" } }, required: ["question"] };
  const globParams = { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] };
  const tools = [
   responsesTool("ask", "Ask a question", askParams),
   responsesTool("glob", "Find files", globParams),
  ];
- const out = injectFingerprintTools(tools, "/v1/responses");
+ const out = withFingerprintTools(tools, "/v1/responses");
  assert.equal(out.length, 7, "ask + glob + 5 injected (bash/grep/read/edit/write)");
  const names = out.map((t) => String(t.name));
  for (const n of ["bash", "grep", "read", "edit", "write"]) assert.ok(names.includes(n), `injected ${n}`);
@@ -64,7 +66,7 @@ test("injectFingerprintTools: partial OMP [ask,glob] on responses yields real sc
   assert.ok(typeof t.name === "string");
   if (t.name === "edit") {
    assert.equal(t.description, COMPAT_TOOL_DESCRIPTION, "injected edit is always the cloaked placeholder");
-   assert.deepEqual(paramsOf(t), { type: "object", properties: {} });
+   assert.deepEqual(paramsOf(t), COMPAT_FINGERPRINT_SCHEMAS.edit);
   } else {
    assert.ok(!String(t.description).includes("never be invoked"), `${t.name}: no COMPAT description`);
   }
@@ -78,16 +80,16 @@ test("injectFingerprintTools: partial OMP [ask,glob] on responses yields real sc
  assert.equal(ask.description, "Ask a question", "caller tools untouched");
  assert.deepEqual(paramsOf(ask), askParams);
 });
-test("injectFingerprintTools: Pi callers keep empty placeholders; explicit ompLike overrides", () => {
+test("fingerprint injection: Pi callers keep empty placeholders; explicit ompLike overrides", () => {
  const pi = [responsesTool("find", "Find files", { type: "object", properties: { p: { type: "string" } } })];
- const piOut = injectFingerprintTools(pi, "/v1/responses");
+ const piOut = withFingerprintTools(pi, "/v1/responses");
  assert.equal(piOut.length, 7, "find is not a fingerprint slot: 1 caller + 6 placeholders");
  for (const t of piOut) {
   if (String(t.name) === "find") continue;
   assert.equal(t.description, COMPAT_TOOL_DESCRIPTION, `${t.name}: Pi keeps placeholder`);
-  assert.deepEqual(paramsOf(t), { type: "object", properties: {} });
+  assert.deepEqual(paramsOf(t), COMPAT_FINGERPRINT_SCHEMAS[String(t.name) as FingerprintToolName]);
  }
- const forced = injectFingerprintTools(
+ const forced = withFingerprintTools(
   [responsesTool("find", "f", { type: "object" })],
   "/v1/responses",
   true,
@@ -101,12 +103,12 @@ test("injectFingerprintTools: Pi callers keep empty placeholders; explicit ompLi
   COMPAT_TOOL_DESCRIPTION,
   "injected edit stays the cloaked placeholder even when forced",
  );
- const forcedPi = injectFingerprintTools([responsesTool("ask", "a", { type: "object" })], "/v1/responses", false);
+ const forcedPi = withFingerprintTools([responsesTool("ask", "a", { type: "object" })], "/v1/responses", false);
  const injected = forcedPi.filter((t) => String(t.name) !== "ask");
  assert.ok(injected.length > 0 && injected.every((t) => t.description === COMPAT_TOOL_DESCRIPTION));
 });
 
-test("injectFingerprintTools: full OMP inventory injects nothing; idempotent and case-insensitive", () => {
+test("fingerprint injection: full OMP inventory injects nothing; idempotent and case-insensitive", () => {
  const full = [
   responsesTool("ask", "a", { type: "object" }),
   responsesTool("read", "r", { type: "object" }),
@@ -118,13 +120,13 @@ test("injectFingerprintTools: full OMP inventory injects nothing; idempotent and
   responsesTool("todo", "t", { type: "object" }),
  ];
  const before = full.length;
- assert.equal(injectFingerprintTools(full, "/v1/responses").length, before, "full inventory: injected=[]");
+ assert.equal(withFingerprintTools(full, "/v1/responses").length, before, "full inventory: injected=[]");
  const partial = [responsesTool("ask", "a", { type: "object" }), responsesTool("glob", "g", { type: "object" })];
- const once = injectFingerprintTools(partial, "/v1/responses");
- const twice = injectFingerprintTools(once, "/v1/responses");
+ const once = withFingerprintTools(partial, "/v1/responses");
+ const twice = withFingerprintTools(once, "/v1/responses");
  assert.equal(twice.length, once.length, "fingerprint-once: re-inject adds zero tools");
  const cased = [{ type: "function", function: { name: "Bash", description: "b" } }];
- assert.equal(injectFingerprintTools(cased, "/v1/chat/completions", true).length, 6, "Bash satisfies bash");
+ assert.equal(withFingerprintTools(cased, "/v1/chat/completions", true).length, 6, "Bash satisfies bash");
  const canon = canonicalizeTool({ type: "function", name: "read", description: "r", parameters: OMP_FINGERPRINT_DEFS.read.parameters });
  assert.ok(canon && Object.keys(canon.parameters.properties as Record<string, unknown>).length > 0);
 });

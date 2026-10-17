@@ -212,6 +212,15 @@ test("refreshCatalog overlays a partial cache without losing static ids or the c
 		assert.equal(kept.maxTokens, entry.maxTokens);
 	}
 });
+test("step-5-preview entries stay dead across both lanes (2026-10-16)", () => {
+	assert.equal(DEAD_MODEL_IDS.has("step-5-preview-free"), true);
+	assert.equal(DEAD_MODEL_IDS.has("stepfun/step-5-preview-free"), true);
+	assert.equal(isFreeCatalogId("step-5-preview-free"), false);
+	assert.equal(isFreeCatalogId("stepfun/step-5-preview-free"), false);
+	assert.equal(ALL_MODELS.some((m) => m.id === "step-5-preview-free"), false);
+	assert.equal(ALL_MODELS.some((m) => m.id === "stepfun/step-5-preview-free"), false);
+});
+
 test("union-alpha is a dead model id (pruned, never re-enters)", () => {
 	assert.equal(DEAD_MODEL_IDS.has("union-alpha"), true);
 	assert.equal(isFreeCatalogId("union-alpha"), false);
@@ -243,4 +252,26 @@ test("deepseek-v4-flash-free stays excluded while served models are untouched", 
 	const merged = mergeCatalog(base, [model("deepseek-v4-flash-free", 100, "opencode")]);
 	assert.equal(merged.some((m) => m.id === "deepseek-v4-flash-free"), false);
 	assert.equal(merged.length, base.length);
+});
+
+test("nemotron-3.5-super-vl-free repairs a reasoning-less dynamic entry (issue #62)", () => {
+	// Before the static entry existed, the runtime merge registered this id
+	// through enrichModelDef, which guesses reasoning:false and no effort map —
+	// the picker then offered no thinking levels. A stale disk cache can still
+	// carry that row, so a merge must repair it against the static definition.
+	const stale: RegisteredModel = {
+		id: "nemotron-3.5-super-vl-free",
+		name: "Nemotron 3.5 Super Vl",
+		reasoning: false,
+		contextWindow: 262_144,
+		maxTokens: 65_536,
+		input: ["text", "image"],
+		source: "opencode",
+	};
+	const merged = mergeCatalog([], [stale]);
+	const repaired = merged.find((m) => m.id === "nemotron-3.5-super-vl-free");
+	assert.ok(repaired, "the stale row must survive as the repaired static entry");
+	assert.equal(repaired.reasoning, true);
+	assert.equal(repaired.thinkingLevelMap?.xhigh, "xhigh");
+	assert.equal(repaired.maxTokens, 131_072);
 });

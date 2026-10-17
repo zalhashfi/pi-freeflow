@@ -3,7 +3,7 @@
  */
 
 export type ProviderApi = "openai-completions" | "openai-responses" | "anthropic-messages";
-export type Upstream = "opencode" | "kilo" | "cline";
+export type Upstream = "opencode" | "kilo" | "cline" | "ovh";
 
 export type ThinkingLevel =
  | "off"
@@ -16,7 +16,7 @@ export type ThinkingLevel =
 
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 
-export type ModelInputType = "text" | "image";
+export type ModelInputType = "text" | "image" | "video";
 
 export interface ModelDef {
  id: string;
@@ -48,7 +48,8 @@ export interface RelayState {
  enabled: boolean;
  url: string;
  relays: KnownRelay[];
- hideWidget?: boolean;
+	hideWidget?: boolean;
+	autoUpdate?: boolean;
 }
 export type LogLevel = "debug" | "info" | "warn" | "error" | "audit";
 
@@ -120,8 +121,6 @@ export interface ProviderModelCompat {
  supportsReasoningEffort?: boolean;
  thinkingFormat?: "openrouter" | string;
  sessionAffinityFormat?: "openai-nosession" | string;
- includeEncryptedReasoning?: boolean;
- filterReasoningHistory?: boolean;
  [key: string]: unknown;
 }
 

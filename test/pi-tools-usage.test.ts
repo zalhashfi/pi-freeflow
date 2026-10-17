@@ -6,6 +6,7 @@ import {
 	restoreToolNameForCaller,
 	retargetToolChoiceForUpstream,
 	translateToolsForPath,
+	sanitizeUpstreamToolName,
 	upstreamToolNameFor,
 } from "../src/tool-translation.ts";
 
@@ -195,7 +196,7 @@ for (const name of PI_TOOL_NAMES) {
 				const input = mkTool(style, name, fixture.description, fixture.parameters, { x_pi: `x-${name}` });
 				const [out] = translateToolsForPath([input], path);
 				assert.ok(out, `${style} -> ${path} ${name}: not dropped`);
-				assert.equal(upstreamNameOf(out), name === "find" ? "glob" : name, `${style} -> ${path} ${name}: name`);
+				assert.equal(upstreamNameOf(out), name, `${style} -> ${path} ${name}: name rides verbatim`);
 				assert.equal(upstreamDescOf(out), fixture.description, `${style} -> ${path} ${name}: description verbatim`);
 				assert.deepEqual(upstreamParamsOf(out), fixture.parameters, `${style} -> ${path} ${name}: params verbatim`);
 				assert.equal((out as Record<string, unknown>).x_pi, `x-${name}`, `${style} -> ${path} ${name}: extra carried`);
@@ -205,11 +206,8 @@ for (const name of PI_TOOL_NAMES) {
 				);
 				assert.ok(!("strict" in out), `${style} -> ${path} ${name}: strict never imposed`);
 				const targetShape = path.endsWith("/responses") ? "responses" : path.endsWith("/messages") ? "anthropic" : "chat";
-				if (name !== "find" && style === targetShape) {
+				if (style === targetShape) {
 					assert.equal(out, input, `${style} -> ${path} ${name}: same shape passes by reference`);
-				}
-				if (name === "find") {
-					assert.notEqual(out, input, `${style} -> ${path} find: rename always produces a new object`);
 				}
 			}
 		});
@@ -232,14 +230,21 @@ test("pi usage: powershell and ls pass through verbatim, never dropped or folded
 	}
 });
 
-test("pi usage: find renames to glob on all paths and shapes, restore map brings find back", () => {
+test("pi usage: only the fingerprint lane renames find to glob", () => {
+	// The OpenCode free tier's gate looks for a sextet whose `glob` slot Pi's
+	// `find` can fill. Every other upstream accepts `find`, so renaming there
+	// would make the model call a name the caller never sent and force the host
+	// to translate it back — pure loss, and on OMP it actively collapses two
+	// distinct tools into one under the other's schema.
 	for (const style of STYLES) {
 		for (const path of PATHS) {
 			const input = mkTool(style, "find", FIND_DESC, PI_FIXTURES.find.parameters);
-			const [out] = translateToolsForPath([input], path);
-			assert.equal(upstreamNameOf(out), "glob", `${style} -> ${path}: find becomes glob`);
-			assert.equal(upstreamDescOf(out), FIND_DESC, `${style} -> ${path}: find description verbatim`);
-			assert.deepEqual(upstreamParamsOf(out), PI_FIXTURES.find.parameters, `${style} -> ${path}: find params verbatim`);
+			const plain = translateToolsForPath([input], path);
+			assert.equal(upstreamNameOf(plain[0]), "find", `${style} -> ${path}: find rides verbatim off the fingerprint lane`);
+			const fingerprinted = translateToolsForPath([input], path, { forFingerprint: true });
+			assert.equal(upstreamNameOf(fingerprinted[0]), "glob", `${style} -> ${path}: the fingerprint lane renames`);
+			assert.equal(upstreamDescOf(fingerprinted[0]), FIND_DESC, `${style} -> ${path}: description verbatim`);
+			assert.deepEqual(upstreamParamsOf(fingerprinted[0]), PI_FIXTURES.find.parameters, `${style} -> ${path}: params verbatim`);
 		}
 	}
 	assert.equal(upstreamToolNameFor("find"), "glob");
@@ -276,15 +281,15 @@ test("pi usage: OMP-style glob fixture is untouched and never restores to find",
 		{ type: "function", name: "find", description: FIND_DESC, parameters: PI_FIXTURES.find.parameters },
 		{ type: "function", name: "glob", description: "g", parameters: globParams },
 	]);
-	assert.equal(both.renamedFindToGlob, false, "find + glob together collapses with no restore");
-	const collapsed = translateToolsForPath(
+	assert.equal(both.renamedFindToGlob, false, "a caller that declared glob needs no rename to undo");
+	const kept = translateToolsForPath(
 		[
 			{ type: "function", name: "find", description: FIND_DESC, parameters: PI_FIXTURES.find.parameters },
 			{ type: "function", name: "glob", description: "g", parameters: globParams },
 		],
 		"/v1/chat/completions",
 	);
-	assert.equal(collapsed.length, 1, "find collapses with glob first-seen-wins");
+	assert.deepEqual(kept.map(upstreamNameOf), ["find", "glob"], "both tools survive: find keeps its own name and schema");
 });
 
 test("pi usage: grep glob param is not confused with the glob tool", () => {
@@ -374,7 +379,25 @@ test("pi usage: custom registerTool envelope keeps unbounded name with constrain
 				[mkTool("responses", name, "custom review", customParams, { strict: true, constrainedSampling })],
 				path,
 			);
-			assert.equal(upstreamNameOf(out), name, `${path}: unbounded custom name verbatim`);
+			// A custom name is unconstrained by the host, so it can carry
+			// characters the upstream shape forbids (`Review-Bot v2`). Such a
+			// name is folded on the wire and restored on the way home; the
+			// caller still gets its own name back.
+			const callerName = name as string;
+			const wireName = upstreamNameOf(out) as string;
+			const restore = buildFindGlobRestore([
+				mkTool("responses", callerName, "custom review", customParams, { strict: true, constrainedSampling }),
+			]);
+			assert.equal(
+				restoreToolNameForCaller(wireName, restore),
+				callerName,
+				`${path}: caller's own custom name comes back`,
+			);
+			assert.equal(
+				wireName,
+				sanitizeUpstreamToolName(callerName, new Set()),
+				`${path}: wire name folded only where upstream would reject it`,
+			);
 			assert.deepEqual(upstreamParamsOf(out), customParams, `${path}: custom params verbatim`);
 			assert.equal((out as Record<string, unknown>).strict, true, `${path}: resolved strict rides along`);
 			assert.deepEqual(

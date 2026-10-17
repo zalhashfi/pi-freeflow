@@ -2,7 +2,7 @@
  * Configuration and path resolution for pi-freeflow
  */
 
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,7 +21,7 @@ try {
 export { PKG_VERSION };
 
 // ── Upstream endpoints ──────────────────────────────────────────────
-export const UPSTREAM_OPENCODE = "https://opencode.ai/zen";
+export const UPSTREAM_OPENCODE = "https://opencode.ai/inference";
 export const KILO_CHAT_URL = "https://api.kilo.ai/api/gateway/chat/completions";
 export const KILO_RESPONSES_URL = "https://api.kilo.ai/api/gateway/responses";
 export const OPENCODE_API_URL = `${UPSTREAM_OPENCODE}/v1`;
@@ -31,10 +31,20 @@ export const OPENCODE_API_URL = `${UPSTREAM_OPENCODE}/v1`;
 // supplied at call time (never stored here).
 export const CLINE_API_BASE = "https://api.cline.bot/api/v1";
 export const CLINE_CHAT_URL = `${CLINE_API_BASE}/chat/completions`;
+// OVHcloud AI Endpoints serves OpenAI-compatible chat completions with no
+// credential at all (probed keyless 2026-10-13: no Authorization header,
+// 200). Direct-only: OVH has no Zen-style per-IP gate to route around, so
+// it never rides the relay pool and is deliberately absent from the deployed
+// relay allowlist (src/deploy.ts), which keeps the relay surface at exactly
+// two upstreams. Chat-only: OVH's responses endpoint rejects every array
+// input shape with 422 "input: data did not match any variant of untagged
+// enum ResponseInput" and accepts only a bare string (probed 2026-10-13), so
+// a responses-path caller is translated to chat upstream and back.
+export const OVH_API_BASE = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1";
+export const OVH_CHAT_URL = `${OVH_API_BASE}/chat/completions`;
 
 // ── Network & Server defaults ───────────────────────────────────────
 export const DEFAULT_PORT = 28180;
-export const LEGACY_PORT = 18080;
 export const HOST = "127.0.0.1";
 
 export function resolvePort(): number {
@@ -63,7 +73,7 @@ export const PORT = resolvePort();
 // OPENCODE_VERSION_FLOOR pins the minimum; OPENCODE_VERSION_FALLBACK is the
 // last-known-good npm version used when the live lookup is stale/offline.
 export const OPENCODE_VERSION_FLOOR = "1.17.0";
-export const OPENCODE_VERSION_FALLBACK = "1.18.31";
+export const OPENCODE_VERSION_FALLBACK = "1.19.0";
 /** Live npm lookup TTL: 6h — within one window the cached UA is reused. */
 export const OPENCODE_VERSION_TTL_MS = 6 * 60 * 60 * 1_000;
 /** Env override: exact `opencode/<version>` UA (or bare version) for tests/pins. */
@@ -238,12 +248,20 @@ export function createOpenCodeRequestId(): string {
 export const OPENCODE_SESSION = createOpenCodeSessionId();
 
 export function opencodeHeaders(): Record<string, string> {
+ const sessionId = OPENCODE_SESSION;
+ // Real OpenCode CLI (captured 2.0.28) does NOT send x-opencode-request on
+ // /inference/v1. Emitting msg_* there is treated as a non-OpenCode client and
+ // returns 403 FreeTierError — keep the helper for ID-shape tests, but omit
+ // the header on the wire.
  return {
+  Authorization: "Bearer public",
   "User-Agent": getOpenCodeUserAgent(),
   "x-opencode-client": OPENCODE_CLIENT,
   "x-opencode-project": OPENCODE_PROJECT,
-  "x-opencode-session": OPENCODE_SESSION,
-  "x-opencode-request": createOpenCodeRequestId(),
+  "x-opencode-session": sessionId,
+  "x-opencode-session-id": sessionId,
+  "x-session-affinity": sessionId,
+  "x-session-id": sessionId,
  };
 }
 
@@ -277,19 +295,44 @@ export const STRIP_HEADERS = new Set([
 ]);
 
 /** Env override that re-roots ALL pi-freeflow data files (tests/CI sandbox).
- *  Unset → ~/.pi/agent. */
+ *  Unset → pi's agent dir (PI_CODING_AGENT_DIR, else ~/.pi/agent). */
 export const DATA_DIR_ENV = "PI_FREEFLOW_DATA_DIR";
+
+/** Env var pi itself uses to re-root its config dir: pi names it
+ *  `<APP_NAME>_CODING_AGENT_DIR` (stock pi → PI_CODING_AGENT_DIR, else
+ *  ~/.pi/agent). Freeflow data files follow it so CI/containers only need to
+ *  relocate one root instead of granting write access to a hardcoded home
+ *  path; when another host (e.g. the omp plugin loader) does not set it, the
+ *  ~/.pi/agent default keeps the shared daemon/log location. */
+export const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+
+/** Expand a leading ~ the way pi expands its own agent-dir value. */
+function expandHome(value: string): string {
+ if (value === "~") return homedir();
+ if (value.startsWith("~/") || value.startsWith("~\\")) return path.join(homedir(), value.slice(2));
+ return value;
+}
 
 function dataDirOverride(): string | null {
  const d = process.env[DATA_DIR_ENV];
- return typeof d === "string" && d.trim() !== "" ? d : null;
+ return typeof d === "string" && d.trim() !== "" ? expandHome(d) : null;
+}
+
+function defaultAgentDir(): string {
+ const d = process.env[AGENT_DIR_ENV];
+ if (typeof d === "string" && d.trim() !== "") return expandHome(d);
+ return path.join(homedir(), ".pi", "agent");
+}
+
+function dataFilePath(name: string): string {
+ const override = dataDirOverride();
+ if (override) return path.join(override, name);
+ return path.join(defaultAgentDir(), name);
 }
 
 export function resolveRelayStatePath(): string {
  try {
-  const override = dataDirOverride();
-  if (override) return path.join(override, "pi-freeflow-relay-state.json");
-  return path.join(homedir(), ".pi", "agent", "pi-freeflow-relay-state.json");
+  return dataFilePath("pi-freeflow-relay-state.json");
  } catch {
   return path.join(
    path.dirname(fileURLToPath(import.meta.url)),
@@ -301,9 +344,7 @@ export function resolveRelayStatePath(): string {
 
 export function resolveLogFilePath(): string {
  try {
-  const override = dataDirOverride();
-  if (override) return path.join(override, "pi-freeflow.log");
-  return path.join(homedir(), ".pi", "agent", "pi-freeflow.log");
+  return dataFilePath("pi-freeflow.log");
  } catch {
   return path.join(
    path.dirname(fileURLToPath(import.meta.url)),
@@ -313,16 +354,27 @@ export function resolveLogFilePath(): string {
  }
 }
 
+/**
+ * Root directory for staged daemon sources — copies taken outside
+ * node_modules because Node's type stripping refuses files under a
+ * node_modules path (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING, issue #52).
+ * Version subdirectories live inside it.
+ */
+export function resolveDaemonSrcCacheDir(): string {
+ try {
+  return dataFilePath("pi-freeflow-daemon-src");
+ } catch {
+  return path.join(
+   path.dirname(fileURLToPath(import.meta.url)),
+   "..",
+   ".pi-freeflow-daemon-src",
+  );
+ }
+}
+
 export function resolveCatalogCachePath(): string {
  try {
-  const override = dataDirOverride();
-  if (override) return path.join(override, "pi-freeflow-catalog-cache.json");
-  return path.join(
-   homedir(),
-   ".pi",
-   "agent",
-   "pi-freeflow-catalog-cache.json",
-  );
+  return dataFilePath("pi-freeflow-catalog-cache.json");
  } catch {
   return path.join(
    path.dirname(fileURLToPath(import.meta.url)),
@@ -334,9 +386,7 @@ export function resolveCatalogCachePath(): string {
 
 export function resolveDebugStatePath(): string {
  try {
-  const override = dataDirOverride();
-  if (override) return path.join(override, "pi-freeflow-debug.json");
-  return path.join(homedir(), ".pi", "agent", "pi-freeflow-debug.json");
+  return dataFilePath("pi-freeflow-debug.json");
  } catch {
   return path.join(
    path.dirname(fileURLToPath(import.meta.url)),
@@ -348,9 +398,7 @@ export function resolveDebugStatePath(): string {
 
 export function resolveUpdateCachePath(): string {
  try {
-  const override = dataDirOverride();
-  if (override) return path.join(override, "pi-freeflow-update.json");
-  return path.join(homedir(), ".pi", "agent", "pi-freeflow-update.json");
+  return dataFilePath("pi-freeflow-update.json");
  } catch {
   return path.join(
    path.dirname(fileURLToPath(import.meta.url)),
@@ -362,9 +410,7 @@ export function resolveUpdateCachePath(): string {
 
 export function resolveOnboardedFlagPath(): string {
  try {
-  const override = dataDirOverride();
-  if (override) return path.join(override, "pi-freeflow-onboarded");
-  return path.join(homedir(), ".pi", "agent", "pi-freeflow-onboarded");
+  return dataFilePath("pi-freeflow-onboarded");
  } catch {
   return path.join(
    path.dirname(fileURLToPath(import.meta.url)),
@@ -376,14 +422,24 @@ export function resolveOnboardedFlagPath(): string {
 
 export function resolveUpstreamHealthPath(): string {
  try {
-  const override = dataDirOverride();
-  if (override) return path.join(override, "pi-freeflow-upstream-health.json");
-  return path.join(homedir(), ".pi", "agent", "pi-freeflow-upstream-health.json");
+  return dataFilePath("pi-freeflow-upstream-health.json");
  } catch {
   return path.join(
    path.dirname(fileURLToPath(import.meta.url)),
    "..",
    ".upstream-health.json",
+  );
+ }
+}
+
+export function resolveSessionPinPath(): string {
+ try {
+  return dataFilePath("pi-freeflow-session-pins.json");
+ } catch {
+  return path.join(
+   path.dirname(fileURLToPath(import.meta.url)),
+   "..",
+   ".session-pins.json",
   );
  }
 }

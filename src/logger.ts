@@ -5,6 +5,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import {
 	DEBUG_STATE_FILE,
 	LOG_FILE,
@@ -363,5 +364,128 @@ export function readRecentLogs(
 		totalMatched: filtered.length,
 		totalLines: allLines.length,
 		logFile: LOG_FILE,
+	};
+}
+
+export interface LogFollowerOptions {
+	level?: LogLevel | null;
+	reqId?: string | null;
+	text?: string | null;
+	/** Max lines returned per next() call. Default 50. */
+	maxLines?: number;
+}
+
+/**
+ * Create a stateful incremental follower over the live log file (LOG_FILE).
+ *
+ * Follow mode must not re-read the whole file — plus every rotated archive —
+ * once per tick, so a follower starts at the current end of LOG_FILE and each
+ * next() returns only the complete lines appended since the previous call.
+ * Steady-state archived content is never read: the one-shot tail printed
+ * before following already covered it, and rotation replaces the live file
+ * rather than appending to it. The rotation salvage window below is the only
+ * time an archive is read.
+ *
+ * Rotation: a rotation renames the old live file to the first archive
+ * verbatim, so bytes appended between two ticks are salvaged from
+ * `.1[offset..]` before the follower re-anchors at the live file's start.
+ * A plain truncation (nothing holds those bytes) drops the carried partial
+ * line instead — its prefix belongs to the discarded file.
+ */
+export function createLogFollower(
+	opts: LogFollowerOptions = {},
+): { next(): string[] } {
+	const levelTag = opts.level ? `[${opts.level.toUpperCase()}]` : null;
+	const reqId = opts.reqId ? opts.reqId.replace(/^req=/, "") : null;
+	const text = opts.text ? opts.text.toLowerCase() : null;
+	const maxLines =
+		opts.maxLines && opts.maxLines > 0 ? Math.floor(opts.maxLines) : 50;
+
+	let offset = 0;
+	try {
+		offset = fs.statSync(LOG_FILE).size;
+	} catch {
+		// No log file yet — follow from 0 so the first append is reported.
+		offset = 0;
+	}
+	let carry = "";
+	// A read can end in the middle of a multi-byte UTF-8 sequence: the
+	// decoder holds those bytes and completes them with the next read, so a
+	// split codepoint never lands as U+FFFD in a line.
+	let decoder = new StringDecoder("utf8");
+
+	const matches = (line: string): boolean => {
+		if (levelTag && !line.includes(levelTag)) return false;
+		if (reqId && !(line.includes(reqId) || line.includes(`[${reqId}]`))) {
+			return false;
+		}
+		if (text && !line.toLowerCase().includes(text)) return false;
+		return true;
+	};
+
+	/** Read bytes [from, to) from one file; null when it cannot be read. */
+	const readRange = (file: string, from: number, to: number): Buffer | null => {
+		const wanted = to - from;
+		if (wanted <= 0) return Buffer.alloc(0);
+		const buf = Buffer.allocUnsafe(wanted);
+		try {
+			const fd = fs.openSync(file, "r");
+			try {
+				const read = fs.readSync(fd, buf, 0, wanted, from);
+				return buf.subarray(0, read);
+			} finally {
+				fs.closeSync(fd);
+			}
+		} catch {
+			return null;
+		}
+	};
+
+	/** Split one decoded read into complete filtered lines, holding the tail. */
+	const finish = (text: string): string[] => {
+		const parts = (carry + text).split("\n");
+		carry = parts.pop() ?? "";
+		return parts.filter((l) => l.length > 0 && matches(l)).slice(-maxLines);
+	};
+
+	return {
+		next(): string[] {
+			let size: number;
+			try {
+				size = fs.statSync(LOG_FILE).size;
+			} catch {
+				return []; // File missing — nothing to follow.
+			}
+
+			let chunk = "";
+			if (size < offset) {
+				// Rotation or truncation: the live file no longer holds the bytes we
+				// already reported. A rotation renames the old live file to the first
+				// archive verbatim, so bytes appended after our last read are salvaged
+				// from there before re-anchoring at the live file's start.
+				let archivedSize = -1;
+				try {
+					archivedSize = fs.statSync(`${LOG_FILE}.1`).size;
+				} catch { }
+				if (archivedSize > offset) {
+					const salvaged = readRange(`${LOG_FILE}.1`, offset, archivedSize);
+					if (salvaged) chunk += decoder.write(salvaged);
+				} else {
+					// Plain truncation: the old tail is gone for good — and so is the
+					// decoder's pending partial sequence, which must not prefix the new file.
+					carry = "";
+					decoder = new StringDecoder("utf8");
+				}
+				offset = 0;
+			}
+			if (size > offset) {
+				const bytes = readRange(LOG_FILE, offset, size);
+				if (bytes === null) return chunk.length === 0 ? [] : finish(chunk);
+				offset += bytes.length;
+				chunk += decoder.write(bytes);
+			}
+			if (chunk.length === 0) return [];
+			return finish(chunk);
+		},
 	};
 }

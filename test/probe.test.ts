@@ -45,10 +45,10 @@ test("probeRelay reports ok + latency for a 200 and sends the expected request",
   assert.equal(calledUrl, "https://relay.example.com/v1/models");
   const headers = (calledInit?.headers ?? {}) as Record<string, string>;
   assert.equal(headers["x-relay-target"], "https://opencode.ai");
-  assert.equal(headers["x-relay-path"], "/zen/v1/models");
+  assert.equal(headers["x-relay-path"], "/inference/v1/models");
   assert.ok(headers["User-Agent"]?.startsWith("opencode/"), "must include opencode User-Agent");
   assert.ok(headers["x-opencode-session"]?.startsWith("ses_"), "must include ses_ OpenCode session");
-  assert.ok(headers["x-opencode-request"]?.startsWith("msg_"), "must include msg_ OpenCode request");
+  assert.equal(headers["x-opencode-request"], undefined, "must omit x-opencode-request (gate rejects msg_*)");
   assert.equal(headers["x-opencode-client"], "cli");
   assert.ok(typeof headers["x-opencode-project"] === "string" && headers["x-opencode-project"].length > 0);
  } finally {
@@ -142,7 +142,7 @@ test("probeRelay sends direct opencode request without relay headers when target
   const result = await probeRelay("opencode");
 
   assert.equal(result.ok, true);
-  assert.equal(calledUrl, "https://opencode.ai/zen/v1/models");
+  assert.equal(calledUrl, "https://opencode.ai/inference/v1/models");
   const headers = (calledInit?.headers ?? {}) as Record<string, string>;
   assert.equal(headers["x-relay-target"], undefined, "direct opencode probe must not set x-relay-target");
   assert.ok(headers["User-Agent"]?.startsWith("opencode/"));
@@ -169,11 +169,11 @@ test("probeRelay supports chat endpoint mode with ping payload and spoofing", as
   });
 
   assert.equal(result.ok, true);
-  assert.equal(calledUrl, "https://relay.example.com/zen/v1/chat/completions");
+  assert.equal(calledUrl, "https://relay.example.com/inference/v1/chat/completions");
   assert.equal(calledInit?.method, "POST");
   const headers = (calledInit?.headers ?? {}) as Record<string, string>;
   assert.equal(headers["x-relay-target"], "https://opencode.ai");
-  assert.equal(headers["x-relay-path"], "/zen/v1/chat/completions");
+  assert.equal(headers["x-relay-path"], "/inference/v1/chat/completions");
   assert.equal(headers["x-relay-auth"], "my-secret");
   assert.equal(headers["content-type"], "application/json");
   assert.ok(headers["x-opencode-session"]?.startsWith("ses_"));
@@ -202,7 +202,7 @@ test("probeRelay supports direct opencode in chat endpoint mode", async () => {
   });
 
   assert.equal(result.ok, true);
-  assert.equal(calledUrl, "https://opencode.ai/zen/v1/chat/completions");
+  assert.equal(calledUrl, "https://opencode.ai/inference/v1/chat/completions");
   assert.equal(calledInit?.method, "POST");
   const headers = (calledInit?.headers ?? {}) as Record<string, string>;
   assert.equal(headers["x-relay-target"], undefined);

@@ -5,7 +5,8 @@
  * /zen/v1/messages) validates requests against the official OpenCode agentic
  * client fingerprint. If any of the following 4 axes are missing, upstream
  * answers HTTP 403 FreeTierError:
- * 1. User-Agent (opencode/1.18.31, >= 1.17.0)
+ * 1. User-Agent (`opencode/<version>`; the pinned fallback, live npm lookup,
+ *    and the >= 1.17.0 floor live in src/config.ts)
  * 2. x-opencode-session (canonical ses_[0-9a-f]{12}[0-9A-Za-z]{14} format)
  * 3. Tools: must declare the placeholder sextet {bash, glob, grep, read, edit, write}
  * 4. Streaming: must be stream: true
@@ -26,6 +27,7 @@
  * per-request map (never module-global).
  */
 import {
+ COMPAT_FINGERPRINT_SCHEMAS,
  COMPAT_TOOL_DESCRIPTION,
  OMP_FINGERPRINT_DEFS,
  OPENCODE_FINGERPRINT_TOOLS,
@@ -33,11 +35,42 @@ import {
  isOmpLikeCaller,
  restoreToolNameForCaller,
  retargetToolChoiceForUpstream,
+ sanitizeUpstreamToolName,
  translateToolsForPath,
  upstreamToolNameFor,
  type FindGlobRestore,
  type FingerprintToolName,
 } from "./tool-translation.ts";
+import { buildArgRepairSchemas, repairToolArguments, repairToolArgumentsValue } from "./tool-args.ts";
+import { getModelDef } from "./models.ts";
+import type { ThinkingLevel } from "./types.ts";
+
+/** Effort levels in descending priority (off excluded — clamping to off is never correct). */
+const EFFORT_DESCENDING: ThinkingLevel[] = ["max", "xhigh", "high", "medium", "low", "minimal"];
+
+/**
+ * Find the highest supported effort for a model whose thinkingLevelMap
+ * declares the requested effort as null. Returns null when no clamp is
+ * needed (effort is supported or model has no map).
+ */
+function clampedEffortFor(model: string, effort: string): string | null {
+ const def = getModelDef(model);
+ if (!def?.thinkingLevelMap) return null;
+ const map = def.thinkingLevelMap;
+ // "off" means disable reasoning entirely — never clamp it even when map says null
+ if (effort.toLowerCase() === "off") return null;
+ // "ultra" is an unofficial alias for beyond-max; treat as "max"
+ const key = (effort.toLowerCase() === "ultra" ? "max" : effort.toLowerCase()) as ThinkingLevel;
+ // Effort is supported (non-null) → no clamp
+ if (key in map && map[key] !== null && map[key] !== undefined) return null;
+ // Effort key is unknown and not "ultra" → let upstream decide
+ if (!(key in map) && effort.toLowerCase() !== "ultra") return null;
+ // Find highest supported effort
+ for (const level of EFFORT_DESCENDING) {
+  if (map[level] !== null && map[level] !== undefined) return level;
+ }
+ return null;
+}
 
 /**
  * Safely extract the tool name whether formatted in Chat Completions style
@@ -74,7 +107,7 @@ export function isPlaceholderToolName(name: unknown): boolean {
  * functions below.
  */
 function fingerprintFill(name: FingerprintToolName, omp: boolean): { description: string; schema: Record<string, unknown> } {
- if (!omp || name === "edit") return { description: COMPAT_TOOL_DESCRIPTION, schema: { type: "object", properties: {} } };
+ if (!omp || name === "edit") return { description: COMPAT_TOOL_DESCRIPTION, schema: COMPAT_FINGERPRINT_SCHEMAS[name] };
  const def = OMP_FINGERPRINT_DEFS[name];
  return { description: def.description, schema: { ...(def.parameters as Record<string, unknown>) } };
 }
@@ -254,6 +287,133 @@ export function ensureMessagesFingerprintTools(body: Record<string, unknown>, om
 }
 
 /**
+ * Drop `phase: "commentary"` from assistant message items in the replayed
+ * history.
+ *
+ * Upstream tags the lead-in text of a tool-calling turn `phase: "commentary"`
+ * and the closing answer `phase: "final_answer"`. When the model narrates a
+ * tool call and emits none (the muse-spark ATEM leak, upstream
+ * anomalyco/opencode#44659), that commentary item ends its own turn — and
+ * upstream then rejects every replay of the history with `400
+ * invalid_request_error: The request contains invalid parameters`.
+ *
+ * Measured on `muse-spark-1.3-contributor-free`, one field at a time: the
+ * phase alone decides it. A terminal commentary item 400s; the same item
+ * followed by a function call, or by a `final_answer` item, returns 200; the
+ * id prefix and the text are irrelevant. Only the phase field is removed, and
+ * `phase` is output metadata the model never reads as instruction, so dropping
+ * it cannot change the answer.
+ *
+ * Every assistant message is swept, not just the turn's last item: upstream
+ * validates the whole replayed history, and a host may seat `system`,
+ * `developer` or additional-tool items between a commentary item and the next
+ * user message, so a tail-only sweep would miss one. One sweep also covers a
+ * commentary item left behind by an earlier turn once later turns append to
+ * the same history.
+ */
+function stripCommentaryPhase(body: Record<string, unknown>): void {
+ const input = body.input;
+ if (!Array.isArray(input)) return;
+ for (const item of input) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+  const record = item as Record<string, unknown>;
+  if (record.role === "assistant" && record.phase === "commentary") delete record.phase;
+ }
+}
+
+/**
+ * Reduce `tool_choice` to what Zen accepts: `"auto"`, or absent.
+ *
+ * Upstream rejects every other value with `400 only "auto" is supported for
+ * tool_choice` — `"none"`, `"required"`, and named function choices alike
+ * (measured live 2026-10-12 on `muse-spark-1.3-contributor-free`, responses and
+ * chat). Absent means the same thing as `"auto"`, so an unsupported choice is
+ * dropped rather than translated. A choice is never imposed on a host that
+ * sent none.
+ *
+ * Dropping a choice can leave a host's native reasoning switched off: OMP
+ * forces its synthetic `think` tool with `reasoning: { effort: "none" }`
+ * (captured request 2026-10-12), so removing the forced call without
+ * restoring native effort would run the model with no reasoning at all.
+ */
+function enforceAutoToolChoice(body: Record<string, unknown>): void {
+ const choice = body.tool_choice;
+ if (choice === undefined) return;
+ if (typeof choice === "string" && choice.trim().toLowerCase() === "auto") return;
+ delete body.tool_choice;
+ restoreNativeEffortAfterChoiceDrop(body);
+}
+
+/**
+ * Put native reasoning back when the only thing enabling it was a dropped
+ * forced tool call.
+ *
+ * `"none"` is not a reasoning-off switch upstream, it is an unsupported value:
+ * `muse-spark-1.3-contributor-free` answers `400 reasoning_effort 'none' is
+ * not supported` (measured 2026-10-12). So the override is replaced with the
+ * model's own highest supported level rather than merely deleted, and a model
+ * whose declared map supports nothing but `off` gets the field dropped.
+ * Genuine reasoning-off (`"off"`) is the caller's real intent, never rewritten.
+ */
+function restoreNativeEffortAfterChoiceDrop(body: Record<string, unknown>): void {
+ const model = body.model;
+ if (typeof model !== "string") return;
+ const replacement = highestSupportedEffort(model);
+ if (replacement === null) return;
+ const nested = body.reasoning;
+ if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+  const rec = nested as Record<string, unknown>;
+  if (typeof rec.effort === "string" && rec.effort.trim().toLowerCase() === "none") {
+   rec.effort = replacement;
+   return;
+  }
+ }
+ for (const key of ["reasoning_effort", "reasoningEffort"] as const) {
+  const flat = body[key];
+  if (typeof flat === "string" && flat.trim().toLowerCase() === "none") {
+   body[key] = replacement;
+   return;
+  }
+ }
+}
+
+/**
+ * Highest non-null level a model's declared map supports, or null when the
+ * model declares no map or only supports `off` (nothing to fall back to).
+ */
+function highestSupportedEffort(model: string): string | null {
+ const map = getModelDef(model)?.thinkingLevelMap;
+ if (!map) return null;
+ for (const level of EFFORT_DESCENDING) {
+  if (map[level] !== null && map[level] !== undefined) return level;
+ }
+ return null;
+}
+
+/**
+ * Fold the name of a replayed tool-call item to a shape upstream accepts.
+ *
+ * A model can emit a malformed call and the host then replays it in `input[]`
+ * forever: upstream validates every replayed item, so one call named
+ * `id id=` (captured in a live session, emitted by `space-bunny-free`) 400s
+ * every subsequent turn of that conversation. Declarations were sanitized
+ * already; this covers the calls.
+ */
+function sanitizeReplayItemNames(body: Record<string, unknown>): void {
+ const input = body.input;
+ if (!Array.isArray(input)) return;
+ for (const item of input) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+  const record = item as Record<string, unknown>;
+  if (record.type !== "function_call" && record.type !== "custom_tool_call") continue;
+  const name = record.name;
+  if (typeof name !== "string") continue;
+  const folded = sanitizeUpstreamToolName(name, new Set());
+  if (folded !== name) record.name = folded;
+ }
+}
+
+/**
  * Normalize a Zen Responses body to what upstream accepts. OMP/Pi hosts
  * sometimes carry Chat Completions leftovers on the responses path and
  * upstream rejects them with 400:
@@ -262,14 +422,18 @@ export function ensureMessagesFingerprintTools(body: Record<string, unknown>, om
  * - `max_tokens` / `max_completion_tokens` become `max_output_tokens` (copied
  *   when absent, dropped either way).
  * - `temperature` / `top_p` are dropped (Responses rejects them).
+ * - `response_format` is dropped (Chat Completions field, Responses rejects it).
  * - `parallel_tool_calls: false` is dropped; absent-or-true rides verbatim.
- * - `tool_choice` is auto-or-absent: `"none"` (string or `{ type: "none" }`)
- *   is dropped, everything else rides (named choices still retarget find->glob).
+ * - `tool_choice` is auto-or-absent: `"auto"` rides verbatim and everything
+   else is dropped, because Zen supports no other value (see
+   enforceAutoToolChoice).
  * - `store` defaults to false (never persisted server-side).
- * - spark reasoning effort clamps `max` / `ultra` to `xhigh`: the spark
- *   thinkingLevelMap declares `max: null` (unoffered) and upstream serves at
- *   most `xhigh`, so a stale or hand-built `max`/`ultra` effort would 400.
- *   Only spark model ids are clamped; `off: null` stays untouched everywhere.
+ * - Assistant message items lose `phase: "commentary"`; upstream 400s the whole
+   request otherwise (see stripCommentaryPhase).
+ * - Reasoning effort is clamped per model: when the model's thinkingLevelMap
+ *   declares the requested effort as null (unsupported), the effort is clamped
+ *   to the highest supported level. Covers all OpenCode models generically
+ *   (muse-spark, mimo, nemotron, etc.), not just a single model family.
  * Zen-responses only: chat/messages paths keep their own fields, and Kilo/Cline
  * bodies never reach here (the proxy fingerprints Zen bodies exclusively).
  */
@@ -279,6 +443,10 @@ export function normalizeResponsesBody(body: Record<string, unknown>): void {
   body.input = body.messages;
  }
  delete body.messages;
+ stripCommentaryPhase(body);
+ // After input[] exists: a replayed call name is only folded once the array is
+ // the one upstream will read.
+ sanitizeReplayItemNames(body);
  if (body.max_output_tokens === undefined) {
   if (typeof body.max_tokens === "number") body.max_output_tokens = body.max_tokens;
   else if (typeof body.max_completion_tokens === "number") body.max_output_tokens = body.max_completion_tokens;
@@ -287,25 +455,28 @@ export function normalizeResponsesBody(body: Record<string, unknown>): void {
  delete body.max_completion_tokens;
  delete body.temperature;
  delete body.top_p;
+ delete body.response_format;
  if (body.parallel_tool_calls === false) delete body.parallel_tool_calls;
- const choice = body.tool_choice;
- if (typeof choice === "string" ? choice.toLowerCase() === "none" : (
-  choice !== null && typeof choice === "object" && !Array.isArray(choice)
-  && (choice as Record<string, unknown>).type === "none"
- )) delete body.tool_choice;
- if (typeof body.model === "string" && /muse-spark/i.test(body.model)) {
+ if (typeof body.model === "string") {
   const reasoning = body.reasoning;
   if (reasoning !== null && typeof reasoning === "object" && !Array.isArray(reasoning)) {
    const effort = (reasoning as Record<string, unknown>).effort;
-   if (typeof effort === "string" && (effort.toLowerCase() === "max" || effort.toLowerCase() === "ultra")) {
-    (reasoning as Record<string, unknown>).effort = "xhigh";
+   if (typeof effort === "string") {
+    const clamped = clampedEffortFor(body.model as string, effort);
+    if (clamped !== null) (reasoning as Record<string, unknown>).effort = clamped;
    }
   }
   for (const key of ["reasoning_effort", "reasoningEffort"] as const) {
    const flat = body[key];
-   if (typeof flat === "string" && (flat.toLowerCase() === "max" || flat.toLowerCase() === "ultra")) body[key] = "xhigh";
+   if (typeof flat === "string") {
+    const clamped = clampedEffortFor(body.model as string, flat);
+    if (clamped !== null) body[key] = clamped;
+   }
   }
  }
+ // After the effort clamp: dropping a forced tool call is what triggers the
+ // native-effort restore, so it runs once clamping is settled.
+ enforceAutoToolChoice(body);
  if (body.store === undefined) body.store = false;
 }
 
@@ -323,6 +494,11 @@ export function normalizeResponsesBody(body: Record<string, unknown>): void {
  * for downstream cloaking. Cloaking strips by `injected` only: names in
  * `injectedReal` were served with executable definitions, so model calls to
  * them execute downstream instead of being cloaked.
+ *
+ * `argSchemas` (lowercased caller tool name -> declared parameters) lets
+ * downstream repair malformed arguments against the caller's own schema; it
+ * is empty when no caller tool declares a structured parameter, so such
+ * requests keep streaming byte-identically.
  */
 export function enforceOpencodeFingerprint(
  body: Record<string, unknown>,
@@ -335,12 +511,17 @@ export function enforceOpencodeFingerprint(
  findGlob: FindGlobRestore;
  injected: string[];
  injectedReal: string[];
+ argSchemas: Map<string, Record<string, unknown>>;
 } {
  const clientRequestedStream = body.stream === true;
  const callerHadTools = Array.isArray(body.tools) && body.tools.length > 0;
- // Zen responses shape conformance first (Chat leftovers, tool_choice none,
- // spark effort clamp, store default): Kilo/Cline bodies never reach here.
+ // Zen responses shape conformance first (Chat leftovers, tool_choice, spark
+ // effort clamp, store default): Kilo/Cline bodies never reach here.
  if (pathname.endsWith("/responses")) normalizeResponsesBody(body);
+ // Chat path mirrors the responses drop: Zen free tier accepts only auto, so a
+ // caller "none" (string or { type: "none" }) would 400 upstream. Messages
+ // path keeps its own choice semantics.
+ enforceAutoToolChoice(body);
  // Upstream Zen free tier mandates stream: true for all free requests
  body.stream = true;
 
@@ -353,6 +534,10 @@ export function enforceOpencodeFingerprint(
  if (body.tool_choice !== undefined) {
   body.tool_choice = retargetToolChoiceForUpstream(body.tool_choice, findGlob) as Record<string, unknown> | string;
  }
+ // Captured before translation and injection: the map is keyed by CALLER tool
+ // name (what arrives downstream), and injected placeholders must not be
+ // repairable.
+ const argSchemas = buildArgRepairSchemas(Array.isArray(body.tools) ? body.tools : []);
  const callerUpstream = new Set<string>();
  const callerNames = new Set<string>();
  if (Array.isArray(body.tools)) {
@@ -374,8 +559,11 @@ export function enforceOpencodeFingerprint(
  const injected = missing.filter((n) => !ompLike || n === "edit");
  const injectedReal = ompLike ? missing.filter((n) => n !== "edit") : [];
 
+ // Zen alone asks for a rename: its free-tier gate looks for the sextet name
+ // `glob`, so a Pi caller that sent `find` needs it renamed into that slot.
+ // Every other lane accepts the caller's own names untouched.
  if (Array.isArray(body.tools)) {
-  body.tools = translateToolsForPath(body.tools, pathname);
+  body.tools = translateToolsForPath(body.tools, pathname, { forFingerprint: true });
  }
 
  const before = Array.isArray(body.tools) ? body.tools.length : 0;
@@ -390,11 +578,12 @@ export function enforceOpencodeFingerprint(
 
  // Note: Upstream OpenCode Zen explicitly rejects any tool_choice other than "auto"
  // with HTTP 400 (only "auto" is supported). tool_choice is auto-or-absent here:
- // normalizeResponsesBody drops "none" upstream, and we never impose a choice.
+ // normalizeResponsesBody drops "none" on the responses path, the chat branch above
+ // drops it on the chat path, and we never impose a choice.
  // Empty-placeholder callers stay silent via the COMPAT description and the
  // output-aggregator; real OMP definitions execute normally.
 
- return { clientRequestedStream, callerHadTools, addedTools: after > before, caseRestore, findGlob, injected, injectedReal };
+ return { clientRequestedStream, callerHadTools, addedTools: after > before, caseRestore, findGlob, injected, injectedReal, argSchemas };
 }
 
 /**
@@ -451,6 +640,7 @@ function cloakChatMessage(
  caseRestore?: CaseRestoreMap,
  findGlob?: FindGlobRestore,
  injected?: readonly string[],
+ argSchemas?: ReadonlyMap<string, Record<string, unknown>>,
 ): void {
  if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
  const m = msg as Record<string, unknown>;
@@ -478,11 +668,9 @@ function cloakChatMessage(
   if (tc && typeof tc === "object" && !Array.isArray(tc)) {
    const fn = (tc as Record<string, unknown>).function;
    if (fn && typeof fn === "object" && !Array.isArray(fn) && typeof (fn as Record<string, unknown>).name === "string") {
-    (fn as Record<string, unknown>).name = restoreCallerName(
-     (fn as Record<string, unknown>).name as string,
-     caseRestore,
-     findGlob,
-    );
+    const f = fn as Record<string, unknown>;
+    f.name = restoreCallerName(f.name as string, caseRestore, findGlob);
+    f.arguments = repairToolArguments(f.name as string, typeof f.arguments === "string" ? f.arguments : "", argSchemas);
    }
   }
   kept.push(tc);
@@ -497,6 +685,7 @@ export function sseToChatCompletionJson(
  caseRestore?: CaseRestoreMap,
  findGlob?: FindGlobRestore,
  injected?: readonly string[],
+ argSchemas?: ReadonlyMap<string, Record<string, unknown>>,
 ): Record<string, unknown> {
  const events = parseSseEvents(sseText);
  let id = "chatcmpl-freeflow";
@@ -507,10 +696,16 @@ export function sseToChatCompletionJson(
  let reasoningContent = "";
  let role = "assistant";
  let usage: unknown = undefined;
+ // Keyed by tool-call id whenever the provider sends one. Index is NOT
+ // trustworthy: free models routinely label every parallel call `index: 0`,
+ // and merging their fragments produces one unparseable argument blob
+ // (observed live: `{"i":"a","op":"done"}{"i":"b","op":"done"}`). Index is
+ // only the fallback for providers that omit an id entirely.
  const toolCallsMap = new Map<
-  number,
+  string,
   { id: string; type: string; function: { name: string; arguments: string } }
  >();
+ const keyByIndex = new Map<number, string>();
 
  for (const ev of events) {
   if (ev.data === "[DONE]") continue;
@@ -534,8 +729,15 @@ export function sseToChatCompletionJson(
       }
       if (Array.isArray(delta.tool_calls)) {
        for (const tc of delta.tool_calls) {
-        const idx = tc.index ?? 0;
-        const existing = toolCallsMap.get(idx) ?? {
+        // The first delta of a call carries its id; later deltas carry only
+        // `arguments`. A later id-less delta therefore belongs to whatever
+        // call this index already opened.
+        const idx = typeof tc.index === "number" ? tc.index : 0;
+        const hasId = typeof tc.id === "string" && tc.id !== "";
+        let key = hasId ? `id:${tc.id}` : keyByIndex.get(idx);
+        if (key === undefined) key = `idx:${idx}`;
+        if (hasId) keyByIndex.set(idx, key);
+        const existing = toolCallsMap.get(key) ?? {
          id: tc.id || "",
          type: tc.type || "function",
          function: { name: "", arguments: "" },
@@ -544,13 +746,13 @@ export function sseToChatCompletionJson(
         if (tc.type) existing.type = tc.type;
         if (tc.function?.name) existing.function.name += tc.function.name;
         if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
-        toolCallsMap.set(idx, existing);
+        toolCallsMap.set(key, existing);
        }
       }
      }
      // Choice contains a pre-assembled message: cloak before returning.
      if (c.message) {
-      cloakChatMessage(c.message, callerHadTools, caseRestore, findGlob, injected);
+      cloakChatMessage(c.message, callerHadTools, caseRestore, findGlob, injected, argSchemas);
       return parsed as Record<string, unknown>;
      }
     }
@@ -560,9 +762,9 @@ export function sseToChatCompletionJson(
   }
  }
 
- const toolCalls = Array.from(toolCallsMap.entries())
-  .sort(([a], [b]) => a - b)
-  .map(([, tc]) => tc);
+ // Map insertion order is emission order, which is what the host expects. The
+ // previous numeric sort assumed the keys were indices; they are now ids.
+ const toolCalls = Array.from(toolCallsMap.values());
 
  const message: Record<string, unknown> = {
   role,
@@ -579,7 +781,10 @@ export function sseToChatCompletionJson(
   const kept = injected === undefined
    ? toolCalls
    : toolCalls.filter((tc) => !injected.includes(tc.function.name.toLowerCase()));
-  for (const tc of kept) tc.function.name = restoreCallerName(tc.function.name, caseRestore, findGlob);
+  for (const tc of kept) {
+   tc.function.name = restoreCallerName(tc.function.name, caseRestore, findGlob);
+   tc.function.arguments = repairToolArguments(tc.function.name, tc.function.arguments, argSchemas);
+  }
   if (kept.length > 0) message.tool_calls = kept;
  }
 
@@ -604,9 +809,17 @@ export function sseToChatCompletionJson(
  * place. Only names this request injected are removed; caller calls keep
  * restored names (caller casing, upstream glob back to caller find). Tool-less
  * callers never see function_call items: every call is dropped, never leaked.
- * Ids and arguments ride verbatim (only the name is ever rewritten).
+ * Ids ride verbatim; arguments are repaired against the caller's declared
+ * schema when it says the emitted shape cannot be right.
  */
-function cloakResponsesObject(resp: unknown, callerHadTools = true, caseRestore?: CaseRestoreMap, findGlob?: FindGlobRestore, injected?: readonly string[]): void {
+function cloakResponsesObject(
+ resp: unknown,
+ callerHadTools = true,
+ caseRestore?: CaseRestoreMap,
+ findGlob?: FindGlobRestore,
+ injected?: readonly string[],
+ argSchemas?: ReadonlyMap<string, Record<string, unknown>>,
+): void {
  if (!resp || typeof resp !== "object" || Array.isArray(resp)) return;
  const output = (resp as Record<string, unknown>).output;
  if (!Array.isArray(output)) return;
@@ -617,7 +830,11 @@ function cloakResponsesObject(resp: unknown, callerHadTools = true, caseRestore?
    if (rec.type === "function_call") {
     if (typeof rec.name === "string" && injected !== undefined && injected.includes(rec.name.toLowerCase())) continue;
     if (!callerHadTools) continue;
-    if (typeof rec.name === "string") rec.name = restoreCallerName(rec.name, caseRestore, findGlob);
+    if (typeof rec.name === "string") {
+     const name = restoreCallerName(rec.name, caseRestore, findGlob);
+     rec.name = name;
+     rec.arguments = repairToolArguments(name, typeof rec.arguments === "string" ? rec.arguments : "", argSchemas);
+    }
    }
   }
   kept.push(item);
@@ -635,6 +852,7 @@ export function sseToResponsesJson(
  caseRestore?: CaseRestoreMap,
  findGlob?: FindGlobRestore,
  injected?: readonly string[],
+ argSchemas?: ReadonlyMap<string, Record<string, unknown>>,
 ): Record<string, unknown> {
  const events = parseSseEvents(sseText);
  // 1. Highest fidelity: response.completed event carries the final full response object
@@ -643,7 +861,7 @@ export function sseToResponsesJson(
   try {
    const parsed = JSON.parse(ev.data);
    if (parsed?.type === "response.completed" && parsed.response && typeof parsed.response === "object") {
-    cloakResponsesObject(parsed.response, callerHadTools, caseRestore, findGlob, injected);
+    cloakResponsesObject(parsed.response, callerHadTools, caseRestore, findGlob, injected, argSchemas);
     return parsed.response as Record<string, unknown>;
    }
   } catch { }
@@ -654,7 +872,7 @@ export function sseToResponsesJson(
   try {
    const parsed = JSON.parse(ev.data);
    if (parsed?.response && typeof parsed.response === "object") {
-    cloakResponsesObject(parsed.response, callerHadTools, caseRestore, findGlob, injected);
+    cloakResponsesObject(parsed.response, callerHadTools, caseRestore, findGlob, injected, argSchemas);
     return parsed.response as Record<string, unknown>;
    }
   } catch { }
@@ -663,15 +881,19 @@ export function sseToResponsesJson(
  try {
   const parsed = JSON.parse(sseText);
   if (parsed && typeof parsed === "object") {
-   cloakResponsesObject(parsed, callerHadTools, caseRestore, findGlob, injected);
+   cloakResponsesObject(parsed, callerHadTools, caseRestore, findGlob, injected, argSchemas);
    return parsed;
   }
  } catch { }
 
+ // Nothing in the stream carried a response object: the upstream turn ended
+ // without one. Report that honestly — a `completed` answer with zero output
+ // reads to the host as "the model chose to say nothing", which is a
+ // different (and wrong) claim than "the stream was cut".
  return {
   id: "resp_fallback",
   object: "response",
-  status: "completed",
+  status: "incomplete",
   output: [],
  };
 }
@@ -680,15 +902,19 @@ export function sseToResponsesJson(
  * Only names this request injected are removed; caller blocks keep restored
  * names (caller casing, upstream glob back to caller find). Tool-less callers
  * never see tool_use: stray placeholder input folds to text, matching the
- * SSE aggregator fallback below. Block objects ride verbatim (only names
- * are ever rewritten).
+ * SSE aggregator fallback below. Ids ride verbatim; `input` is repaired
+ * against the caller's declared schema when the emitted shape cannot be right.
+ *
+ * Exported so the streaming cloak applies these identical rules to a `message`
+ * frame that arrives mid-stream, instead of forwarding it verbatim.
  */
-function cloakMessagesContent(
+export function cloakMessagesContent(
  msg: unknown,
  callerHadTools: boolean,
  caseRestore?: CaseRestoreMap,
  findGlob?: FindGlobRestore,
  injected?: readonly string[],
+ argSchemas?: ReadonlyMap<string, Record<string, unknown>>,
 ): void {
  if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
  const content = (msg as Record<string, unknown>).content;
@@ -705,7 +931,11 @@ function cloakMessagesContent(
    const rec = block as Record<string, unknown>;
    const isInjected = typeof rec.name === "string" && injected !== undefined && injected.includes(rec.name.toLowerCase());
    if (callerHadTools && !isInjected) {
-    if (typeof rec.name === "string") rec.name = restoreCallerName(rec.name, caseRestore, findGlob);
+    if (typeof rec.name === "string") {
+     const name = restoreCallerName(rec.name, caseRestore, findGlob);
+     rec.name = name;
+     rec.input = repairToolArgumentsValue(name, rec.input, argSchemas);
+    }
     kept.push(block);
    } else if (!callerHadTools) {
     let text = "";
@@ -741,6 +971,7 @@ export function sseToMessagesJson(
  caseRestore?: CaseRestoreMap,
  findGlob?: FindGlobRestore,
  injected?: readonly string[],
+ argSchemas?: ReadonlyMap<string, Record<string, unknown>>,
 ): Record<string, unknown> {
  const events = parseSseEvents(sseText);
  let id = "msg_freeflow";
@@ -802,7 +1033,7 @@ export function sseToMessagesJson(
    continue;
   }
   if (type === "message" && parsed.role !== undefined) {
-   cloakMessagesContent(parsed, callerHadTools, caseRestore, findGlob, injected);
+   cloakMessagesContent(parsed, callerHadTools, caseRestore, findGlob, injected, argSchemas);
    return parsed;
   }
  }
@@ -819,7 +1050,8 @@ export function sseToMessagesJson(
     } catch {
      input = {};
     }
-    content.push({ type: "tool_use", id: tool.id, name: restoreCallerName(tool.name, caseRestore, findGlob), input });
+    const name = restoreCallerName(tool.name, caseRestore, findGlob);
+    content.push({ type: "tool_use", id: tool.id, name, input: repairToolArgumentsValue(name, input, argSchemas) });
    }
    continue;
   }
@@ -854,6 +1086,7 @@ export function convertSseToJson(
  caseRestore?: CaseRestoreMap,
  findGlob?: FindGlobRestore,
  injected?: readonly string[],
+ argSchemas?: ReadonlyMap<string, Record<string, unknown>>,
 ): string {
  if (!sseText || typeof sseText !== "string") return sseText;
  const trimmed = sseText.trim();
@@ -862,14 +1095,85 @@ export function convertSseToJson(
  }
  try {
   if (pathname.endsWith("/responses")) {
-   return JSON.stringify(sseToResponsesJson(trimmed, callerHadTools, caseRestore, findGlob, injected));
+   return JSON.stringify(sseToResponsesJson(trimmed, callerHadTools, caseRestore, findGlob, injected, argSchemas));
   }
   if (pathname.endsWith("/messages")) {
-   return JSON.stringify(sseToMessagesJson(trimmed, callerHadTools, caseRestore, findGlob, injected));
+   return JSON.stringify(sseToMessagesJson(trimmed, callerHadTools, caseRestore, findGlob, injected, argSchemas));
   }
-  return JSON.stringify(sseToChatCompletionJson(trimmed, callerHadTools, caseRestore, findGlob, injected));
- } catch {
-  return sseText;
+  return JSON.stringify(sseToChatCompletionJson(trimmed, callerHadTools, caseRestore, findGlob, injected, argSchemas));
+ } catch (error) {
+  // Every caller has already committed to `content-type: application/json`
+  // by the time this runs, so handing back the raw SSE bytes would deliver a
+  // parse error with no diagnosis. Say what happened, and keep the payload
+  // reachable under `raw` so nothing is silently destroyed.
+  return JSON.stringify({
+   error: {
+    message: "upstream stream could not be aggregated into a JSON answer",
+    detail: String(error).slice(0, 300),
+    raw: sseText.slice(0, 2000),
+   },
+  });
  }
- return sseText;
+}
+
+/**
+ * Repair the tool calls inside an already-JSON answer body.
+ *
+ * A lane that passes the caller's `stream` through untouched (Kilo) answers a
+ * non-streaming caller with a plain `chat.completion` / `response` object, not
+ * SSE. The SSE aggregators above never see that body, so the malformed
+ * arguments reached the host unrepaired on exactly the requests that asked for
+ * no stream. Repairs each call in place and re-serializes only when something
+ * actually changed, so a well-formed answer keeps its byte-identical body.
+ * Returns the input string untouched when it is not JSON or has no tool calls.
+ */
+export function repairJsonToolArguments(
+ bodyText: string,
+ pathname: string,
+ argSchemas: ReadonlyMap<string, Record<string, unknown>> | undefined,
+): string {
+ if (argSchemas === undefined || argSchemas.size === 0 || !bodyText.trimStart().startsWith("{")) return bodyText;
+ let parsed: unknown;
+ try {
+  parsed = JSON.parse(bodyText);
+ } catch {
+  return bodyText;
+ }
+ if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return bodyText;
+ const body = parsed as Record<string, unknown>;
+ let changed = false;
+ const repairCall = (name: string, args: string): string => {
+  const repaired = repairToolArguments(name, args, argSchemas);
+  if (repaired !== args) changed = true;
+  return repaired;
+ };
+ if (pathname.endsWith("/responses")) {
+  const output = body.output;
+  if (!Array.isArray(output)) return bodyText;
+  for (const item of output) {
+   if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+   const rec = item as Record<string, unknown>;
+   if (rec.type !== "function_call" || typeof rec.name !== "string" || typeof rec.arguments !== "string") continue;
+   rec.arguments = repairCall(rec.name, rec.arguments);
+  }
+ } else {
+  const choices = body.choices;
+  if (!Array.isArray(choices)) return bodyText;
+  for (const choice of choices) {
+   if (choice === null || typeof choice !== "object" || Array.isArray(choice)) continue;
+   const message = (choice as Record<string, unknown>).message;
+   if (message === null || typeof message !== "object" || Array.isArray(message)) continue;
+   const calls = (message as Record<string, unknown>).tool_calls;
+   if (!Array.isArray(calls)) continue;
+   for (const call of calls) {
+    if (call === null || typeof call !== "object" || Array.isArray(call)) continue;
+    const fn = (call as Record<string, unknown>).function;
+    if (fn === null || typeof fn !== "object" || Array.isArray(fn)) continue;
+    const fnRec = fn as Record<string, unknown>;
+    if (typeof fnRec.name !== "string" || typeof fnRec.arguments !== "string") continue;
+    fnRec.arguments = repairCall(fnRec.name, fnRec.arguments);
+   }
+  }
+ }
+ return changed ? JSON.stringify(body) : bodyText;
 }

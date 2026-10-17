@@ -117,9 +117,16 @@ test("enforceOpencodeFingerprint: tool-less body gains 6 injected tools and stre
 	assert.equal(body.stream, true);
 	const names = (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name).sort();
 	assert.deepEqual(names, ["bash", "edit", "glob", "grep", "read", "write"]);
+	for (const tool of body.tools as Array<{ function: { name: string; parameters: { properties: Record<string, unknown> } } }>) {
+		assert.ok(Object.keys(tool.function.parameters.properties).length > 0, `${tool.function.name} must have non-empty properties for inference gate`);
+	}
+	const bashTool = (body.tools as Array<{ function: { name: string; parameters: { properties: Record<string, unknown> } } }>).find((t) => t.function.name === "bash");
+	assert.ok("command" in bashTool!.function.parameters.properties);
+	const readTool = (body.tools as Array<{ function: { name: string; parameters: { properties: Record<string, unknown> } } }>).find((t) => t.function.name === "read");
+	assert.ok("path" in readTool!.function.parameters.properties);
 });
 
-test("enforceOpencodeFingerprint: Bash lowercased without dup, tool_choice retargeted, host tools kept", () => {
+test("enforceOpencodeFingerprint: Bash lowercased without dup, host tools kept", () => {
 	const body: Record<string, unknown> = {
 		stream: true,
 		tools: [
@@ -129,6 +136,8 @@ test("enforceOpencodeFingerprint: Bash lowercased without dup, tool_choice retar
 			{ type: "function", function: { name: "powershell", description: "ps" } },
 			{ type: "function", function: { name: "find", description: "find" } },
 		],
+		// Zen accepts only "auto", so a named choice is dropped rather than
+		// retargeted: it cannot reach upstream in any form.
 		tool_choice: { type: "function", function: { name: "Bash" } },
 	};
 	const r = enforceOpencodeFingerprint(body, "/v1/chat/completions");
@@ -142,12 +151,14 @@ test("enforceOpencodeFingerprint: Bash lowercased without dup, tool_choice retar
 	assert.ok(names.includes("powershell"), "caller powershell never dropped");
 	assert.ok(names.includes("glob"), "Pi find rides upstream as glob");
 	assert.deepEqual(r.injected, ["grep", "read", "edit", "write"], "bash+glob declared upstream, rest injected");
-	assert.deepEqual(body.tool_choice, { type: "function", function: { name: "bash" } });
+	assert.ok(!("tool_choice" in body), "named choice dropped — Zen supports only auto");
 });
 
-test("enforceOpencodeFingerprint: caller tool_choice naming find rides upstream as glob", () => {
-	// Translator gap: the find declaration was renamed to glob upstream while a
-	// caller tool_choice naming find was left dangling. Both shapes retarget.
+test("enforceOpencodeFingerprint: a find declaration still rides upstream as glob", () => {
+	// The find declaration is renamed to glob upstream so the sextet is
+	// satisfied. The caller's tool_choice naming find is dropped instead of
+	// retargeted: Zen rejects every choice but "auto", so retargeting it to
+	// glob would only produce another 400.
 	const body: Record<string, unknown> = {
 		model: "m",
 		stream: true,
@@ -158,19 +169,20 @@ test("enforceOpencodeFingerprint: caller tool_choice naming find rides upstream 
 	const names = (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
 	assert.ok(names.includes("glob"), "find declaration renamed to glob upstream");
 	assert.ok(!names.some((n) => n.toLowerCase() === "find"), "no dangling find declaration");
-	assert.deepEqual(body.tool_choice, { type: "function", function: { name: "glob" } });
+	assert.ok(!("tool_choice" in body), "named choice dropped");
 	for (const t of ["bash", "glob", "grep", "read", "edit", "write"]) {
 		assert.ok(names.includes(t), `sextet complete upstream: ${t}`);
 	}
 	assert.ok(!r.injected.includes("glob"), "caller-supplied glob is not re-injected");
-	const stringChoice: Record<string, unknown> = {
-		stream: true,
+
+	const autoChoice: Record<string, unknown> = {
+		model: "m",
 		tools: [{ type: "function", function: { name: "find", description: "f", parameters: { type: "object" } } }],
-		tool_choice: "find",
+		tool_choice: "auto",
 	};
-	enforceOpencodeFingerprint(stringChoice, "/v1/responses");
-	assert.equal(stringChoice.tool_choice, "glob", "string choice retargets too");
-	assert.equal(stringChoice.store, false, "responses cloak still applies");
+	enforceOpencodeFingerprint(autoChoice, "/v1/responses");
+	assert.equal(autoChoice.tool_choice, "auto", "auto rides verbatim");
+	assert.equal(autoChoice.store, false, "responses cloak still applies");
 });
 
 test("normalizePlaceholderCase + retargetToolChoice: bounded per-request restore", () => {
@@ -317,6 +329,64 @@ test("sseToChatCompletionJson: strips only injected, restores caller casing and 
 	assert.equal(res.choices[0].message.tool_calls[0].function.name, "find", "upstream glob restored to caller find");
 });
 
+test("sseToChatCompletionJson: parallel calls sharing index 0 stay separate", () => {
+	// Observed live from space-bunny-free on 2026-10-08: two tool calls in one
+	// turn, both labelled index 0, each with its own id. Keying fragments on
+	// index alone spliced them into one unparseable argument blob, which the
+	// host rejected with "Unexpected token at position 0" on every retry.
+	const sse = [
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_AAA","type":"function","function":{"name":"todo","arguments":"{\\"i\\":\\"Mark A done\\",\\"op\\":\\"done\\",\\"task\\":\\"alpha\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_BBB","type":"function","function":{"name":"todo","arguments":"{\\"i\\":\\"Mark B done\\",\\"op\\":\\"done\\",\\"task\\":\\"beta\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+		"data: [DONE]",
+	].join("\n\n");
+	const res = sseToChatCompletionJson(sse, true) as {
+		choices: Array<{ message: { tool_calls: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+	};
+	const calls = res.choices[0].message.tool_calls;
+	assert.equal(calls.length, 2, "two parallel calls must not merge into one");
+	assert.deepEqual(calls.map((call) => call.id), ["call_AAA", "call_BBB"], "emission order preserved");
+	for (const call of calls) {
+		assert.equal(call.function.name, "todo", "each call keeps its own name");
+		assert.doesNotThrow(() => JSON.parse(call.function.arguments), `arguments for ${call.id} must parse`);
+	}
+	assert.deepEqual(JSON.parse(calls[0].function.arguments), { i: "Mark A done", op: "done", task: "alpha" });
+	assert.deepEqual(JSON.parse(calls[1].function.arguments), { i: "Mark B done", op: "done", task: "beta" });
+});
+
+test("sseToChatCompletionJson: one call split across deltas still reassembles whole", () => {
+	// The ordinary shape: the first delta carries the id, later ones carry only
+	// `arguments`. Those must rejoin the call the index already opened.
+	const sse = [
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\\"comm"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\\":\\"ls\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+		"data: [DONE]",
+	].join("\n\n");
+	const res = sseToChatCompletionJson(sse, true) as {
+		choices: Array<{ message: { tool_calls: Array<{ id: string; function: { arguments: string } }> } }>;
+	};
+	const calls = res.choices[0].message.tool_calls;
+	assert.equal(calls.length, 1, "id-less follow-up deltas must not open a second call");
+	assert.equal(calls[0].id, "call_1");
+	assert.deepEqual(JSON.parse(calls[0].function.arguments), { command: "ls" });
+});
+
+test("sseToChatCompletionJson: id-less streams still split on distinct indices", () => {
+	// Providers that send no id at all keep working through the index fallback.
+	const sse = [
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read","arguments":"{\\"path\\":\\"a\\"}"}},{"index":1,"type":"function","function":{"name":"read","arguments":"{\\"path\\":\\"b\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+		"data: [DONE]",
+	].join("\n\n");
+	const res = sseToChatCompletionJson(sse, true) as {
+		choices: Array<{ message: { tool_calls: Array<{ function: { arguments: string } }> } }>;
+	};
+	const calls = res.choices[0].message.tool_calls;
+	assert.equal(calls.length, 2);
+	assert.deepEqual(calls.map((call) => JSON.parse(call.function.arguments)), [{ path: "a" }, { path: "b" }]);
+});
+
 test("enforce+sse round trip: caller Bash survives cloak with original casing", () => {
 	const body: Record<string, unknown> = {
 		stream: false,
@@ -405,6 +475,219 @@ test("normalizeResponsesBody: auto + parallel true + ultra survive, non-spark un
 	assert.ok(!("tool_choice" in other), "{ type: none } dropped");
 });
 
+test("normalizeResponsesBody: every assistant commentary item loses its phase", () => {
+	const user = { role: "user", content: [{ type: "input_text", text: "ok" }] };
+	const narration = () => ({
+		type: "message",
+		role: "assistant",
+		content: [{ type: "output_text", text: "Running the check now.", annotations: [] }],
+		status: "completed",
+		id: "rs_01a12c40f27b7642992f75b23eff6502",
+		phase: "commentary",
+	});
+
+	const terminal: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: [user, narration(), user],
+	};
+	normalizeResponsesBody(terminal);
+	const terminalItems = terminal.input as Array<Record<string, unknown>>;
+	assert.ok(!("phase" in terminalItems[1]), "terminal commentary phase dropped — upstream 400s on it");
+	assert.equal(terminalItems[1].id, "rs_01a12c40f27b7642992f75b23eff6502", "only the phase is rewritten");
+	assert.deepEqual(
+		terminalItems[1].content,
+		[{ type: "output_text", text: "Running the check now.", annotations: [] }],
+		"the text the model reads is untouched",
+	);
+
+	// A host may seat instruction items between a commentary item and the next
+	// user message, so a tail-only sweep would miss it. Upstream validates the
+	// whole replayed history, so every commentary item goes.
+	const withSystemBetween: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: [narration(), { role: "developer", content: "extra tools" }, user],
+	};
+	normalizeResponsesBody(withSystemBetween);
+	assert.ok(
+		!("phase" in (withSystemBetween.input as Array<Record<string, unknown>>)[0]),
+		"commentary followed by a developer item is still swept",
+	);
+
+	// An earlier turn's commentary must not come back once later turns append.
+	const twoTurns: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: [
+			{ ...narration(), id: "rs_turn_one" },
+			user,
+			{ ...narration(), id: "rs_turn_two", phase: "final_answer" },
+			user,
+		],
+	};
+	normalizeResponsesBody(twoTurns);
+	const twoTurnItems = twoTurns.input as Array<Record<string, unknown>>;
+	assert.ok(!("phase" in twoTurnItems[0]), "earlier turn's commentary swept too");
+	assert.equal(twoTurnItems[2].phase, "final_answer", "final_answer is not the rejected shape");
+});
+
+test("tool_choice is auto-or-absent on every Zen path", () => {
+	const unsupported = ["none", "required", "any"] as const;
+	for (const value of unsupported) {
+		const body: Record<string, unknown> = { model: "muse-spark-1.3-contributor-free", input: "hi", tool_choice: value };
+		normalizeResponsesBody(body);
+		assert.ok(!("tool_choice" in body), `"${value}" dropped — Zen supports only auto`);
+	}
+	const named: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		tool_choice: { type: "function", name: "bash" },
+	};
+	normalizeResponsesBody(named);
+	assert.ok(!("tool_choice" in named), "named function choice dropped");
+
+	const auto: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		tool_choice: "auto",
+	};
+	normalizeResponsesBody(auto);
+	assert.equal(auto.tool_choice, "auto", "auto rides verbatim");
+
+	const chat: Record<string, unknown> = { model: "big-pickle", messages: [], tool_choice: "required" };
+	enforceOpencodeFingerprint(chat, "/v1/chat/completions");
+	assert.ok(!("tool_choice" in chat), "chat path drops an unsupported choice too");
+
+	const chatNone: Record<string, unknown> = { model: "big-pickle", messages: [], tool_choice: "none" };
+	enforceOpencodeFingerprint(chatNone, "/v1/chat/completions");
+	assert.ok(!("tool_choice" in chatNone), "chat path still drops none");
+
+	const chatAuto: Record<string, unknown> = { model: "big-pickle", messages: [], tool_choice: "auto" };
+	enforceOpencodeFingerprint(chatAuto, "/v1/chat/completions");
+	assert.equal(chatAuto.tool_choice, "auto", "chat auto rides verbatim");
+
+	// The messages path shares the chat branch: Zen accepts only auto there
+	// too, so an unsupported choice is dropped rather than passed through.
+	const messagesPath: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "required" };
+	enforceOpencodeFingerprint(messagesPath, "/v1/messages");
+	assert.ok(!("tool_choice" in messagesPath), "messages path drops an unsupported choice too");
+
+	const messagesAuto: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "auto" };
+	enforceOpencodeFingerprint(messagesAuto, "/v1/messages");
+	assert.equal(messagesAuto.tool_choice, "auto", "messages auto rides verbatim");
+});
+
+test("a replayed tool call with a malformed name is folded on the wire", () => {
+	// Captured live: space-bunny-free emitted a call named `id id=`, and Pi
+	// replays it in input[] forever, so every later turn 400s.
+	const body: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: [
+			{ role: "user", content: [{ type: "input_text", text: "go" }] },
+			{ type: "function_call", call_id: "call_983ed385be8d42d1a0841458", name: "id id=", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call_983ed385be8d42d1a0841458", output: "ok" },
+			{ role: "user", content: [{ type: "input_text", text: "again" }] },
+		],
+	};
+	normalizeResponsesBody(body);
+	const items = body.input as Array<Record<string, unknown>>;
+	assert.equal(items[1].name, "id_id_", "the malformed call name is folded");
+	assert.equal(items[1].call_id, "call_983ed385be8d42d1a0841458", "the call id is untouched");
+	assert.equal(items[1].arguments, "{}", "arguments untouched");
+
+	const custom: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: [
+			{ type: "custom_tool_call", call_id: "c1", name: "xd://browser__open", input: "{}" },
+			{ type: "custom_tool_call", call_id: "c1", name: "bash", input: "{}" },
+		],
+	};
+	normalizeResponsesBody(custom);
+	const customItems = custom.input as Array<Record<string, unknown>>;
+	assert.equal(customItems[0].name, "xd___browser__open", "custom_tool_call folded too (one _ per invalid character)");
+	assert.equal(customItems[1].name, "bash", "a legal replayed call name rides verbatim");
+
+	// A `messages` body copied into `input` is covered by the same sweep.
+	const viaMessages: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		messages: [{ type: "function_call", call_id: "c2", name: "bad name", arguments: "{}" }],
+	};
+	normalizeResponsesBody(viaMessages);
+	assert.equal(
+		(viaMessages.input as Array<Record<string, unknown>>)[0].name,
+		"bad_name",
+		"chat leftovers copied into input[] are swept too",
+	);
+});
+
+test("dropping a forced tool call keeps the model's native reasoning on", () => {
+	// Captured live: OMP forces its synthetic `think` tool and switches native
+	// reasoning off with effort "none". Dropping the forced call must not leave
+	// the model reasoning-free, and "none" is itself rejected upstream.
+	const body: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: [{ role: "user", content: [{ type: "input_text", text: "go" }] }],
+		tool_choice: { type: "function", name: "think" },
+		reasoning: { effort: "none" },
+	};
+	normalizeResponsesBody(body);
+	assert.ok(!("tool_choice" in body), "the forced call is dropped");
+	assert.equal(
+		(body.reasoning as Record<string, unknown>).effort,
+		"xhigh",
+		"native reasoning is restored to the model's highest supported level",
+	);
+
+	const flat: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		tool_choice: "required",
+		reasoning_effort: "none",
+	};
+	normalizeResponsesBody(flat);
+	assert.equal(flat.reasoning_effort, "xhigh", "the flat field is restored too");
+
+	const camel: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		tool_choice: "required",
+		reasoningEffort: "none",
+	};
+	normalizeResponsesBody(camel);
+	assert.equal(camel.reasoningEffort, "xhigh", "the camelCase field is restored too");
+
+	// Genuine reasoning-off is the caller's real intent and must survive.
+	const genuineOff: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		tool_choice: "required",
+		reasoning: { effort: "off" },
+	};
+	normalizeResponsesBody(genuineOff);
+	assert.equal((genuineOff.reasoning as Record<string, unknown>).effort, "off", "an explicit off is never rewritten");
+
+	// A supported effort is left exactly as the caller set it.
+	const chosen: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		tool_choice: "required",
+		reasoning: { effort: "low" },
+	};
+	normalizeResponsesBody(chosen);
+	assert.equal((chosen.reasoning as Record<string, unknown>).effort, "low", "a supported effort is untouched");
+
+	// No forced call means no restore: the host's own value stands.
+	const untouched: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		reasoning: { effort: "none" },
+	};
+	normalizeResponsesBody(untouched);
+	assert.equal(
+		(untouched.reasoning as Record<string, unknown>).effort,
+		"none",
+		"without a dropped forced call the host's value is left alone",
+	);
+});
+
 test("enforceOpencodeFingerprint: responses path normalizes before fingerprint", () => {
 	const body: Record<string, unknown> = {
 		model: "muse-spark-1.3-contributor-free",
@@ -435,6 +718,142 @@ test("enforceOpencodeFingerprint: responses path normalizes before fingerprint",
 	enforceOpencodeFingerprint(chat, "/v1/chat/completions");
 	assert.ok(Array.isArray(chat.messages), "chat path keeps messages");
 	assert.equal(chat.temperature, 0.5, "chat path keeps temperature");
-	assert.equal(chat.tool_choice, "none", "chat path keeps caller choice");
+	assert.ok(!("tool_choice" in chat), "chat none dropped, never 400");
 	assert.ok(!("store" in chat), "store stays responses-only");
+});
+
+test("normalizeResponsesBody: flat reasoning effort max|ultra clamp to xhigh", () => {
+	const body: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		reasoning_effort: "max",
+		reasoningEffort: "ultra",
+	};
+	normalizeResponsesBody(body);
+	assert.equal(body.reasoning_effort, "xhigh");
+	assert.equal(body.reasoningEffort, "xhigh");
+	const upper: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		reasoning_effort: "MAX",
+		reasoningEffort: "Ultra",
+	};
+	normalizeResponsesBody(upper);
+	assert.equal(upper.reasoning_effort, "xhigh", "clamp is case-insensitive");
+	assert.equal(upper.reasoningEffort, "xhigh", "clamp is case-insensitive");
+	for (const level of ["off", "low", "medium", "high", "xhigh"]) {
+		const kept: Record<string, unknown> = {
+			model: "muse-spark-1.3-contributor-free",
+			input: "hi",
+			reasoning_effort: level,
+			reasoningEffort: level,
+		};
+		normalizeResponsesBody(kept);
+		assert.equal(kept.reasoning_effort, level, `${level} untouched`);
+		assert.equal(kept.reasoningEffort, level, `${level} untouched`);
+	}
+	const other: Record<string, unknown> = {
+		model: "big-pickle",
+		input: "hi",
+		reasoning_effort: "max",
+		reasoningEffort: "ultra",
+	};
+	normalizeResponsesBody(other);
+	assert.equal(other.reasoning_effort, "max", "non-spark flat effort never clamped");
+	assert.equal(other.reasoningEffort, "ultra", "non-spark flat effort never clamped");
+});
+
+test("enforceOpencodeFingerprint: responses path clamps flat effort end to end", () => {
+	const body: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		reasoning_effort: "max",
+		reasoningEffort: "ultra",
+		stream: false,
+	};
+	enforceOpencodeFingerprint(body, "/v1/responses");
+	assert.equal(body.reasoning_effort, "xhigh");
+	assert.equal(body.reasoningEffort, "xhigh");
+	const other: Record<string, unknown> = {
+		model: "big-pickle",
+		input: "hi",
+		reasoning_effort: "max",
+		reasoningEffort: "ultra",
+		stream: false,
+	};
+	enforceOpencodeFingerprint(other, "/v1/responses");
+	assert.equal(other.reasoning_effort, "max", "non-spark untouched end to end");
+	assert.equal(other.reasoningEffort, "ultra", "non-spark untouched end to end");
+});
+
+test("enforceOpencodeFingerprint: chat path drops tool_choice none, keeps auto-or-absent", () => {
+	for (const none of ["none", "None", { type: "none" }]) {
+		const body: Record<string, unknown> = {
+			model: "muse-spark-1.3-contributor-free",
+			messages: [{ role: "user", content: "hi" }],
+			tool_choice: none,
+			stream: false,
+		};
+		enforceOpencodeFingerprint(body, "/v1/chat/completions");
+		assert.ok(!("tool_choice" in body), `none dropped, never 400: ${JSON.stringify(none)}`);
+		assert.equal(body.stream, true, "stream still forced");
+	}
+	const auto: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		messages: [{ role: "user", content: "hi" }],
+		tool_choice: "auto",
+		stream: false,
+	};
+	enforceOpencodeFingerprint(auto, "/v1/chat/completions");
+	assert.equal(auto.tool_choice, "auto", "auto still rides");
+	const absent: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		messages: [{ role: "user", content: "hi" }],
+		stream: false,
+	};
+	enforceOpencodeFingerprint(absent, "/v1/chat/completions");
+	assert.ok(!("tool_choice" in absent), "no choice imposed");
+});
+
+test("normalizeResponsesBody: drops response_format leftover from chat completions", () => {
+	const body: Record<string, unknown> = {
+		model: "muse-spark-1.3-contributor-free",
+		input: "hi",
+		response_format: { type: "json_object" },
+	};
+	normalizeResponsesBody(body);
+	assert.ok(!("response_format" in body), "response_format stripped on responses path");
+});
+
+test("normalizeResponsesBody: generalized model effort clamping for mimo and nemotron", () => {
+	// mimo-v2.6-flash-free: max is null, highest non-null is xhigh (mapped to high)
+	const mimo: Record<string, unknown> = {
+		model: "mimo-v2.6-flash-free",
+		input: "hi",
+		reasoning_effort: "max",
+		reasoningEffort: "ultra",
+	};
+	normalizeResponsesBody(mimo);
+	assert.equal(mimo.reasoning_effort, "xhigh", "mimo max clamped to highest supported xhigh");
+	assert.equal(mimo.reasoningEffort, "xhigh", "mimo ultra clamped to highest supported xhigh");
+
+	// nemotron-3-ultra-free: max is null, highest non-null is xhigh
+	const nemo: Record<string, unknown> = {
+		model: "nemotron-3-ultra-free",
+		input: "hi",
+		reasoning_effort: "max",
+		reasoningEffort: "ultra",
+	};
+	normalizeResponsesBody(nemo);
+	assert.equal(nemo.reasoning_effort, "xhigh", "nemotron max clamped to highest supported xhigh");
+	assert.equal(nemo.reasoningEffort, "xhigh", "nemotron ultra clamped to highest supported xhigh");
+
+	// nested reasoning.effort works as well
+	const nested: Record<string, unknown> = {
+		model: "mimo-v2.6-flash-free",
+		input: "hi",
+		reasoning: { effort: "max" },
+	};
+	normalizeResponsesBody(nested);
+	assert.equal((nested.reasoning as Record<string, unknown>).effort, "xhigh", "nested reasoning effort clamped");
 });

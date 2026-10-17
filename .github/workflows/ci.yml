@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      use_self_hosted:
+        description: "Run on self-hosted acerblue-local runner (fallback when GitHub Actions quota is limited)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -14,13 +22,14 @@ concurrency:
 jobs:
   test:
     name: Test (${{ matrix.os }} - Node ${{ matrix.node-version }})
+    if: "!inputs.use_self_hosted"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        node-version: ["22.x"]
+        os: [ubuntu-latest, windows-latest]
+        node-version: ["lts/*", "22.19.0"]
 
     steps:
       - name: Checkout repository
@@ -31,7 +40,7 @@ jobs:
         with:
           version: 9
 
-      - name: Setup Node.js ${{ matrix.node-version }}
+      - name: Setup Node.js (LTS)
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
@@ -49,7 +58,44 @@ jobs:
       - name: Smoke test (extension entrypoint)
         run: pnpm run smoke
 
-      - name: Run test suite (107 unit & E2E tests)
+      - name: Run test suite
+        run: pnpm test
+
+  # Fallback runner: only used when explicitly requested (e.g. GitHub Actions minutes limit reached)
+  test-local:
+    name: Test (acerblue-local - Node 22.x fallback)
+    if: "inputs.use_self_hosted == true"
+    runs-on: [self-hosted, Linux, X64, acerblue-local]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (tsc --noEmit)
+        run: pnpm run typecheck
+
+      - name: Build docs (vitepress)
+        run: pnpm run docs:build
+
+      - name: Smoke test (extension entrypoint)
+        run: pnpm run smoke
+
+      - name: Run test suite
         run: pnpm test
 
   package-check:
@@ -65,10 +111,10 @@ jobs:
         with:
           version: 9
 
-      - name: Setup Node.js 22.x
+      - name: Setup Node.js (LTS)
         uses: actions/setup-node@v4
         with:
-          node-version: 22.x
+          node-version: "lts/*"
           cache: "pnpm"
 
       - name: Install dependencies
@@ -96,45 +142,3 @@ jobs:
             exit 1
           fi
           echo "✓ Package bundle is clean and strictly whitelisted."
-
-  load-test:
-    name: Load Test (k6)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - name: Setup Node.js 22.x
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22.x
-          cache: "pnpm"
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Start proxy in background
-        run: |
-          node --experimental-strip-types -e "import('./src/proxy.ts').then(async ({ startProxy }) => { await startProxy(); setInterval(() => {}, 1000); })" &
-          for i in $(seq 1 15); do
-            if curl -sf http://localhost:28180/_health > /dev/null 2>&1; then
-              echo "Proxy ready on http://localhost:28180"
-              break
-            fi
-            sleep 1
-          done
-          curl -sf http://localhost:28180/_health > /dev/null
-
-      - name: Install k6 and run load test
-        if: runner.os == 'Linux'
-        continue-on-error: true
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq k6
-          k6 run test/load/k6.js

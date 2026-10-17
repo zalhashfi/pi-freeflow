@@ -27,7 +27,7 @@ export interface UpstreamHealthSnapshot {
 }
 
 export const GATE_ENTER_AFTER = 2;
-export const FALLBACK_KILO_MODEL = "dots-studio/dots-3-note-preview:free";
+export const FALLBACK_KILO_MODEL = "nvidia/nemotron-3.5-lightning:free";
 
 export type ZenRoute = "passthrough" | "failover" | "canary";
 
@@ -108,6 +108,12 @@ const rejected = new Map<string, number>();
 const REJECTED_TTL_MS = 60 * 60 * 1_000;
 const MAX_REJECTED = 1_000;
 let loaded = false;
+/**
+ * mtime of the health file at this process's last read/write. A mismatch means
+ * another process rewrote it (the shared daemon owns the gates on the traffic
+ * path while host clients mostly read), so the in-memory snapshot is stale.
+ */
+let lastKnownHealthMtimeMs = -1;
 let lastSaveAt = 0;
 let lastGateNotifyAt = 0;
 let lastGateNotifyKey = "";
@@ -132,9 +138,27 @@ function isEstablished(key: string): boolean {
  return true;
 }
 
+function currentDiskHealthMtimeMs(): number {
+ try {
+  return fs.statSync(resolveUpstreamHealthPath()).mtimeMs;
+ } catch {
+  return -1;
+ }
+}
+
 function ensureLoaded(): void {
- if (loaded) return;
+ const mtime = currentDiskHealthMtimeMs();
+ // Reload when the file moved under us. Gates and the session table are written
+ // by whichever process sees the traffic (usually the shared daemon), so a
+ // one-shot load would leave this process serving a stale snapshot — and then
+ // persisting it back over the daemon's newer state. Own writes stamp the mtime
+ // in persist(), so this never re-reads what this process just wrote.
+ if (loaded && mtime === lastKnownHealthMtimeMs) return;
  loaded = true;
+ lastKnownHealthMtimeMs = mtime;
+ // Adopt the file wholesale: it is the newest authority for both maps.
+ sessions.clear();
+ gates.clear();
  let raw: string;
  try {
   raw = fs.readFileSync(resolveUpstreamHealthPath(), "utf8");
@@ -215,6 +239,9 @@ function persist(force: boolean): void {
    fs.writeFileSync(file, body, "utf8");
   }
   lastSaveAt = Date.now();
+  // Our own write wins: adopt its mtime so the next ensureLoaded does not
+  // re-read (and clear) the state this process just produced.
+  lastKnownHealthMtimeMs = currentDiskHealthMtimeMs();
  } catch (e) {
   log("warn", "Could not persist upstream health", { error: String(e) });
  }
@@ -306,6 +333,9 @@ export function rememberGateRejection(
 
 /** True when this session already ate a gate 403 and its retry should fail over. */
 export function wasGateRejected(parsedBody: unknown, pathname: string): boolean {
+ // Nothing remembered (the steady state): skip fingerprinting entirely. A keyless
+ // body hashes the whole conversation, by far the heaviest per-turn work here.
+ if (rejected.size === 0) return false;
  const fp = rejectionFingerprint(parsedBody, pathname);
  if (!fp) return false;
  const expiresAt = rejected.get(fp);
@@ -351,10 +381,15 @@ export function decideZenRoute(parsedBody: unknown, pathname: string): ZenRoute 
  return "failover";
 }
 
-/** First healthy Kilo model id, else the built-in Kilo fallback. */
-export function pickFailoverModel(): string {
+/** First healthy Kilo model id, preferring 1M context models, else the built-in Kilo fallback. */
+export function pickFailoverModel(requestedModel?: unknown): string {
  try {
-  const hit = getAliveCatalog().find(
+  const alive = getAliveCatalog();
+  const lightning = alive.find(
+   (m) => (m as { source?: string }).source === "kilo" && m.id === "nvidia/nemotron-3.5-lightning:free",
+  );
+  if (lightning && typeof lightning.id === "string") return lightning.id;
+  const hit = alive.find(
    (m) => (m as { source?: string }).source === "kilo" && typeof m.id === "string" && m.id.length > 0,
   );
   if (hit) return hit.id;
@@ -493,6 +528,7 @@ export function _resetUpstreamHealthForTest(): void {
  sessions.clear();
  rejected.clear();
  loaded = false;
+ lastKnownHealthMtimeMs = -1;
  lastSaveAt = 0;
  lastGateNotifyAt = 0;
  lastGateNotifyKey = "";

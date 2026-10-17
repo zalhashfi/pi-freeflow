@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getClientPort, isJsRuntimeExecutable, resolveDaemonRuntime } from "./client.ts";
+import { getClientPort, isJsRuntimeExecutable, materializeDaemonSources, resolveDaemonRuntime } from "./client.ts";
 import { refreshCatalog, setAliveCatalog } from "./catalog.ts";
 import { DAEMON_SPAWN_ENV, DATA_DIR_ENV, DEBUG_STATE_FILE, HOST, LOG_FILE, PORT, RELAY_STATE_FILE } from "./config.ts";
 import {
@@ -28,6 +28,7 @@ import {
  type DeployPlatform,
 } from "./deploy.ts";
 import {
+ createLogFollower,
  LOG_LEVEL_ORDER,
  getMinLogLevel,
  isDebugEnabled,
@@ -36,6 +37,7 @@ import {
  saveDebugState,
 } from "./logger.ts";
 import { probeRelay } from "./probe.ts";
+import { killPortHolder } from "./proxy.ts";
 import { getUpstreamHealth, resetUpstreamGate } from "./upstream-health.ts";
 import {
  buildRelayExport,
@@ -44,6 +46,7 @@ import {
  EXPORT_MAX_BYTES,
  findRelay,
  getActiveRelayState,
+ ewmaBadge,
  getRelayHealth,
  loadRelayState,
  parseRelayImport,
@@ -141,13 +144,17 @@ export function getStartupPlan(opts?: {
  const platform = opts?.platform ?? process.platform;
  const home = opts?.homeDir ?? os.homedir();
  const script = daemonEntryForStartup(opts?.scriptPath);
+ // A Node runtime cannot strip types for files under node_modules, so the
+ // hook must point at staged sources when the package is installed (issue #52).
+ // Bun runs TypeScript anywhere — keep its command side-effect free.
+ const nodeEntry = (): string => materializeDaemonSources(script);
  let quoted: string;
  if (opts?.execPath) {
   const type = isJsRuntimeExecutable(opts.execPath);
   if (type === "bun") {
    quoted = `"${opts.execPath}" "${script}"`;
   } else {
-   quoted = `"${opts.execPath}" --experimental-strip-types "${script}"`;
+   quoted = `"${opts.execPath}" --experimental-strip-types "${nodeEntry()}"`;
   }
  } else {
   const runtime = resolveDaemonRuntime({ scriptPath: script });
@@ -155,10 +162,10 @@ export function getStartupPlan(opts?: {
    if (runtime.runtimeType === "bun") {
     quoted = `"${runtime.execPath}" "${script}"`;
    } else {
-    quoted = `"${runtime.execPath}" --experimental-strip-types "${script}"`;
+    quoted = `"${runtime.execPath}" --experimental-strip-types "${nodeEntry()}"`;
    }
   } else {
-   quoted = `"node" --experimental-strip-types "${script}"`;
+   quoted = `"node" --experimental-strip-types "${nodeEntry()}"`;
   }
  }
  if (platform === "win32") {
@@ -330,9 +337,12 @@ function spawnWithProgress(
 }
 
 /**
- * Follow-mode log poller: tracks the count of matched lines already printed
- * and notifies only lines beyond it, so repeated ticks never re-notify the
- * same tail. One poller at a time — a re-run clears the previous interval.
+ * Follow-mode log poller: one stateful byte-offset follower over the live log
+ * file (createLogFollower), so each tick reads only the bytes appended since
+ * the previous tick instead of re-reading the log file and every rotated
+ * archive. Existing content is the one-shot tail's job — it is printed before
+ * this poller starts, and the follower never re-reports it. One poller at a
+ * time: a re-run clears the previous interval.
  * Stop with stopLogsFollow (session shutdown / non-follow commands).
  */
 let logsFollowTimer: NodeJS.Timeout | null = null;
@@ -346,29 +356,20 @@ function startLogsFollow(
  ctx: ExtensionContext,
  filterLevel: LogLevel | null,
  filterReqId: string | null,
- count: number,
  filterText: string | null,
- baselineMatched: number,
 ): void {
  stopLogsFollow();
- let lastPrinted = baselineMatched;
+ const follower = createLogFollower({
+  level: filterLevel,
+  reqId: filterReqId,
+  text: filterText,
+ });
  logsFollowTimer = setInterval(() => {
   try {
-   const tail = readRecentLogs(filterLevel, filterReqId, count, filterText);
-   if (tail.totalMatched < lastPrinted) {
-    // Log rotated/rewritten below the baseline — re-baseline silently.
-    lastPrinted = tail.totalMatched;
-    return;
-   }
-   const newCount = tail.totalMatched - lastPrinted;
-   if (newCount <= 0) return;
-   const newLines = tail.lines.slice(
-    tail.lines.length - Math.min(newCount, tail.lines.length),
-   ).slice(-50);
+   const newLines = follower.next();
    if (newLines.length > 0) {
     ctx.ui.notify(newLines.join("\n"), "info");
    }
-   lastPrinted = tail.totalMatched;
   } catch { }
  }, 1000);
  // @ts-ignore allow unref to not block process exit in CLI
@@ -521,13 +522,38 @@ export function validateDeployProjectName(
  }
  return { ok: true, name: clean };
 }
+/**
+ * /freeflow update restarts the daemon the session is actually attached to: a
+ * walked port must not keep serving the old build after a successful update.
+ * Three indirections keep that contract testable without module mocking — the
+ * update-step runner, the attached-port lookup and the killer. Production never
+ * calls the setter; the defaults are the real spawnWithProgress, the real
+ * getClientPort() || PORT and the real killPortHolder.
+ */
+let updateStepRunner = spawnWithProgress;
+let attachedPortResolver = (): number => getClientPort() || PORT;
+let attachedPortKiller = (port: number): Promise<unknown> => killPortHolder(port);
+
+/** Test seam for the /freeflow update restart path (null restores the real deps). */
+export function _setUpdateRestartDepsForTest(
+ opts: {
+  runUpdateStep?: (cmd: string, args: string[], ctx: ExtensionContext) => Promise<number>;
+  resolveAttachedPort?: () => number;
+  killAttachedPort?: (port: number) => Promise<unknown>;
+ } | null,
+): void {
+ updateStepRunner = opts?.runUpdateStep ?? spawnWithProgress;
+ attachedPortResolver = opts?.resolveAttachedPort ?? ((): number => getClientPort() || PORT);
+ attachedPortKiller = opts?.killAttachedPort ?? ((port: number): Promise<unknown> => killPortHolder(port));
+}
+
 export function createCommandSpec(
  _pi: ExtensionAPI,
  onCatalogRefreshed?: (models: RegisteredModel[]) => void,
 ): Omit<RegisteredCommand, "name"> {
  return {
   description:
-   "Relay egress: auto | spread | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update | deploy cloudflare | deploy deno | deploy vercel | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot]",
+   "Relay egress: auto | spread | on | off | hide | show | widget hide/show | status | kill|stop|shutdown | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | url [value] | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | trace [reqId] | debug on|off|level <level> | refresh | models|reload | update [auto on|off] | autoupdate [on|off] | deploy cloudflare | deploy deno | deploy vercel | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot] | cline signout|switch",
   getArgumentCompletions: (prefix: string) =>
    [
     "auto",
@@ -538,6 +564,9 @@ export function createCommandSpec(
     "widget hide",
     "widget show",
     "status",
+    "kill",
+    "stop",
+    "shutdown",
     "add",
     "list",
     "use",
@@ -549,6 +578,12 @@ export function createCommandSpec(
     "test",
     "test opencode",
     "url",
+    "autoupdate",
+    "autoupdate on",
+    "autoupdate off",
+    "update auto",
+    "update auto on",
+    "update auto off",
     "deploy",
     "deploy cloudflare",
     "deploy deno",
@@ -560,10 +595,19 @@ export function createCommandSpec(
     "cline login --key",
     "cline accounts",
     "cline logout",
+    "cline signout",
+    "cline switch",
     "refresh",
     "models",
+    "reload",
     "logs",
     "debug",
+    "debug on",
+    "debug off",
+    "debug level debug",
+    "debug level info",
+    "debug level warn",
+    "debug level error",
     "trace",
    ]
     .filter((s) => s.startsWith(prefix))
@@ -594,22 +638,6 @@ export function createCommandSpec(
     relayState = withRelayState(updater);
     return relayState;
    };
-   const setRelay = (
-    enabled: boolean,
-    url: string,
-    addLabel?: string,
-   ) => {
-    applyRelayState((s) => {
-     s.enabled = enabled;
-     const cleanUrl = (url || "").trim() || "";
-     s.url = cleanUrl;
-     if (cleanUrl) {
-      ensureRelay(s, cleanUrl, addLabel);
-     }
-     return s;
-    });
-   };
-
    const addRelayInteractive = async () => {
     const inputUrl = (
      await ctx.ui.input(
@@ -629,12 +657,17 @@ export function createCommandSpec(
      )
     )?.trim() || defaultLabel;
 
-    applyRelayState((s) => {
-     const added = ensureRelay(s, inputUrl, inputLabel);
-     s.enabled = true;
-     s.url = added.url;
-     return s;
-    });
+    try {
+     applyRelayState((s) => {
+      const added = ensureRelay(s, inputUrl, inputLabel);
+      s.enabled = true;
+      s.url = added.url;
+      return s;
+     });
+    } catch (e) {
+     ctx.ui.notify((e as Error).message, "warning");
+     return;
+    }
     persist();
     flash();
     ctx.ui.notify(
@@ -862,7 +895,7 @@ export function createCommandSpec(
       : isCooling
        ? ` ⚠️ [cooling ${remainingSec}s: ${health.lastStatus ? `HTTP ${health.lastStatus}` : "error"}]`
        : health?.lastLatencyMs != null && Number.isFinite(health.lastLatencyMs)
-        ? ` ✓ [${health.lastLatencyMs}ms]`
+        ? ` ✓ [${health.lastLatencyMs}ms]${ewmaBadge(health)}`
         : " ✓";
      const counterText = health && (health.successCount != null || health.failureCount != null)
       ? ` ${health.successCount ?? 0} ok / ${health.failureCount ?? 0} fail`
@@ -1187,7 +1220,7 @@ export function createCommandSpec(
     const deadLine = deadParked.length
      ? `\nDead relays (HTTP 402 disabled deployment, parked): ${deadParked.map((r) => r.url).join(", ")} — delete the Vercel project, run /freeflow remove <url>, then deploy Cloudflare`
      : "";
-    ctx.ui.notify(`${modeLine} | ${poolLine}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}${deadLine}`, "info");
+    ctx.ui.notify(`${modeLine} | ${poolLine} | auto-update: ${relayState.autoUpdate ? "on" : "off"}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}${deadLine}`, "info");
    } else if (sub === "kill" || sub === "stop" || sub === "shutdown") {
     const port = getClientPort() || PORT;
     try {
@@ -1202,6 +1235,20 @@ export function createCommandSpec(
      }
     } catch {
      ctx.ui.notify("Daemon not running or not reachable", "warning");
+    }
+   } else if (sub === "autoupdate" || (sub === "update" && rest.trim().toLowerCase().startsWith("auto"))) {
+    const arg = sub === "autoupdate"
+     ? rest.trim().toLowerCase()
+     : rest.trim().slice(4).trim().toLowerCase();
+    if (arg === "on" || arg === "enable" || arg === "true" || arg === "1") {
+     withRelayState((s) => { s.autoUpdate = true; return s; });
+     ctx.ui.notify("Auto-update enabled (new versions will be installed automatically).", "info");
+    } else if (arg === "off" || arg === "disable" || arg === "false" || arg === "0") {
+     withRelayState((s) => { s.autoUpdate = false; return s; });
+     ctx.ui.notify("Auto-update disabled.", "info");
+    } else {
+     const current = loadRelayState().autoUpdate ? "ON" : "OFF";
+     ctx.ui.notify(`Auto-update is currently ${current}. Use '/freeflow autoupdate on|off'`, "info");
     }
    } else if (sub === "update") {
     if (isLinkedInstall()) {
@@ -1244,7 +1291,7 @@ export function createCommandSpec(
          piAvailable: isCommandAvailable("pi"),
         })) {
          if (lastStep !== "") ctx.ui.notify(`${lastStep} exited ${code} — trying ${step.manual}…`, "info");
-         code = await spawnWithProgress(step.cmd, step.args, ctx);
+         code = await updateStepRunner(step.cmd, step.args, ctx);
          manual = step.manual;
          lastStep = step.manual;
          if (code === 0) break;
@@ -1260,11 +1307,14 @@ export function createCommandSpec(
            "info",
           );
           manual = plan.manual;
-          code = await spawnWithProgress(plan.cmd, plan.args, ctx);
+          code = await updateStepRunner(plan.cmd, plan.args, ctx);
          }
         }
         if (code === 0) {
-         ctx.ui.notify(`Updated to ${latest} — restart your host app`, "info");
+         // Restart the daemon that is actually attached — a walked port must
+         // not leave the old build serving after a successful update.
+         try { await attachedPortKiller(attachedPortResolver()); } catch { }
+         ctx.ui.notify(`Updated to ${latest} and restarted proxy daemon`, "info");
         } else {
          ctx.ui.notify(
           `Update failed (exit ${code}) — try manually: ${manual}`,
@@ -1430,13 +1480,17 @@ export function createCommandSpec(
      }
     } else {
      const st = loadDebugState();
-     const cur = st?.debug
-      ? "debug (ON)"
-      : st?.level ||
-      process.env.FREEFLOW_LOG_LEVEL ||
-      "info";
+     const minLevel = getMinLogLevel();
+     // Report the level the logger actually filters at, not the raw fields: a
+     // fresh install (no state file) and FREEFLOW_DEBUG=1 both run at debug
+     // without either being persisted anywhere.
+     const effective =
+      (Object.keys(LOG_LEVEL_ORDER) as LogLevel[]).find(
+       (level) => LOG_LEVEL_ORDER[level] === minLevel,
+      ) ?? "info";
+     const cur = st?.debug ? "debug (ON)" : effective;
      ctx.ui.notify(
-      `Debug status: ${cur}\nFile: ${DEBUG_STATE_FILE}\nMinLevel: ${getMinLogLevel()} | isDebug=${isDebugEnabled()}\nUsage: /freeflow debug on|off | /freeflow debug level debug`,
+      `Debug status: ${cur}\nFile: ${DEBUG_STATE_FILE}\nMinLevel: ${minLevel} | isDebug=${isDebugEnabled()}\nUsage: /freeflow debug on|off | /freeflow debug level debug`,
       "info",
      );
     }
@@ -1511,9 +1565,7 @@ export function createCommandSpec(
         ctx,
         filterLevel,
         filterReqId,
-        count,
         filterText,
-        result.totalMatched,
        );
       }
       return;
@@ -1529,9 +1581,7 @@ export function createCommandSpec(
        ctx,
        filterLevel,
        filterReqId,
-       count,
        filterText,
-       result.totalMatched,
       );
      }
     } catch (e) {
@@ -1838,13 +1888,18 @@ export function createCommandSpec(
       relayState.url || "",
      ));
     const cleanInput = (input || "").trim() || "";
-    applyRelayState((s) => {
-     s.url = cleanInput;
-     if (cleanInput) {
-      ensureRelay(s, cleanInput, shortRelayLabel(cleanInput, s.relays));
-     }
-     return s;
-    });
+    try {
+     applyRelayState((s) => {
+      s.url = cleanInput;
+      if (cleanInput) {
+       ensureRelay(s, cleanInput, shortRelayLabel(cleanInput, s.relays));
+      }
+      return s;
+     });
+    } catch (e) {
+     ctx.ui.notify((e as Error).message, "warning");
+     return;
+    }
     persist();
     flash();
    } else if (sub === "deploy") {
@@ -1858,7 +1913,7 @@ export function createCommandSpec(
      const pf = parseDeployPlatform(rest);
      if (!pf) {
       ctx.ui.notify(
-       "Unknown platform. Use: cloudflare | deno | vercel",
+       "Unknown platform. Use: cloudflare | deno | vercel (for self-hosted VPS, see https://github.com/trefeon/warp-relay-pool)",
        "warning",
       );
      } else {

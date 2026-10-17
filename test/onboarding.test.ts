@@ -4,17 +4,26 @@
  * Drives the real `session_start` handler captured from the default export,
  * isolating the real disk state (flag + relay state + backup) for the test.
  */
+// MUST be literal first import: it disables detached-daemon spawn and points
+// the extension at TEST_PROXY_PORT before src/config.ts is evaluated, and
+// supplies the fetch stub that keeps the registry/daemon probes off the wire.
+import { harnessFetchHandler } from "./user-flow-env.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import defaultExtension from "../src/index.ts";
 import { ONBOARDED_FLAG_FILE, RELAY_STATE_FILE } from "../src/config.ts";
+import { ALL_MODELS } from "../src/models.ts";
 import {
  ensureRelay,
  resolveRelayState,
  saveRelayState,
 } from "../src/relay-state.ts";
-import type { ExtensionAPI, ExtensionContext } from "../src/types.ts";
+import type {
+ ExtensionAPI,
+ ExtensionContext,
+ ProviderConfig,
+} from "../src/types.ts";
 
 const BAK_FILE = `${RELAY_STATE_FILE}.bak`;
 const TOUCHED = [ONBOARDED_FLAG_FILE, RELAY_STATE_FILE, BAK_FILE];
@@ -48,16 +57,20 @@ async function withIsolatedFiles(fn: () => Promise<void>): Promise<void> {
  }
 }
 
-/** Capture the real session_start handler without heavy per-invocation setup. */
-async function captureSessionStart(): Promise<
- (event: unknown, ctx: ExtensionContext) => Promise<void> | void
-> {
+/** Capture the real session_start handler plus the config it registered. */
+async function captureSessionStart(): Promise<{
+ handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void;
+ providerConfig: ProviderConfig | undefined;
+}> {
  const registeredEvents: Record<
   string,
   (event: unknown, ctx: ExtensionContext) => Promise<void> | void
  > = {};
+ let providerConfig: ProviderConfig | undefined;
  const mockPi: ExtensionAPI = {
-  registerProvider() { },
+  registerProvider(_name, config) {
+   providerConfig = config;
+  },
   registerCommand() { },
   on(event, handler) {
    registeredEvents[event] = handler;
@@ -66,7 +79,7 @@ async function captureSessionStart(): Promise<
  await defaultExtension(mockPi);
  const handler = registeredEvents.session_start;
  assert.ok(handler, "session_start handler must be registered");
- return handler;
+ return { handler, providerConfig };
 }
 
 function makeCtx(notifyMessages: string[]): ExtensionContext {
@@ -82,10 +95,13 @@ function makeCtx(notifyMessages: string[]): ExtensionContext {
  } as ExtensionContext;
 }
 
-test("first run notifies once and persists the flag; later sessions stay silent", async () => {
+test("first run notifies once and persists the flag; later sessions stay silent", async (t) => {
  await withIsolatedFiles(async () => {
+  // Phantom daemon + offline registry: activation must neither bind a real
+  // port nor reach registry.npmjs.org via checkForUpdateInBackground.
+  t.mock.method(globalThis, "fetch", harnessFetchHandler());
   clearFiles();
-  const handler = await captureSessionStart();
+  const { handler, providerConfig } = await captureSessionStart();
   const notifyMessages: string[] = [];
   const ctx = makeCtx(notifyMessages);
 
@@ -101,10 +117,15 @@ test("first run notifies once and persists the flag; later sessions stay silent"
    "1",
    "flag file must contain '1'",
   );
-  assert.match(
-   notifyMessages[0],
-   /^freeflow ready: 31 free models via local proxy 127\.0\.0\.1:28180\. /,
-   "welcome must announce the local proxy",
+  // The welcome must name the proxy the registered provider actually uses —
+  // a hardcoded default port here is exactly the drift this guards against.
+  assert.ok(providerConfig, "provider config must be registered");
+  const proxyHost = new URL(providerConfig.baseUrl).host;
+  assert.ok(
+   notifyMessages[0].startsWith(
+    `freeflow ready: ${ALL_MODELS.length} free models via local proxy ${proxyHost}. `,
+   ),
+   `welcome must name the registered proxy (${proxyHost})`,
   );
   assert.match(
    notifyMessages[0],
@@ -123,8 +144,9 @@ test("first run notifies once and persists the flag; later sessions stay silent"
  });
 });
 
-test("first run with a pre-configured relay pool reports the pool size", async () => {
+test("first run with a pre-configured relay pool reports the pool size", async (t) => {
  await withIsolatedFiles(async () => {
+  t.mock.method(globalThis, "fetch", harnessFetchHandler());
   clearFiles();
   const seed = resolveRelayState();
   ensureRelay(seed, "https://relay-a.example.com", "relay-a");
@@ -134,7 +156,7 @@ test("first run with a pre-configured relay pool reports the pool size", async (
   seed.mode = "on";
   saveRelayState(seed);
 
-  const handler = await captureSessionStart();
+  const { handler } = await captureSessionStart();
   const notifyMessages: string[] = [];
   await handler({}, makeCtx(notifyMessages));
   assert.equal(notifyMessages.length, 1, "first run must notify exactly once");
