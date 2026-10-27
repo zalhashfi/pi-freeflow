@@ -4,9 +4,9 @@
  * Provides 24-hour atomic disk caching with safe offline fallback to verified static definitions.
  */
 
-import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { writeFileAtomic } from "./atomic-write.ts";
 import {
  CATALOG_CACHE_FILE,
  CATALOG_CACHE_TTL_MS,
@@ -45,12 +45,11 @@ import type {
  * - mimo-v2.5-free: decommissioned upstream (2026-10-07) — HTTP 401 "Model mimo-v2.5-free is not supported".
  *   Re-probed 2026-10-16: 410 "Model mimo-v2.5-free has been deprecated. Use
  *   mimo-v2.6-flash-free instead." The docs still list it as free; they are stale.
- * - exo-free: dead-listed 2026-10-09 (410 "Model exo-free has been deprecated")
- *   but revived upstream on 2026-10-16 — back on the official free lineup and
- *   answering live through the proxy (chat 200 with tools, stream, reasoning,
- *   vision; dual-canary recall at ~520K tokens; a 1.2M-word prompt draws the
- *   empty-bodied 400). Re-registered statically the same day: do NOT add this
- *   id back to this set unless it dies again.
+ * - exo-free: dead-listed 2026-10-09 (410 "Model exo-free has been deprecated"),
+ *   revived upstream on 2026-10-16, and dead again on 2026-10-22: the endpoint
+ *   answers 410 "Model exo-free has been deprecated" on every path through the
+ *   relay pool and the id is absent from the live Zen listing. Permanently
+ *   dead-listed so no disk cache or upstream merge can put it back.
  * - fledge-alpha-free: withdrawn upstream (2026-10-09) — absent from the live
  *   Zen list, chat 401 "Model fledge-alpha-free is not supported".
  * - inclusionai/ling-3.0-flash-sante:free: demoted to paid on Kilo (2026-10-09) —
@@ -75,10 +74,10 @@ import type {
  *   retired upstream (2026-10-13) — probed live twice each against the real
  *   Cline pool, every attempt answered HTTP 404 `{"error":"model not found",
  *   "success":false,"hint":"Cline has no such model. Refresh the model list and
- *   retry."}`, while the two Cline models that survive (cline-free/
- *   muse-spark-1.3-contributor and z-ai/glm-5.3-flash) answered 200 with the
- *   same account and request shape. The lane is healthy; these three ids are
- *   gone, so they must never re-enter the picker from disk cache or an
+ *   retry."}`, while the sibling `z-ai/glm-5.3-flash` (and, until its own
+ *   retirement below, `cline-free/muse-spark-1.3-contributor`) answered 200
+ *   with the same account and request shape. The lane is healthy; these three
+ *   ids are gone, so they must never re-enter the picker from disk cache or an
  *   upstream merge.
  */
 export const DEAD_MODEL_IDS = new Set<string>([
@@ -101,6 +100,10 @@ export const DEAD_MODEL_IDS = new Set<string>([
  "inclusionai/ling-3.0-flash-fin:free",
  "mimo-v2.5-free",
  "stealth/space-bunny-alpha",
+ // space-bunny-free: deprecated on the Zen free tier (2026-10-20) — the
+ // endpoint answers 410 ModelDeprecated and points at minimax-m3.1-flash-free,
+ // which was itself retired on 2026-10-23 (see below).
+ "space-bunny-free",
  "qwen/qwen3.8-27b:free",
  "nvidia/nemotron-3.5-content-safety:free",
  "fledge-alpha-free",
@@ -124,6 +127,74 @@ export const DEAD_MODEL_IDS = new Set<string>([
  // answers 401 PAID_MODEL_AUTH_REQUIRED while the sibling z-ai/glm-5.3-flash
  // answers 200 keyless with the same request shape.
  "stepfun/step-5-preview-free",
+ // ll-alpha-free: decommissioned upstream (2026-10-17) — gone from live
+ // Zen /v1/models list, answers HTTP 410 "Model ll-alpha-free has been deprecated".
+ "ll-alpha-free",
+ // muse-spark-1.3-contributor-free: decommissioned upstream (2026-10-17) — gone from
+ // live Zen /v1/models list, answers HTTP 410 "Model muse-spark-1.3-contributor-free has been deprecated".
+ "muse-spark-1.3-contributor-free",
+ // muse-spark-1.2-contributor-free: decommissioned upstream (2026-10-18) — answers
+ // HTTP 410 "Model muse-spark-1.2-contributor-free has been deprecated" while the
+ // same request shape on the surviving Zen models answers 200. Retired from the
+ // static catalog the same day.
+ "muse-spark-1.2-contributor-free",
+ // cline-free/muse-spark-1.3-contributor: gone from Cline's model inventory
+ // (2026-10-22) — three live probes through the real pool, spaced over ~10
+ // minutes, each answered HTTP 404 `{"error":"model not found",
+ // "success":false,"hint":"Cline has no such model. Refresh the model list and
+ // retry."}`, while `z-ai/glm-5.3-flash` resolved on the same account (its 402
+ // insufficient_credits is raised after model resolution). The id was the last
+ // entry declaring `api: "openai-responses"`; it stays retired so a stale disk
+ // cache cannot put it back in the picker.
+ "cline-free/muse-spark-1.3-contributor",
+ // nvidia/nemotron-3-super-120b-a12b:free: dead route (2026-10-21) — Kilo answers
+ // 404 "Function '<uuid>': Not found for account ..." from its Nvidia provider on
+ // every attempt, from two independent egress IPs, while sibling Nvidia ids answer
+ // 200 with the same request shape.
+ "nvidia/nemotron-3-super-120b-a12b:free",
+ // thinkingmachines/inkling-small:free: gone upstream (2026-10-21) — Kilo answers
+ // HTTP 404 "The requested model is currently unavailable" (unavailable_model) on
+ // every attempt, from two independent egress IPs; it is no longer served.
+ "thinkingmachines/inkling-small:free",
+ // exo-free: re-deprecated upstream (2026-10-22) — 410 ModelDeprecated on every
+ // path and gone from the live Zen listing, four days after it was re-registered
+ // from a 2026-10-16 revival. Permanently dead-listed.
+ "exo-free",
+ // minimax-m3.1-flash-free: the Zen free endpoint of MiniMax M3.1 Flash was
+ // retired on 2026-10-23 — it answers HTTP 410 with a model-level deprecation
+ // and points at deepseek-v4.1-flash-free. The KiloCode free twin of the same
+ // weights died the same day (see below), so both free endpoints are gone.
+ "minimax-m3.1-flash-free",
+ // minimax/minimax-m3.1-flash:free: the KiloCode free endpoint was retired on
+ // 2026-10-23 too — a direct gateway request answers HTTP 404 "The requested
+ // model 'minimax/minimax-m3.1-flash:free' does not exist" (model_not_found)
+ // on every attempt, and the live /api/gateway/models listing carries only the
+ // PAID minimax/minimax-m3.1-flash. No short alias exists for it: a short name
+ // must never route to a paid model.
+ "minimax/minimax-m3.1-flash:free",
+ // cat-jam-free: retired upstream (2026-10-24) — every request path
+ // (chat non-stream, chat stream, and responses) through the relay pool answers
+ // persistent HTTP 404 "Upstream request failed: Endpoint is unavailable." across
+ // multiple independent runs, while sibling OpenCode models (deepseek, mimo,
+ // nemotron) answer 200 on the same request shapes.
+ "cat-jam-free",
+ // z-ai/glm-5.3-flash: retired from the Cline free catalog (2026-10-24) — paid
+ // model that drains account credits and answers HTTP 402 insufficient_credits.
+ // Replaced with Cline's verified working free tier model.
+ "z-ai/glm-5.3-flash",
+ // longcat-2.5-preview-free: deprecated upstream (2026-10-26, issue #121) —
+ // the endpoint answers HTTP 410 "Model longcat-2.5-preview-free has been
+ // deprecated", and the id is absent from the live Zen free listing (watch
+ // state 2026-10-24). Permanently dead-listed so no disk cache or upstream
+ // merge can put it back.
+ "longcat-2.5-preview-free",
+ // nemotron-3-ultra-free: retired upstream (2026-10-26, issue #121) — the
+ // endpoint answers HTTP 400 "Model is unavailable", and the id is absent
+ // from the live Zen free listing (watch state 2026-10-24 lastChecked), the
+ // same removal-plus-unavailable signature as step-5-preview-free. The
+ // sibling Kilo id nvidia/nemotron-3-ultra-550b-a55b:free is a separate
+ // serving route and is unaffected.
+ "nemotron-3-ultra-free",
 ]);
 /**
  * Free-tier allowlist for anything entering the picker via network or stale disk.
@@ -140,10 +211,10 @@ export function isFreeCatalogId(id: string): boolean {
 /**
  * Purge paid/dead entries from a catalog list and repair known models against
  * the static definitions. Stale disk caches predate the paid filter and the
- * muse-spark-1.3 responses-api entry, so loading them verbatim replays a wrong
- * api (chat/completions for a responses-only model -> upstream 500) until the
- * 24h TTL expires. Repairing here self-heals on the next refresh without a
- * reinstall.
+ * responses-api entries (the last one, Cline's Muse Spark 1.3, retired on
+ * 2026-10-22), so loading them verbatim replays a wrong api (chat/completions
+ * for a responses-only model -> upstream 500) until the 24h TTL expires.
+ * Repairing here self-heals on the next refresh without a reinstall.
  */
 export function sanitizeCatalogModels(models: RegisteredModel[]): RegisteredModel[] {
  const out: RegisteredModel[] = [];
@@ -163,7 +234,7 @@ export function sanitizeCatalogModels(models: RegisteredModel[]): RegisteredMode
 }
 /**
  * In-memory cache of currently active/available free models.
- * Initialized with all 37 verified models for 0ms instant availability.
+ * Initialized with all 32 verified models for 0ms instant availability.
  */
 let aliveCatalog: RegisteredModel[] = ALL_MODELS.map((m) => ({
  ...m,
@@ -282,10 +353,11 @@ export function enrichModelDef(raw: RawModelItem, source: Upstream): RegisteredM
   maxTokens = 131_072;
  }
 
- // Muse Spark is served on the responses API upstream (both static catalogue
- // entries declare it). Every known id short-circuits above, so this only
- // decides for ids Zen lists dynamically — matching the family keeps a future
- // muse-spark id off the chat endpoint it would 500 on.
+ // Muse Spark was served on the responses API upstream: the Cline entry
+ // declared it until 2026-10-22, and the Zen 1.2/1.3 contributor ids retired
+ // before that. Every known id short-circuits above, so this only decides for
+ // ids Zen lists dynamically — matching the family keeps a future muse-spark
+ // id off the chat endpoint it would 500 on.
  const isResponses = idLower.includes("muse-spark");
 
  return {
@@ -327,39 +399,18 @@ export function readCatalogCache(): CatalogCacheData | null {
 }
 
 /**
- * Atomically write catalog cache data to disk using temporary file + rename.
+ * Atomically write catalog cache data to disk (temp file + rename, see
+ * src/atomic-write.ts).
  * Persists etag alongside models for subsequent If-None-Match conditional requests.
  * Note: fsync not needed — rename is atomic on same filesystem; crash leaves either old or new file intact.
  */
-function sleepSync(ms: number): void {
- Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-function renameWithRetry(from: string, to: string): void {
- const retryable: Record<string, true> = { EPERM: true, EACCES: true, EBUSY: true };
- for (let attempt = 1; ; attempt++) {
-  try {
-   fs.renameSync(from, to);
-   return;
-  } catch (e) {
-   const code = (e as NodeJS.ErrnoException | null)?.code;
-   if (!code || !retryable[code] || attempt >= 3) {
-    throw e;
-   }
-   sleepSync(50);
-  }
- }
-}
-
 export function writeCatalogCache(data: CatalogCacheData): void {
  try {
   const dir = path.dirname(CATALOG_CACHE_FILE);
   if (!fs.existsSync(dir)) {
    fs.mkdirSync(dir, { recursive: true });
   }
-  const tmpPath = `${CATALOG_CACHE_FILE}.${randomUUID()}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf8");
-  renameWithRetry(tmpPath, CATALOG_CACHE_FILE);
+  writeFileAtomic(CATALOG_CACHE_FILE, JSON.stringify(data, null, 2));
  } catch (err) {
   logWarn("Could not persist catalog cache to disk", { error: String(err) });
  }
@@ -424,7 +475,14 @@ export async function refreshCatalog(force = false): Promise<RegisteredModel[]> 
     signal: AbortSignal.timeout(CATALOG_REFRESH_TIMEOUT_MS),
    });
    if (res.status === 304) {
-    // Not modified — skip merge, extend timestamp to avoid tight loop
+    // Not modified upstream, but the cached list is still the only record of
+    // dynamically discovered ids this process never merged (a 304 revalidates
+    // before any 200 merge), so overlay it exactly like the stale-cache paths
+    // below instead of returning the untouched in-memory catalog.
+    if (staleForEtag && Array.isArray(staleForEtag.models) && staleForEtag.models.length > 0) {
+     aliveCatalog = mergeCatalog(aliveCatalog, sanitizeCatalogModels(staleForEtag.models));
+    }
+    // Extend the timestamp to avoid a tight loop on the same 304
     if (staleForEtag && Array.isArray(staleForEtag.models)) {
      try {
       writeCatalogCache({ ...staleForEtag, timestamp: Date.now() });

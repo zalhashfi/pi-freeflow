@@ -27,6 +27,7 @@ Requires Node >= 22.19.0, ESM (`"type": "module"`).
 - Proxy preserves caller tools verbatim; translation only reshapes wire format (`src/tool-translation.ts`)
 - Reuse existing patterns; one convention per concern — a second parallel implementation is a bug
 - Before changing an exported symbol, find all callsites first
+- Never implement auto fallback models: a request for a model must either be fulfilled by that exact model or surface the authentic upstream error/status; never silently swap or substitute another model (e.g. Zen -> Kilo fallback)
 
 ## Testing rules
 
@@ -34,11 +35,23 @@ Requires Node >= 22.19.0, ESM (`"type": "module"`).
 - New behavior needs a test that fails without the fix; keep tests to observable contracts (no source-text or wiring assertions)
 - Tests touching relay state must isolate BOTH the state file and its `.bak` (see `withIsolatedRelayFiles` in `test/relay-state-lifecycle.test.ts`); never touch real user state on disk
 - Live upstream checks are opt-in scripts, never part of `npm test`
+- CI is change-gated (`.github/workflows/ci.yml`): `code` changes run the test matrix (ubuntu lts + 22.19, windows lts), `docs/` changes build the docs site, shipped-file changes run the tarball whitelist. Keep jobs path-scoped — a job without a gate burns a runner on every push
 
 ## Versioning and releases
 
 - Changesets workflow (`.changeset/`): `major` = breaking, `minor` = new compatible capability, `patch` = fix. Changelog headings follow suit (`### Minor Changes`).
 - `npm publish` is always run by the maintainer in their own terminal (2FA). Agents never publish, never push/tag before the maintainer confirms the publish landed.
+- The Release workflow re-verifies the published tarball against the tagged tree (`scripts/verify-published-tarball.mjs`); a tag whose content does not match what npm serves fails the run.
+
+## Repo metadata (About panel)
+
+The GitHub About description mirrors README's tagline — same facts, same numbers. Any README change to the headline (model count, tagline, relay story) MUST update the About in the same change:
+
+```
+gh repo edit --description "<new description>"
+```
+
+Topics in the About panel follow the README feature list: add one when a headline feature lands, drop one when it is removed. The About must never advertise an older model count than README and `src/models.ts`.
 
 ## Public-repo hygiene (this repo is public)
 

@@ -25,8 +25,10 @@ import {
 import type { RelayState } from "../src/types.ts";
 import { _resetUpstreamHealthForTest } from "../src/upstream-health.ts";
 import { clearSandboxFiles, withIsolatedSandboxFiles } from "./_sandbox-helpers.ts";
+import { authHeaders } from "./_auth.ts";
 import {
 	isTransientModelFailureFrame,
+	isRetriableRateLimitFrame,
 	getMidStreamFaultStats,
 	_resetMidStreamFaultStatsForTest,
 	_resetSseStatsForTest,
@@ -36,7 +38,7 @@ import {
 const PROXY_PORT = 19380;
 const RELAY_A = "http://127.0.0.1:19381";
 const RELAY_B = "http://127.0.0.1:19382";
-const MODEL = "muse-spark-1.3-contributor-free";
+const MODEL = "nemotron-3.5-super-vl-free";
 
 function seedPool(): void {
 	setActiveRelayState(
@@ -138,7 +140,7 @@ test("mid-stream cut on primary re-fires once on next relay; client gets respons
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -197,7 +199,7 @@ test("clean terminal marker never re-fires", async () => {
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -259,7 +261,7 @@ test("client abort mid-stream never re-fires and never penalizes the relay", asy
 				const ctl = new AbortController();
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 					signal: ctl.signal,
 				});
@@ -335,7 +337,7 @@ test("both relays cut: exactly two attempts, client still gets a terminal marker
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -397,7 +399,7 @@ test("tool-call turn cut mid-stream never re-fires: no duplicate execution", asy
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					// The caller advertises fetch_docs (production-shaped): the cloak must
 					// pass its calls through with markers intact so the resume veto sees
 					// them. A tool-less caller would have them stripped as injected.
@@ -516,7 +518,7 @@ test("mid-stream response.failed server_error text-only re-fires once; client ge
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -584,7 +586,7 @@ test("mid-stream response.failed server_error after tool calls never re-fires", 
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: JSON.stringify({ model: MODEL, stream: true, input: "tool turn", tools: [{ type: "function", name: "fetch_docs", description: "fetch docs", parameters: { type: "object", properties: {} } }] }),
 				});
 				assert.equal(res.status, 200);
@@ -652,6 +654,35 @@ function failedEmptyStream(): Response {
 	);
 }
 
+/** 200 SSE response that rate-limits before any output delta. */
+function failedRateLimitStream(): Response {
+	return new Response(
+		new ReadableStream({
+			start(controller) {
+				controller.enqueue(enc.encode(created));
+				controller.enqueue(enc.encode('event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"Rate limit exceeded, retry later"}}}\n\n'));
+				controller.close();
+			},
+		}),
+		{ status: 200, headers: { "content-type": "text/event-stream" } },
+	);
+}
+
+/** 200 SSE response that announces a tool call, then rate-limits. */
+function failedRateLimitToolStream(): Response {
+	return new Response(
+		new ReadableStream({
+			start(controller) {
+				controller.enqueue(enc.encode(created));
+				controller.enqueue(enc.encode('data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"fetch_docs","call_id":"call_rl"}}\n\n'));
+				controller.enqueue(enc.encode('event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"Rate limit exceeded, retry later"}}}\n\n'));
+				controller.close();
+			},
+		}),
+		{ status: 200, headers: { "content-type": "text/event-stream" } },
+	);
+}
+
 /** Caller-owned arguments delta (no item marker), then a transient failure. */
 function failedArgsOnlyStream(): Response {
 	return new Response(
@@ -670,6 +701,256 @@ function failedArgsOnlyStream(): Response {
 function toolBody(): string {
 	return JSON.stringify({ model: MODEL, stream: true, input: "tool turn", tools: [{ type: "function", name: "fetch_docs", description: "fetch docs", parameters: { type: "object", properties: {} } }] });
 }
+
+test("pre-stream relay 429 rolls before headers; the SSE client sees one uninterrupted stream", async () => {
+	await withIsolatedSandboxFiles(async () => {
+		clearSandboxFiles();
+		const priorState = getActiveRelayState();
+		seedPool();
+		const { server, port } = await startProxy(PROXY_PORT);
+		const effectivePort = port ?? PROXY_PORT;
+		const localPrefix = `http://127.0.0.1:${effectivePort}`;
+		const realFetch = globalThis.fetch.bind(globalThis);
+		const hits: Record<string, number> = {};
+		try {
+			const fetchMock = test.mock.method(
+				globalThis,
+				"fetch",
+				async (url: unknown, init?: RequestInit) => {
+					const u = String(url);
+					if (u.startsWith(localPrefix)) return realFetch(u, init);
+					if (u.startsWith(RELAY_A)) {
+						hits.A = (hits.A ?? 0) + 1;
+						return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded", message: "Too Many Requests" } }), {
+							status: 429,
+							headers: { "content-type": "application/json" },
+						});
+					}
+					if (u.startsWith(RELAY_B)) {
+						hits.B = (hits.B ?? 0) + 1;
+						return fullStream();
+					}
+					throw new Error(`unexpected upstream fetch in test: ${u}`);
+				},
+			);
+			try {
+				const res = await fetch(`${localPrefix}/v1/responses`, {
+					method: "POST",
+					headers: { "content-type": "application/json", ...authHeaders() },
+					body: streamBody(),
+				});
+				assert.equal(res.status, 200, "the pre-stream 429 must never reach the SSE client");
+				const text = await res.text();
+				assert.ok(text.includes("hello complete"), `the sibling stream must serve, got tail: ${text.slice(-300)}`);
+				assert.ok(text.includes("response.completed"), `the turn must complete, got tail: ${text.slice(-300)}`);
+				assert.ok(!text.includes("rate_limit_exceeded"), "no rate-limit verdict may leak before the stream starts");
+				assert.equal(hits.A, 1);
+				assert.equal(hits.B, 1, `the pre-stream 429 must roll once, saw ${JSON.stringify(hits)}`);
+				const health = getRelayHealth(RELAY_A);
+				assert.equal(health?.lastStatus, 429);
+			} finally {
+				fetchMock.mock.restore();
+			}
+		} finally {
+			_resetUpstreamHealthForTest();
+			resetAllRelayHealth();
+			setActiveRelayState(priorState, false);
+			if (server) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				server.close(() => resolve());
+				await promise;
+			}
+		}
+	});
+});
+
+test("mid-stream rate limit before output re-fires on a sibling; client never sees the 429", async () => {
+	await withIsolatedSandboxFiles(async () => {
+		clearSandboxFiles();
+		const priorState = getActiveRelayState();
+		seedPool();
+		const statsBefore = getMidStreamFaultStats();
+		const { server, port } = await startProxy(PROXY_PORT);
+		const effectivePort = port ?? PROXY_PORT;
+		const localPrefix = `http://127.0.0.1:${effectivePort}`;
+		const realFetch = globalThis.fetch.bind(globalThis);
+		const hits: Record<string, number> = {};
+		try {
+			const fetchMock = test.mock.method(
+				globalThis,
+				"fetch",
+				async (url: unknown, init?: RequestInit) => {
+					const u = String(url);
+					if (u.startsWith(localPrefix)) return realFetch(u, init);
+					if (u.startsWith(RELAY_A)) {
+						hits.A = (hits.A ?? 0) + 1;
+						return failedRateLimitStream();
+					}
+					if (u.startsWith(RELAY_B)) {
+						hits.B = (hits.B ?? 0) + 1;
+						return fullStream();
+					}
+					throw new Error(`unexpected upstream fetch in test: ${u}`);
+				},
+			);
+			try {
+				const res = await fetch(`${localPrefix}/v1/responses`, {
+					method: "POST",
+					headers: { "content-type": "application/json", ...authHeaders() },
+					body: streamBody(),
+				});
+				assert.equal(res.status, 200);
+				const text = await res.text();
+				assert.ok(
+					text.includes("hello complete"),
+					`the sibling relay must continue the turn, got tail: ${text.slice(-300)}`,
+				);
+				assert.ok(
+					text.includes("response.completed"),
+					`the rescued turn must end cleanly, got tail: ${text.slice(-300)}`,
+				);
+				assert.ok(
+					!text.includes("rate_limit_exceeded"),
+					"the held 429 frame must be dropped after a successful rescue",
+				);
+				assert.equal(hits.A, 1);
+				assert.equal(hits.B, 1, `the rate limit must roll to the sibling, saw ${JSON.stringify(hits)}`);
+				const health = getRelayHealth(RELAY_A);
+				assert.equal(health?.lastStatus, 429, "the rate-limited relay must cool with a 429 verdict");
+				assert.ok((health?.cooldownUntil ?? 0) > Date.now(), "the rate-limited relay must be in cooldown");
+				const statsAfter = getMidStreamFaultStats();
+				assert.equal(
+					statsAfter.rateLimitFaults - statsBefore.rateLimitFaults,
+					1,
+					"a rescued rate limit is one rate-limit fault",
+				);
+				assert.equal(
+					statsAfter.modelFaults - statsBefore.modelFaults,
+					0,
+					"a rate limit is not a model fault",
+				);
+			} finally {
+				fetchMock.mock.restore();
+			}
+		} finally {
+			_resetUpstreamHealthForTest();
+			resetAllRelayHealth();
+			setActiveRelayState(priorState, false);
+			if (server) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				server.close(() => resolve());
+				await promise;
+			}
+		}
+	});
+});
+
+test("mid-stream rate limit after a tool call never re-fires: genuine verdict reaches the caller", async () => {
+	await withIsolatedSandboxFiles(async () => {
+		clearSandboxFiles();
+		const priorState = getActiveRelayState();
+		seedPool();
+		const statsBefore = getMidStreamFaultStats();
+		const { server, port } = await startProxy(PROXY_PORT);
+		const effectivePort = port ?? PROXY_PORT;
+		const localPrefix = `http://127.0.0.1:${effectivePort}`;
+		const realFetch = globalThis.fetch.bind(globalThis);
+		const hits: Record<string, number> = {};
+		try {
+			const fetchMock = test.mock.method(
+				globalThis,
+				"fetch",
+				async (url: unknown, init?: RequestInit) => {
+					const u = String(url);
+					if (u.startsWith(localPrefix)) return realFetch(u, init);
+					if (u.startsWith(RELAY_A)) {
+						hits.A = (hits.A ?? 0) + 1;
+						return failedRateLimitToolStream();
+					}
+					if (u.startsWith(RELAY_B)) {
+						hits.B = (hits.B ?? 0) + 1;
+						return fullStream();
+					}
+					throw new Error(`unexpected upstream fetch in test: ${u}`);
+				},
+			);
+			try {
+				const res = await fetch(`${localPrefix}/v1/responses`, {
+					method: "POST",
+					headers: { "content-type": "application/json", ...authHeaders() },
+					body: toolBody(),
+				});
+				assert.equal(res.status, 200);
+				const text = await res.text();
+				assert.ok(
+					text.includes("rate_limit_exceeded"),
+					`the genuine rate-limit verdict must reach the caller, got tail: ${text.slice(-300)}`,
+				);
+				assert.ok(!text.includes("response.completed"), "no relay completed the tool turn");
+				assert.equal(hits.A, 1);
+				assert.equal(hits.B ?? 0, 0, `a re-fire would re-execute the forwarded call, saw ${JSON.stringify(hits)}`);
+				assert.equal(
+					getMidStreamFaultStats().rateLimitFaults - statsBefore.rateLimitFaults,
+					0,
+					"a vetoed rate-limit hold must not count as a rescue",
+				);
+			} finally {
+				fetchMock.mock.restore();
+			}
+		} finally {
+			_resetUpstreamHealthForTest();
+			resetAllRelayHealth();
+			setActiveRelayState(priorState, false);
+			if (server) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				server.close(() => resolve());
+				await promise;
+			}
+		}
+	});
+});
+
+test("rate-limit frames are retriable; quota/auth/billing stay terminal", () => {
+	const frame = (code: string, message: string): string =>
+		`event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"code":"${code}","message":"${message}"}}}`;
+	assert.equal(
+		isRetriableRateLimitFrame(frame("rate_limit_exceeded", "Rate limit exceeded, retry later")),
+		true,
+		"a 429 rate limit is per-egress and may be served by a sibling relay",
+	);
+	assert.equal(
+		isRetriableRateLimitFrame('data: {"error":{"code":"rate_limit_exceeded","message":"Too Many Requests"}}\n\n'),
+		true,
+		"the chat-completions error shape is retriable too",
+	);
+	assert.equal(
+		isRetriableRateLimitFrame('data: {"error":{"message":"Shared free-tier IP quota reached"}}\n\n'),
+		true,
+		"the free-tier 429 wording is a rate limit",
+	);
+	assert.equal(
+		isRetriableRateLimitFrame(frame("insufficient_quota", "quota exceeded for this project")),
+		false,
+		"a hard quota verdict must never be replayed",
+	);
+	assert.equal(
+		isRetriableRateLimitFrame(frame("billing_hard_limit", "billing limit reached")),
+		false,
+		"a billing verdict must never be replayed",
+	);
+	assert.equal(
+		isRetriableRateLimitFrame('data: {"delta":"rate limit is a concept, not an error"}\n\n'),
+		false,
+		"ordinary model prose mentioning rate limit is not an error frame",
+	);
+	assert.equal(
+		isRetriableRateLimitFrame(
+			'data: {"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"HTTP 429 means rate limit exceeded"}]}]}}\n\n',
+		),
+		false,
+		"a completed response echoes error:null and its own prose, never a rate-limit frame",
+	);
+});
 
 test("deterministic response.failed verdicts never re-fire: forwarded verbatim, one attempt", async () => {
 	await withIsolatedSandboxFiles(async () => {
@@ -703,7 +984,7 @@ test("deterministic response.failed verdicts never re-fire: forwarded verbatim, 
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -816,7 +1097,7 @@ test("failed rescue forwards the genuine upstream verdict: exactly two attempts,
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -892,7 +1173,7 @@ test("empty-output transient frame on a text-only turn still re-fires", async ()
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -960,7 +1241,7 @@ test("transient failure after an arguments-delta-only tool turn never re-fires",
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: toolBody(),
 				});
 				assert.equal(res.status, 200);
@@ -1046,6 +1327,77 @@ function flowTicks(n = 5): Promise<void> {
 async function untilRefire(calls: { n: number }): Promise<void> {
 	for (let i = 0; i < 200 && calls.n === 0; i++) await flowTicks(1);
 }
+
+test("a completed event with error:null and rate-limit prose is forwarded, never replayed", async () => {
+	await withIsolatedSandboxFiles(async () => {
+		clearSandboxFiles();
+		_resetMidStreamFaultStatsForTest();
+		_resetSseStatsForTest();
+		try {
+			const upstream = new PassThrough();
+			const req = mockPipeReq();
+			const res = new MockPipeRes();
+			const refireCalls = { n: 0 };
+			pipeUpstreamStream(
+				upstream,
+				res as unknown as http.ServerResponse,
+				req as unknown as http.IncomingMessage,
+				"edge-completed-prose",
+				undefined,
+				undefined,
+				{ refire: async () => { refireCalls.n += 1; return null; } },
+			);
+			upstream.write(
+				`${created}event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"HTTP 429 means rate limit exceeded"}]}]}}\n\n`,
+			);
+			upstream.end();
+			await flowTicks(20);
+			assert.equal(refireCalls.n, 0, "a completed turn must never be re-fired");
+			assert.ok(res.text().includes("response.completed"), "the completed event reaches the client");
+			assert.ok(!res.text().includes("response.incomplete"), "no synthetic terminal replaces a clean completion");
+			assert.equal(res.writableEnded, true, "the completed stream ends");
+		} finally {
+			_resetMidStreamFaultStatsForTest();
+			_resetSseStatsForTest();
+		}
+	});
+});
+
+test("failed rate-limit rescue releases the genuine frame and ends the response", async () => {
+	await withIsolatedSandboxFiles(async () => {
+		clearSandboxFiles();
+		_resetMidStreamFaultStatsForTest();
+		_resetSseStatsForTest();
+		try {
+			const upstream = new PassThrough();
+			const req = mockPipeReq();
+			const res = new MockPipeRes();
+			const refireCalls = { n: 0 };
+			pipeUpstreamStream(
+				upstream,
+				res as unknown as http.ServerResponse,
+				req as unknown as http.IncomingMessage,
+				"edge-rate-limit-rescue-fail",
+				undefined,
+				undefined,
+				{ refire: async () => { refireCalls.n += 1; return null; } },
+			);
+			upstream.write(`${created}data: {"error":{"message":"Rate limit exceeded, retry later"}}\n\n`);
+			upstream.end();
+			await flowTicks(20);
+			assert.equal(refireCalls.n, 1, "the 429 frame offers exactly one rescue");
+			assert.ok(res.text().includes("Rate limit exceeded"), "the genuine verdict reaches the client");
+			assert.ok(
+				res.text().includes("[DONE]") || res.text().includes("response.incomplete"),
+				"the released stream gets a terminal marker before the socket closes",
+			);
+			assert.equal(res.writableEnded, true, "the cut stream's FIN was consumed by the rescue; the response must still end");
+		} finally {
+			_resetMidStreamFaultStatsForTest();
+			_resetSseStatsForTest();
+		}
+	});
+});
 
 test("every tool-call marker shape vetoes the mid-stream re-fire", async () => {
 	const shapes: Array<[string, string]> = [
@@ -1207,6 +1559,98 @@ test("cut stream's late events after successful rescue cannot corrupt the rescue
 	});
 });
 
+test("a tail-framed 429 hold leaves the turn to the rescue, not a synthetic terminal", async () => {
+	await withIsolatedSandboxFiles(async () => {
+		clearSandboxFiles();
+		_resetMidStreamFaultStatsForTest();
+		_resetSseStatsForTest();
+		try {
+			const cutStream = new PassThrough();
+			const replacement = new PassThrough();
+			const req = mockPipeReq();
+			const res = new MockPipeRes();
+			const refireCalls = { n: 0 };
+			let releaseRefire: (s: Readable | null) => void = () => { };
+			const refireGate = new Promise<Readable | null>((resolve) => { releaseRefire = resolve; });
+			pipeUpstreamStream(
+				cutStream,
+				res as unknown as http.ServerResponse,
+				req as unknown as http.IncomingMessage,
+				"edge-tail-rate-limit",
+				undefined,
+				undefined,
+				{ refire: async () => { refireCalls.n += 1; return refireGate; } },
+			);
+			// The 429 is the trailing block with no blank-line terminator: the
+			// onEnd tail flush starts the hold, and onEnd must stop there.
+			cutStream.write(`${created}data: {"error":{"message":"Rate limit exceeded, retry later"}}`);
+			cutStream.end();
+			await untilRefire(refireCalls);
+			assert.equal(refireCalls.n, 1, "the tail frame offers exactly one rescue");
+			await flowTicks();
+			assert.equal(res.writableEnded, false, "the pending rescue must own the response");
+			assert.ok(!res.text().includes("response.incomplete"), "no synthetic terminal may land mid-rescue");
+			releaseRefire(replacement);
+			await flowTicks();
+			replacement.write(`${created}data: {"type":"response.output_text.delta","delta":"rescued"}\n\n`);
+			replacement.write(completed);
+			replacement.end();
+			await flowTicks(10);
+			const text = res.text();
+			assert.ok(text.includes("rescued") && text.includes("response.completed"), "the rescue completes the turn");
+			assert.ok(!text.includes("rate_limit_exceeded"), "the held 429 is dropped after a successful rescue");
+			assert.equal(res.writableEnded, true, "the rescued turn ends exactly once");
+			assert.equal(refireCalls.n, 1, "the rescue never loops");
+		} finally {
+			resetAllRelayHealth();
+			_resetMidStreamFaultStatsForTest();
+			_resetSseStatsForTest();
+		}
+	});
+});
+
+test("blocks after a held 429 in the same chunk are not forwarded", async () => {
+	await withIsolatedSandboxFiles(async () => {
+		clearSandboxFiles();
+		_resetMidStreamFaultStatsForTest();
+		_resetSseStatsForTest();
+		try {
+			const cutStream = new PassThrough();
+			const replacement = new PassThrough();
+			const req = mockPipeReq();
+			const res = new MockPipeRes();
+			const refireCalls = { n: 0 };
+			let releaseRefire: (s: Readable | null) => void = () => { };
+			const refireGate = new Promise<Readable | null>((resolve) => { releaseRefire = resolve; });
+			pipeUpstreamStream(
+				cutStream,
+				res as unknown as http.ServerResponse,
+				req as unknown as http.IncomingMessage,
+				"edge-held-frame-tail-block",
+				undefined,
+				undefined,
+				{ refire: async () => { refireCalls.n += 1; return refireGate; } },
+			);
+			cutStream.write(`${created}data: {"error":{"message":"Rate limit exceeded, retry later"}}\n\ndata: {"type":"response.output_text.delta","delta":"CUT-TRAIL"}\n\n`);
+			await untilRefire(refireCalls);
+			assert.ok(!res.text().includes("CUT-TRAIL"), "the cut stream's next block must not interleave with the rescue");
+			releaseRefire(replacement);
+			await flowTicks();
+			replacement.write(`${created}data: {"type":"response.output_text.delta","delta":"rescued"}\n\n`);
+			replacement.write(completed);
+			replacement.end();
+			await flowTicks(10);
+			assert.ok(res.text().includes("rescued") && res.text().includes("response.completed"), "the rescue completes the turn");
+			assert.ok(!res.text().includes("CUT-TRAIL"), "the stale block stays out of the rescued turn");
+			assert.equal(refireCalls.n, 1, "exactly one rescue");
+		} finally {
+			resetAllRelayHealth();
+			_resetMidStreamFaultStatsForTest();
+			_resetSseStatsForTest();
+		}
+	});
+});
+
 test("relayTruncations counts only genuine transport cuts", async () => {
 	await withIsolatedSandboxFiles(async () => {
 		clearSandboxFiles();
@@ -1317,7 +1761,7 @@ test("held failure with a dead rescue relay still forwards the genuine verdict",
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: streamBody(),
 				});
 				assert.equal(res.status, 200);
@@ -1402,7 +1846,7 @@ test("mid-stream failure with chunk boundary split mid-delta preserves SSE frami
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: JSON.stringify({
 						model: MODEL,
 						stream: true,
@@ -1491,7 +1935,7 @@ test("mid-stream cut mid-delta with dead rescue relay terminates cleanly without
 			try {
 				const res = await fetch(`${localPrefix}/v1/responses`, {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: { "content-type": "application/json", ...authHeaders() },
 					body: JSON.stringify({
 						model: MODEL,
 						stream: true,

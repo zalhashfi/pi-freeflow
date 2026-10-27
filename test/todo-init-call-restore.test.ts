@@ -9,7 +9,7 @@
  * non-empty items are absent — i.e. a bare `{ op: "init" }`.
  *
  * Proves the proxy is lossless for todo: the OMP caller marker makes the
- * request OMP-like (injectedReal), so todo calls execute downstream and are
+ * request OMP-like, so todo calls execute downstream and are
  * never cloaked as fingerprint placeholders; list/items arguments ride
  * verbatim through the aggregate (convertSseToJson) and streaming
  * (rewriteSseBlock) cloaks. The bare-init control passes through unchanged,
@@ -35,7 +35,7 @@ function responsesTool(name: string, description: string, parameters: unknown): 
 /** OMP-like caller body: todo marker + one fingerprint slot covered. */
 function todoCallerBody(): Record<string, unknown> {
 	return {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		stream: false,
 		tools: [
@@ -68,7 +68,6 @@ test("todo caller is OMP-like: canonical name survives, only edit cloaked", () =
 	assert.equal(r.callerHadTools, true);
 	assert.deepEqual(r.injected, ["edit"]);
 	assert.ok(!r.injected.includes("todo"), "todo is a caller tool, never an injected placeholder");
-	assert.ok(!r.injectedReal.includes("todo"), "todo needs no injection: caller declared it");
 	const tools = body.tools as Array<Record<string, unknown>>;
 	assert.ok(tools.some((t) => t.name === "todo"), "todo definition served verbatim");
 	assert.equal(tools.find((t) => t.name === "todo")?.description, "Manage tasks");
@@ -148,7 +147,7 @@ test("bare init control passes through unchanged (error is model-sent, not strip
 
 test("normalizeResponsesBody leaves todo tools alone (spark effort clamp only)", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		reasoning: { effort: "max" },
 		tools: [responsesTool("todo", "Manage tasks", { type: "object" })],

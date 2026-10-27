@@ -18,6 +18,7 @@
 // keeps activation attached (and the registry offline) during the two tests
 // below that boot the real extension.
 import { harnessFetchHandler } from "./user-flow-env.ts";
+import { authHeaders } from "./_auth.ts";
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -128,7 +129,7 @@ test("E2E [2/10] startProxy socket is unref'd so CLI commands exit immediately w
 
  try {
   // Server accepts requests while unref'd
-  const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { ...authHeaders() } });
   assert.equal(res.status, 200);
   const json = (await res.json()) as { object: string; data: Array<{ id: string }> };
   assert.equal(json.object, "list");
@@ -223,24 +224,27 @@ test("E2E [5/10] ensureDaemon seamlessly rebinds when active daemon process is t
 
 test("E2E [6/10] model catalog accurately maps thinking formats and source routing", () => {
  // Canonical resolution
- assert.equal(resolveCanonicalModelId("muse-spark-1.2-contributor-free"), "muse-spark-1.2-contributor-free");
- assert.equal(resolveCanonicalModelId("muse-spark-1.3-contributor-free"), "muse-spark-1.3-contributor-free");
+ assert.equal(resolveCanonicalModelId("cline-super-vl"), "cline/nemotron-3.5-super-vl");
+	assert.equal(resolveCanonicalModelId("beam-free"), "beam-free");
 	assert.equal(resolveCanonicalModelId("mimo-v2.6-flash-free"), "mimo-v2.6-flash-free");
 
  // Kilo models identification
  assert.equal(isKiloModel("dots-3-note-preview"), true);
- assert.equal(isKiloModel("muse-spark-1.2-contributor-free"), false);
+ assert.equal(isKiloModel("cline/nemotron-3.5-super-vl"), false);
 
- // ProviderConfig format verification
+ // ProviderConfig format verification. The catalog carries no
+ // `openai-responses` entry since Cline's Muse Spark 1.3 retired (2026-10-22),
+ // so the responses compat mapping is locked with a synthetic model — every
+ // flavor stays supported for hosts and stale registrations.
  const sampleCatalog: RegisteredModel[] = [
   {
-   id: "muse-spark-1.2-contributor-free",
-   name: "Muse Spark",
+   id: "flavor-fixture-responses",
+   name: "Flavor Fixture Responses",
    api: "openai-responses",
    contextWindow: 128000,
    maxTokens: 4096,
    reasoning: true,
-   source: "opencode",
+   source: "cline",
   },
   {
 			id: "mimo-v2.6-flash-free",
@@ -262,10 +266,10 @@ test("E2E [6/10] model catalog accurately maps thinking formats and source routi
  const cfg = buildProviderConfig(sampleCatalog, 28180);
  assert.equal(cfg.baseUrl, "http://127.0.0.1:28180/v1");
 
- // Muse spark gets openai-responses session format
- const museModel = cfg.models.find((m) => m.id === "muse-spark-1.2-contributor-free");
- assert.ok(museModel);
- assert.equal(museModel?.compat?.sessionAffinityFormat, "openai-nosession");
+ // The responses flavor gets the openai-nosession affinity
+ const responsesModel = cfg.models.find((m) => m.id === "flavor-fixture-responses");
+ assert.ok(responsesModel);
+ assert.equal(responsesModel?.compat?.sessionAffinityFormat, "openai-nosession");
 
  // Kilo models disable developer role & reasoning effort
  const kiloModel = cfg.models.find((m) => m.id === "dots-studio/dots-3-note-preview:free");

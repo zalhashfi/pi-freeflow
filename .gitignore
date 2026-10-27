@@ -39,6 +39,8 @@ pi-freeflow-relay-state.json
 .debug-state.json
 .update-cache.json
 .onboarded
+.toolcall-audit.jsonl
+.toolcall-audit.jsonl.1
 
 # ── Internal Docs & Scratch / Test Scripts ────────────────────────────
 devdocs/

@@ -95,13 +95,12 @@ test("refreshCatalog passes an abortable timeout signal and falls back instead o
 });
 
 /**
- * Static ids an older catalog cache cannot know about: the Cline entries were
- * added after earlier releases wrote their cache, so a legacy list can hold as
- * many entries as the static set while still missing these two ids.
+ * Static ids an older catalog cache cannot know about: the surviving Cline
+ * entry was added after earlier releases wrote their cache, so a legacy list
+ * can hold as many entries as the static set while still missing this id.
  */
 const STATIC_IDS_ABSENT_FROM_LEGACY_CACHE = [
-	"cline-free/muse-spark-1.3-contributor",
-	"z-ai/glm-5.3-flash",
+	"cline/nemotron-3.5-super-vl",
 ];
 
 /** Persist a catalog cache fixture; ageMs > TTL makes it stale (hidden from readCatalogCache). */
@@ -136,10 +135,10 @@ async function withFetch<T>(impl: typeof fetch, run: () => Promise<T>): Promise<
 }
 
 /**
- * Cache fixture imitating a catalog written before the Cline entries existed:
- * every static id except those two, padded with rotated-in upstream frees so
- * the total still matches the static size (the old "cache is big enough"
- * heuristic accepted it).
+ * Cache fixture imitating a catalog written before the surviving Cline entry
+ * existed: every static id except the one above, padded with rotated-in
+ * upstream frees so the total still matches the static size (the old "cache is
+ * big enough" heuristic accepted it).
  */
 function legacyCacheModels(): RegisteredModel[] {
 	const models: RegisteredModel[] = ALL_MODELS.filter(
@@ -212,6 +211,31 @@ test("refreshCatalog overlays a partial cache without losing static ids or the c
 		assert.equal(kept.maxTokens, entry.maxTokens);
 	}
 });
+test("refreshCatalog overlays the cache on a 304 so dynamic ids survive (issue: 304 drops them)", async () => {
+	// A 304 revalidates upstream before any 200 merge, so the cached list is the
+	// only record of a dynamically discovered id this process never merged: the
+	// 304 branch must overlay it exactly like the stale-cache branches, or the
+	// id vanishes from this process's catalog.
+	const dynamic = model("zen-304-dynamic-free", 4242, "opencode");
+	writeCacheFile(
+		[...ALL_MODELS.map((m) => ({ ...m, source: getModelUpstream(m.id) })), dynamic],
+		CATALOG_CACHE_TTL_MS + 60_000,
+	);
+	const requested: string[] = [];
+	const result = await withFetch(
+		async (url) => {
+			requested.push(String(url));
+			return new Response(null, { status: 304, headers: { etag: '"legacy-cache"' } });
+		},
+		() => refreshCatalog(false),
+	);
+	assert.equal(requested.length, 1, "the conditional refresh must revalidate upstream exactly once");
+	const kept = result.find((m) => m.id === dynamic.id);
+	assert.ok(kept, "a 304 must keep the cached dynamic free id");
+	assert.equal(kept.maxTokens, 4242, "the cached row, not a rebuilt one, must survive");
+	assertIdsPresent(result, STATIC_IDS_ABSENT_FROM_LEGACY_CACHE, "a 304 must keep the static base");
+});
+
 test("step-5-preview entries stay dead across both lanes (2026-10-16)", () => {
 	assert.equal(DEAD_MODEL_IDS.has("step-5-preview-free"), true);
 	assert.equal(DEAD_MODEL_IDS.has("stepfun/step-5-preview-free"), true);
@@ -219,6 +243,15 @@ test("step-5-preview entries stay dead across both lanes (2026-10-16)", () => {
 	assert.equal(isFreeCatalogId("stepfun/step-5-preview-free"), false);
 	assert.equal(ALL_MODELS.some((m) => m.id === "step-5-preview-free"), false);
 	assert.equal(ALL_MODELS.some((m) => m.id === "stepfun/step-5-preview-free"), false);
+});
+
+test("both free MiniMax M3.1 Flash endpoints are dead (2026-10-23)", () => {
+	for (const id of ["minimax-m3.1-flash-free", "minimax/minimax-m3.1-flash:free"]) {
+		assert.equal(DEAD_MODEL_IDS.has(id), true, id + " must be dead-listed");
+		assert.equal(isFreeCatalogId(id), false, id + " must never enter the picker");
+		assert.equal(ALL_MODELS.some((m) => m.id === id), false, id + " must not be in the static catalog");
+	}
+	assert.equal(isFreeCatalogId("minimax-m3.1-flash"), false);
 });
 
 test("union-alpha is a dead model id (pruned, never re-enters)", () => {
@@ -273,5 +306,5 @@ test("nemotron-3.5-super-vl-free repairs a reasoning-less dynamic entry (issue #
 	assert.ok(repaired, "the stale row must survive as the repaired static entry");
 	assert.equal(repaired.reasoning, true);
 	assert.equal(repaired.thinkingLevelMap?.xhigh, "xhigh");
-	assert.equal(repaired.maxTokens, 131_072);
+	assert.equal(repaired.maxTokens, 235_929);
 });

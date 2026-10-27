@@ -4,6 +4,7 @@
  */
 import { loadRelayState } from "../src/relay-state.ts";
 import { agent } from "../src/relay.ts";
+import { tokenAuthHeaders } from "../src/token.ts";
 
 const PROXY = "http://127.0.0.1:28180";
 
@@ -34,7 +35,7 @@ async function postBody(model: string, body: Record<string, unknown>, abortAfter
 	try {
 		const res = await fetch(`${PROXY}/v1/chat/completions`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { "content-type": "application/json", ...tokenAuthHeaders() },
 			body: JSON.stringify(body),
 			signal: controller.signal,
 		});
@@ -89,10 +90,7 @@ const plan: Array<() => Promise<ProbeResult>> = [
 	() => probeCtx("laguna-s-2.1-free", "laguna zen ctx", 270_000),      // >262,144 cap → 1M?
 	() => probeCtx("laguna-s-2.1-free", "laguna zen ctx", 520_000),      // beyond half-M → 1M?
 	() => probeCtx("liquid/lfm-2.5-2.6b:free", "lfm ctx", 70_000),       // >65,536 cap → 131K?
-	() => probeCtx("nvidia/nemotron-3-super-120b-a12b:free", "super ctx", 270_000), // >262,144 cap → 1M?
-	() => probeCtx("nvidia/nemotron-3-super-120b-a12b:free", "super ctx", 520_000),
 	() => probeCtx("nvidia/nemotron-3.5-lightning:free", "lightning kilo ctx", 1_050_000), // >1M cap?
-	() => probeCtx("thinkingmachines/inkling:free", "inkling ctx", 1_050_000),    // >1M cap?
 	// ── MAX OUTPUT ladder (cheap) ──
 	() => probeMax("laguna-s-2.1-free", "laguna zen max", 33_000),       // >32,768 cap → 131K?
 	() => probeMax("laguna-s-2.1-free", "laguna zen max", 65_000),
@@ -101,7 +99,6 @@ const plan: Array<() => Promise<ProbeResult>> = [
 	() => probeMax("liquid/lfm-2.5-2.6b:free", "lfm max", 32_768),
 	() => probeMax("nvidia/nemotron-3-ultra-550b-a55b:free", "ultra kilo max", 70_000),  // >65,536 cap
 	() => probeMax("nvidia/nemotron-3.5-lightning:free", "lightning kilo max", 70_000),
-	() => probeMax("nvidia/nemotron-3-super-120b-a12b:free", "super max", 263_000),     // >262,144 cap
 	() => probeMax("stealth/glyph-cluster", "glyph max", 257_000),      // >256,000 cap?
 	() => probeMax("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "nano-omni max", 70_000),
 ];

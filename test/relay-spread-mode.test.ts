@@ -7,13 +7,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { relayFetch } from "../src/relay.ts";
 import {
- getActiveRelayState,
- loadRelayState,
- markRelayFailure,
- orderedRelayCandidates,
- resetAllRelayHealth,
- saveRelayState,
- setActiveRelayState,
+	_resetSpreadCursorForTest,
+	getActiveRelayState,
+	loadRelayState,
+	markRelayFailure,
+	orderedRelayCandidates,
+	resetAllRelayHealth,
+	saveRelayState,
+	setActiveRelayState,
 } from "../src/relay-state.ts";
 import type { RelayState } from "../src/types.ts";
 import { withIsolatedRelayFiles } from "./_sandbox-helpers.ts";
@@ -119,4 +120,32 @@ test("loadRelayState accepts the spread mode from disk", async () => {
   saveRelayState(poolState("spread"));
   assert.equal(loadRelayState().mode, "spread");
  }, { onRestore: () => resetAllRelayHealth() });
+});
+
+test("round-robin: forceRoundRobin rotates across healthy relays even in auto mode", async () => {
+	await withIsolatedRelayFiles(async () => {
+		_resetSpreadCursorForTest();
+		setActiveRelayState(poolState("auto"), false);
+		const seen = new Set<string>();
+		for (let i = 0; i < POOL.length; i++) {
+			seen.add(orderedRelayCandidates(undefined, undefined, true)[0]);
+		}
+		assert.equal(seen.size, POOL.length, "forced round-robin must cover every healthy relay in auto mode");
+	}, { onRestore: () => resetAllRelayHealth() });
+});
+
+test("round-robin: relayFetch with roundRobin affinity does not rewrite sticky primary in auto mode", async () => {
+	await withIsolatedRelayFiles(async () => {
+		_resetSpreadCursorForTest();
+		resetAllRelayHealth();
+		setActiveRelayState(poolState("auto"), false);
+		test.mock.method(globalThis, "fetch", async () => stubResponse(200));
+		await relayFetch("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions", {}, "ovh-rid-1", { roundRobin: true });
+		await relayFetch("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions", {}, "ovh-rid-2", { roundRobin: true });
+		assert.equal(
+			getActiveRelayState().url,
+			POOL[0],
+			"forced round-robin requests (like OVH) must not overwrite the sticky primary relay",
+		);
+	}, { onRestore: () => resetAllRelayHealth() });
 });

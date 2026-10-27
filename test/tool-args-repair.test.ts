@@ -408,7 +408,7 @@ test("value-level repair handles the Anthropic parsed-input shape", () => {
 
 test("aggregate responses path repairs the reported payload end to end", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		stream: false,
 		tools: [todoTool()],
@@ -534,6 +534,48 @@ test("chat stream: fragmented arguments are buffered and repaired on the termina
 	assert.deepEqual(args.list.map((p) => p.phase), ["Research", "Synthesis"]);
 });
 
+test("chat stream: argument fragment riding the terminal finish_reason chunk is absorbed without rotation or duplication", () => {
+	const half = Math.floor(REPORTED.length / 2);
+	const body = runBlocks(
+		[
+			`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "todo", arguments: REPORTED.slice(0, half) } }] } }] })}`,
+			`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: REPORTED.slice(half) } }] }, finish_reason: "tool_calls" }] })}`,
+		],
+		"/v1/chat/completions",
+	);
+	const flushed = body.split("\n\n").filter((block) => block.includes('"finish_reason":"tool_calls"'));
+	assert.equal(flushed.length, 1, "one terminal chunk carries the flushed call");
+	const chunk = JSON.parse(flushed[0].slice(flushed[0].indexOf("data: ") + 6));
+	assert.equal(chunk.choices[0].delta.tool_calls.length, 1, "exactly one tool call on terminal chunk");
+	const rawArgs = chunk.choices[0].delta.tool_calls[0].function.arguments;
+	const args = JSON.parse(rawArgs) as { list: Array<{ phase: string }> };
+	assert.deepEqual(args.list.map((p) => p.phase), ["Research", "Synthesis"]);
+});
+
+test("chat stream: terminal chunk fragment with multibyte CJK, emoji, and escaped quotes resolves cleanly", () => {
+	const payload = JSON.stringify({
+		op: "init",
+		items: ["研究 🚀 \"quoted text\" \n newline", "東京🗼"],
+	});
+	const splitIdx = payload.indexOf("東京");
+	const part1 = payload.slice(0, splitIdx);
+	const part2 = payload.slice(splitIdx);
+	const body = runBlocks(
+		[
+			`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "todo", arguments: part1 } }] } }] })}`,
+			`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: part2 } }] }, finish_reason: "tool_calls" }] })}`,
+		],
+		"/v1/chat/completions",
+	);
+	const flushed = body.split("\n\n").filter((block) => block.includes('"finish_reason":"tool_calls"'));
+	assert.equal(flushed.length, 1);
+	const chunk = JSON.parse(flushed[0].slice(flushed[0].indexOf("data: ") + 6));
+	assert.equal(chunk.choices[0].delta.tool_calls.length, 1);
+	const args = JSON.parse(chunk.choices[0].delta.tool_calls[0].function.arguments) as { op: string; items: string[] };
+	assert.equal(args.op, "init");
+	assert.deepEqual(args.items, ["研究 🚀 \"quoted text\" \n newline", "東京🗼"]);
+});
+
 test("chat stream: a tool the caller never declared a schema for keeps streaming incrementally", () => {
 	// A tool absent from argSchemas (here: not one this request declared) must
 	// not be buffered — its arguments flow through on the original delta. Every
@@ -655,4 +697,55 @@ test("messages stream: arguments survive a block that never stops", () => {
 	const args = JSON.parse(JSON.parse(blocks[0].slice(blocks[0].indexOf("data: ") + 6)).delta.partial_json) as { list: Array<{ phase: string }> };
 	assert.deepEqual(args.list.map((p) => p.phase), ["Research", "Synthesis"]);
 	assert.ok(closing!.indexOf("input_json_delta") < closing!.indexOf("message_stop"), "the recovered input precedes message_stop");
+});
+
+test("a brace-heavy payload beyond the salvage budget answers fast instead of scanning quadratically", () => {
+	// The salvage re-slices and re-parses at every top-level brace, so a
+	// brace-heavy emission costs O(candidates x payload): measured 2092 ms for
+	// this 83 KB payload (34.5 s at 80 KB in a live capture) on the
+	// single-threaded proxy, and the scan even returned a salvage it then had
+	// to discard. The bound refuses the scan and hands the payload back
+	// unharmed, so the host answers with its own schema error instead.
+	const bash = buildArgRepairSchemas([
+		{
+			type: "function",
+			name: "bash",
+			description: "Run a shell command",
+			parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+		},
+	]);
+	const huge = '{"command":"check"}'.repeat(4_400);
+	assert.ok(huge.length > 64 * 1024, `payload must exceed the byte budget, got ${huge.length}`);
+	const started = performance.now();
+	const out = repairToolArguments("bash", huge, bash);
+	const elapsedMs = performance.now() - started;
+	assert.equal(out, huge, "nothing salvaged: the payload rides through unchanged");
+	assert.ok(elapsedMs < 1000, `the bound must keep this under 1 s, took ${Math.round(elapsedMs)} ms`);
+
+	// Under the byte budget the candidate cap carries the bound: a complete
+	// call sitting behind 200 junk objects lies past the offered offsets, so it
+	// is never handed to the parser (a live glue is one short echo, not 200).
+	const capped = `${'{"a":1}'.repeat(200)}{"command":"check"}`;
+	assert.equal(repairToolArguments("bash", capped, bash), capped, "past the candidate cap nothing is salvaged");
+});
+
+test("the salvage still repairs the live glue shapes under the bounds", () => {
+	// The bound must not cost the shapes it exists for: a short echo in front
+	// of the caller's own object, and the same with its closing brace missing.
+	const bash = buildArgRepairSchemas([
+		{
+			type: "function",
+			name: "bash",
+			description: "Run a shell command",
+			parameters: { type: "object", properties: { i: { type: "string" }, command: { type: "string" }, timeout: { type: "number" }, cwd: { type: "string" } }, required: ["command"] },
+		},
+	]);
+	assert.deepEqual(
+		JSON.parse(repairToolArguments("bash", '{"async":true}{"command":"ls","timeout":180}', bash)),
+		{ command: "ls", timeout: 180 },
+	);
+	assert.deepEqual(
+		JSON.parse(repairToolArguments("bash", 'reelane-proxy"}{"i": "Confirming the files", "command": "git status --short"}', bash)),
+		{ i: "Confirming the files", command: "git status --short" },
+	);
 });

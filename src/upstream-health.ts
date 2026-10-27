@@ -11,14 +11,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { renameWithRetry } from "./atomic-write.ts";
 import { getAliveCatalog } from "./catalog.ts";
 import { resolveUpstreamHealthPath } from "./config.ts";
 import { log } from "./logger.ts";
 import { getStatusUi } from "./relay-state.ts";
 
-export type UpstreamName = "zen" | "kilo";
+type UpstreamName = "zen" | "kilo";
 
-export interface UpstreamHealthSnapshot {
+interface UpstreamHealthSnapshot {
  gated: boolean;
  consecutiveFreeTier403: number;
  firstGatedAt: number;
@@ -26,15 +27,16 @@ export interface UpstreamHealthSnapshot {
  lastCanaryAt: number;
 }
 
-export const GATE_ENTER_AFTER = 2;
-export const FALLBACK_KILO_MODEL = "nvidia/nemotron-3.5-lightning:free";
+const GATE_ENTER_AFTER = 2;
+const FALLBACK_KILO_MODEL = "nvidia/nemotron-3.5-lightning:free";
 
-export type ZenRoute = "passthrough" | "failover" | "canary";
+type ZenRoute = "passthrough" | "failover" | "canary";
 
-/** Free-tier gate marker: the free tier only works from inside OpenCode. */
+/** Free-tier gate marker: the free tier only works from inside OpenCode or is blocked by network/VPN abuse detection. */
 const GATE_CODE_MARKER = "FreeTierError";
 const GATE_MESSAGE_MARKER = "only be used from within OpenCode";
-
+const GATE_ABUSIVE_MARKER = "abusive traffic";
+const GATE_NETWORK_MARKER = "aren't available from your current network";
 /** User-visible hint attached to fast-failed 403 gate bodies. */
 const FREE_TIER_HINT =
  "OpenCode's free tier is only available inside OpenCode right now, " +
@@ -178,22 +180,24 @@ function ensureLoaded(): void {
     }
    }
   }
-  for (const name of ["zen", "kilo"] as UpstreamName[]) {
-   const stored = data.gates?.[name];
-   if (stored && typeof stored === "object") {
-    gates.set(name, {
-     gated: stored.gated === true,
-     consecutiveFreeTier403:
-      typeof stored.consecutiveFreeTier403 === "number" &&
-       Number.isFinite(stored.consecutiveFreeTier403)
-       ? Math.max(0, Math.floor(stored.consecutiveFreeTier403))
-       : 0,
-     firstGatedAt: typeof stored.firstGatedAt === "number" ? stored.firstGatedAt : 0,
-     lastTransitionAt:
-      typeof stored.lastTransitionAt === "number" ? stored.lastTransitionAt : 0,
-     lastCanaryAt: typeof stored.lastCanaryAt === "number" ? stored.lastCanaryAt : 0,
-    });
-   }
+  // Only Zen has a failure path — recordUpstreamFailure is called for "zen"
+  // only (proxy.ts) — so a persisted Kilo gate was schema that could never
+  // flip. Legacy state files may still carry it; the dead entry is ignored
+  // on load (not rejected) so those files keep working.
+  const stored = data.gates?.["zen"];
+  if (stored && typeof stored === "object") {
+   gates.set("zen", {
+    gated: stored.gated === true,
+    consecutiveFreeTier403:
+     typeof stored.consecutiveFreeTier403 === "number" &&
+      Number.isFinite(stored.consecutiveFreeTier403)
+      ? Math.max(0, Math.floor(stored.consecutiveFreeTier403))
+      : 0,
+    firstGatedAt: typeof stored.firstGatedAt === "number" ? stored.firstGatedAt : 0,
+    lastTransitionAt:
+     typeof stored.lastTransitionAt === "number" ? stored.lastTransitionAt : 0,
+    lastCanaryAt: typeof stored.lastCanaryAt === "number" ? stored.lastCanaryAt : 0,
+   });
   }
  } catch {
   gates.clear();
@@ -221,8 +225,9 @@ function persist(force: boolean): void {
     version: 1,
     sessions: Object.fromEntries(sessions),
     gates: {
+     // Zen only: it is the only upstream whose gate can trip (see
+     // recordUpstreamFailure). The former Kilo entry was dead schema.
      zen: gates.get("zen") ?? cleanGate(),
-     kilo: gates.get("kilo") ?? cleanGate(),
     },
    },
    null,
@@ -231,7 +236,7 @@ function persist(force: boolean): void {
   const tmp = `${file}.${randomUUID()}.tmp`;
   fs.writeFileSync(tmp, body, "utf8");
   try {
-   fs.renameSync(tmp, file);
+   renameWithRetry(tmp, file);
   } catch {
    try {
     fs.rmSync(tmp, { force: true });
@@ -247,7 +252,7 @@ function persist(force: boolean): void {
  }
 }
 
-export function notifyGateTransition(upstream: UpstreamName, gated?: boolean): void {
+function notifyGateTransition(upstream: UpstreamName, gated?: boolean): void {
  ensureLoaded();
  const isGated = typeof gated === "boolean" ? gated : gateOf(upstream).gated;
  const ui = getStatusUi();
@@ -266,12 +271,14 @@ export function notifyGateTransition(upstream: UpstreamName, gated?: boolean): v
 
 /** True when a status/body pair is the free-tier gate (fresh sessions refused). */
 export function isFreeTierGate(status: number, bodyText: unknown): boolean {
- if (status !== 403 || typeof bodyText !== "string") return false;
- return (
-  bodyText.includes(GATE_CODE_MARKER) && bodyText.includes(GATE_MESSAGE_MARKER)
- );
+	if (status !== 403 || typeof bodyText !== "string") return false;
+	if (!bodyText.includes(GATE_CODE_MARKER)) return false;
+	return (
+		bodyText.includes(GATE_MESSAGE_MARKER) ||
+		bodyText.includes(GATE_ABUSIVE_MARKER) ||
+		bodyText.includes(GATE_NETWORK_MARKER)
+	);
 }
-
 /** Stable conversation key carried by request bodies, if the caller sent one. */
 export function sessionKeyOf(parsedBody: unknown): string | null {
  if (typeof parsedBody !== "object" || parsedBody === null) return null;
@@ -322,9 +329,14 @@ export function rememberGateRejection(
  pathname: string,
  status: number,
  bodyText: unknown,
+ fingerprint?: string,
 ): void {
  if (!isFreeTierGate(status, bodyText)) return;
- const fp = rejectionFingerprint(parsedBody, pathname);
+ // The caller may hand over the fingerprint it took before rewriting the body
+ // it sent (proxy normalizes tools and system prompts in place). The next
+ // attempt of the same conversation is hashed from the caller's own bytes, so a
+ // post-rewrite hash would never match and the retry would replay the refusal.
+ const fp = fingerprint ?? rejectionFingerprint(parsedBody, pathname);
  if (!fp) return;
  const now = Date.now();
  pruneRejected(now);

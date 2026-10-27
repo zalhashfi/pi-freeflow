@@ -25,7 +25,6 @@ import {
 	chatResponsesJsonFromChatCompletion,
 	chatResponsesSseFromChatCompletion,
 	restoreToolNameForCaller,
-	retargetToolChoiceForUpstream,
 	sanitizeUpstreamToolName,
 	toAnthropicTool,
 	toChatTool,
@@ -33,6 +32,7 @@ import {
 	translateToolsForPath,
 	upstreamToolNameFor,
 } from "../src/tool-translation.ts";
+import type { CanonicalTool } from "../src/tool-translation.ts";
 import { withFingerprintTools } from "./_fingerprint.ts";
 
 const PATHS = ["/v1/chat/completions", "/v1/responses", "/v1/messages"] as const;
@@ -400,6 +400,13 @@ function matrixTool(style: "chat" | "responses" | "anthropic", name: string): Re
 	if (style === "responses") return { type: "function", name, description, parameters: params, strict: true, x_extra: `x-${name}` };
 	return { name, description, input_schema: params, strict: true, x_extra: `x-${name}` };
 }
+/** Where `strict` landed on the wire: top-level tool field or in `function`. */
+function strictPlacementOf(out: Record<string, unknown>): "top" | "nested" | "absent" {
+	if (typeof out.strict === "boolean") return "top";
+	const fn = out.function as Record<string, unknown> | undefined;
+	if (fn && typeof fn.strict === "boolean") return "nested";
+	return "absent";
+}
 test("translateToolsForPath: matrix shared + OMP uniques survive verbatim, no additionalProperties", () => {
 	for (const style of ["chat", "responses", "anthropic"] as const) {
 		for (const path of PATHS) {
@@ -409,13 +416,68 @@ test("translateToolsForPath: matrix shared + OMP uniques survive verbatim, no ad
 				assert.equal(upstreamNameOf(out), name, `${style} -> ${path} ${name}: name verbatim`);
 				assert.equal(upstreamDescOf(out), `${name} desc`, `${style} -> ${path} ${name}: description verbatim`);
 				assert.deepEqual(upstreamParamsOf(out), { type: "object", properties: { [name]: { type: "string" } } }, `${style} -> ${path} ${name}: params verbatim`);
-				assert.equal((out as Record<string, unknown>).strict, true, `${style} -> ${path} ${name}: strict verbatim`);
+				// `strict` rides top-level on the Responses/Anthropic shapes and
+				// inside the chat `function` wrapper. A chat-shape caller passes
+				// through verbatim on the chat path and keeps its own placement.
+				const expectedStrict = path === "/v1/chat/completions" && style !== "chat" ? "nested" : "top";
+				assert.equal(strictPlacementOf(out), expectedStrict, `${style} -> ${path} ${name}: strict at the target wire position`);
 				assert.equal((out as Record<string, unknown>).x_extra, `x-${name}`, `${style} -> ${path} ${name}: extra field carried`);
 				assert.ok(!JSON.stringify(upstreamParamsOf(out)).includes("additionalProperties"), `${style} -> ${path} ${name}: never injects additionalProperties`);
 			}
 		}
 	}
 });
+test("contract: toChatTool nests strict inside the chat function wrapper, reader accepts both placements", () => {
+	// The chat wire shape puts `strict` inside the `function` wrapper; the
+	// Responses and Anthropic shapes carry it top-level on the tool object.
+	const strictCanon: CanonicalTool = { name: "todo", description: "plan", parameters: { type: "object" }, strict: true };
+	const chatOut = toChatTool(strictCanon);
+	assert.deepEqual(chatOut, {
+		type: "function",
+		function: { name: "todo", description: "plan", parameters: { type: "object" }, strict: true },
+	}, "chat re-emission lands strict inside the function wrapper");
+	assert.ok(!("strict" in chatOut), "top-level strict is never re-emitted on the chat shape");
+	assert.ok(!("strict" in toChatTool({ name: "todo", description: "plan", parameters: { type: "object" } })), "absent strict stays absent at both levels");
+	assert.deepEqual(toResponsesTool(strictCanon), {
+		type: "function",
+		name: "todo",
+		description: "plan",
+		parameters: { type: "object" },
+		strict: true,
+	}, "responses shape keeps the top-level canonical position");
+	assert.deepEqual(toAnthropicTool(strictCanon), {
+		name: "todo",
+		description: "plan",
+		input_schema: { type: "object" },
+		strict: true,
+	}, "anthropic shape keeps the top-level position");
+
+	// The reader accepts BOTH wire placements so the Responses/Kilo/Anthropic
+	// directions round-trip: a chat-shaped tool that (correctly) carries
+	// nested strict stays executable downstream, and a top-level placement
+	// keeps working for hosts that still spell it that way.
+	const nestedCaller = { type: "function", function: { name: "todo", description: "plan", parameters: { type: "object" }, strict: false } };
+	assert.equal(canonicalizeTool(nestedCaller)?.strict, false, "reader accepts the nested chat placement");
+	const topLevelCaller = { type: "function", function: { name: "todo", description: "plan", parameters: { type: "object" } }, strict: true };
+	assert.equal(canonicalizeTool(topLevelCaller)?.strict, true, "reader still accepts the top-level placement");
+
+	// Round-trip through every direction: nested (chat) -> anthropic (top)
+	// -> chat (nested); and a top-level chat caller -> responses -> chat.
+	const nestedToMessages = translateToolsForPath([nestedCaller], "/v1/messages");
+	assert.equal(strictPlacementOf(nestedToMessages[0]), "top", "nested chat strict re-emits top-level on the anthropic shape");
+	assert.deepEqual(nestedToMessages[0].strict, false);
+	const backToChat = translateToolsForPath(nestedToMessages, "/v1/chat/completions");
+	assert.deepEqual(strictPlacementOf(backToChat[0]), "nested", "anthropic strict re-nests on the chat shape");
+	assert.deepEqual((backToChat[0].function as Record<string, unknown>).strict, false);
+
+	const responsesOrigin = [{ type: "function", name: "todo", description: "plan", parameters: { type: "object" }, strict: true }];
+	const responsesToChat = translateToolsForPath(responsesOrigin, "/v1/chat/completions");
+	assert.deepEqual(strictPlacementOf(responsesToChat[0]), "nested", "responses strict nests on re-emission to chat");
+	const chatToResponses = translateToolsForPath(responsesToChat, "/v1/responses");
+	assert.deepEqual(strictPlacementOf(chatToResponses[0]), "top", "chat nested strict restores top-level on re-emission to responses");
+	assert.deepEqual(chatToResponses[0].strict, true);
+});
+
 test("translateToolsForPath: unknown mcp custom tools survive every shape x path", () => {
 	const names = ["mcp__github__search_code", "my_custom_tool", "xd://browser__open", "some_unknown_tool_xyz"];
 	for (const style of ["chat", "responses", "anthropic"] as const) {
@@ -482,9 +544,6 @@ test("translateToolsForPath: Pi find renames to glob on all shapes, OMP glob unt
 	assert.equal(restoreToolNameForCaller("glob", both), "glob");
 	const none = buildFindGlobRestore([{ type: "function", name: "read", description: "r", parameters: { type: "object" } }]);
 	assert.equal(none.renamedFindToGlob, false);
-	assert.deepEqual(retargetToolChoiceForUpstream({ type: "function", name: "find" }, renamed), { type: "function", name: "glob" });
-	assert.deepEqual(retargetToolChoiceForUpstream({ type: "function", function: { name: "find" } }, renamed), { type: "function", function: { name: "glob" } });
-	assert.equal(retargetToolChoiceForUpstream("auto", renamed), "auto", "tool_choice auto never retargeted");
 });
 test("translateToolsForPath: dup collapse case-insensitive, second translate adds zero", () => {
 	const dupes = [
@@ -593,7 +652,14 @@ test("contract: full Pi inventory round-trips verbatim on all three paths", () =
 			assert.ok(hit, `${path}: keeps caller tool ${cname}`);
 			assert.equal(upstreamDescOf(hit!), `${cname} host tool`, `${path}: ${cname} description verbatim`);
 			assert.deepEqual(upstreamSchemaOf(hit!), (fn.parameters as Record<string, unknown>), `${path}: ${cname} params verbatim`);
-			assert.equal((hit as Record<string, unknown>).strict, true, `${path}: ${cname} strict verbatim`);
+			// `strict` sits at the target wire position; the chat shape nests it
+			// inside the function wrapper (a renamed Pi find is re-emitted there).
+			const hitFn = hit!.function as Record<string, unknown> | undefined;
+			assert.deepEqual(
+				hitFn && typeof hitFn.strict === "boolean" ? hitFn.strict : (hit as Record<string, unknown>).strict,
+				true,
+				`${path}: ${cname} strict verbatim`,
+			);
 			assert.equal((hit as Record<string, unknown>)["x-host"], "pi", `${path}: ${cname} extra field verbatim`);
 		}
 		const restore = buildFindGlobRestore(caller);
@@ -778,7 +844,6 @@ test("contract: OMP gated custom tools are caller tools end-to-end, never cloake
 	const r = enforceOpencodeFingerprint(body, "/v1/responses");
 	assert.equal(r.callerHadTools, true);
 	assert.deepEqual(r.injected, ["edit"], "only the truly-missing edit cloaks; customs never do");
-	assert.deepEqual(r.injectedReal, ["bash", "grep", "read", "write"], "customs never placeholder-injected either");
 	const tools = body.tools as Array<Record<string, unknown>>;
 	assert.equal(tools.length, 9, "4 caller + 5 missing fingerprint tools, zero dropped");
 	for (const n of ["generate_image", "tts"]) {
@@ -959,13 +1024,13 @@ test("a sanitized tool name round-trips through a full streamed response", () =>
 test("chatResponsesSseFromChatCompletion emits response.output_text.delta so UI never sees blank reply", () => {
 	const chat = {
 		id: "chatcmpl_test",
-		model: "cline-free/muse-spark-1.3-contributor",
+		model: "cline/nemotron-3.5-super-vl",
 		choices: [{
 			message: { role: "assistant", content: "Hello from Cline!" },
 			finish_reason: "stop",
 		}],
 	};
-	const resp = chatResponsesJsonFromChatCompletion(chat, "cline-free/muse-spark-1.3-contributor");
+	const resp = chatResponsesJsonFromChatCompletion(chat, "cline/nemotron-3.5-super-vl");
 	const sse = chatResponsesSseFromChatCompletion(resp);
 	assert.ok(sse.includes("event: response.output_text.delta"), "must emit response.output_text.delta");
 	assert.ok(sse.includes("Hello from Cline!"), "must carry the assistant text");
@@ -976,13 +1041,13 @@ test("chatResponsesSseFromChatCompletion emits response.output_text.delta so UI 
 test("chatResponsesSseFromChatCompletion frames the message item so hosts keep the text", () => {
 	const chat = {
 		id: "chatcmpl_frames",
-		model: "cline-free/muse-spark-1.3-contributor",
+		model: "cline/nemotron-3.5-super-vl",
 		choices: [{
 			message: { role: "assistant", content: "Hello from Cline!" },
 			finish_reason: "stop",
 		}],
 	};
-	const resp = chatResponsesJsonFromChatCompletion(chat, "cline-free/muse-spark-1.3-contributor");
+	const resp = chatResponsesJsonFromChatCompletion(chat, "cline/nemotron-3.5-super-vl");
 
 	const frames = chatResponsesSseFromChatCompletion(resp)
 		.split("\n\n")

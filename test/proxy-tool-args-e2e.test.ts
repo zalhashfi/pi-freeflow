@@ -12,9 +12,10 @@ import {
 	_resetUpstreamHealthForTest,
 } from "../src/upstream-health.ts";
 import { startProxy } from "../src/proxy.ts";
+import { authHeaders } from "./_auth.ts";
 
-const CHAT_MODEL = "muse-spark-1.2-contributor-free";
-const RESPONSES_MODEL = "muse-spark-1.3-contributor-free";
+const CHAT_MODEL = "mimo-v2.6-flash-free";
+const RESPONSES_MODEL = "nemotron-3.5-super-vl-free";
 
 /** The malformation reproduced live from the free models (see tool-args-repair). */
 const MALFORMED = '{"op":"init","phases":[{"name":"Research","tasks":["Map repo structure"]},{"name":"Synthesis","tasks":["Write summary"]}]}';
@@ -58,7 +59,7 @@ function postJson(
 	return new Promise((resolve, reject) => {
 		const data = JSON.stringify(payload);
 		const req = http.request(
-			{ host: "127.0.0.1", port, path, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data) } },
+			{ host: "127.0.0.1", port, path, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data), ...authHeaders() } },
 			(res) => {
 				const chunks: Buffer[] = [];
 				res.on("data", (chunk: Buffer) => chunks.push(chunk));

@@ -49,11 +49,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { startProxy } from "../src/proxy.ts";
 import { getActiveRelayState, setActiveRelayState } from "../src/relay-state.ts";
+import { tokenAuthHeaders } from "../src/token.ts";
 import type { RelayState } from "../src/types.ts";
 
 const RESPONSES_MODELS: Record<string, true> = {
- "muse-spark-1.2-contributor-free": true,
- "muse-spark-1.3-contributor-free": true,
+ "nemotron-3.5-super-vl-free": true,
 };
 const PORT = 29363;
 const PROMPT = "Write a TypeScript LRU cache with JSDoc, ~80 lines, no preamble.";
@@ -87,21 +87,19 @@ interface BenchRow {
  notes: string;
 }
 
-/* Quick pass: 14 cells x {direct, relay} x 1 attempt = 28 rows. */
+/* Quick pass: 11 cells x {direct, relay} x 1 attempt = 22 rows. */
 const CELLS: Cell[] = [
- { model: "muse-spark-1.3-contributor-free", effortLabel: "xhigh", effortSent: "xhigh", perPath: 1 },
- { model: "muse-spark-1.3-contributor-free", effortLabel: "high", effortSent: "high", perPath: 1 },
- { model: "muse-spark-1.2-contributor-free", effortLabel: "xhigh", effortSent: "xhigh", perPath: 1 },
- { model: "muse-spark-1.2-contributor-free", effortLabel: "high", effortSent: "high", perPath: 1 },
+ { model: "nemotron-3.5-super-vl-free", effortLabel: "xhigh", effortSent: "xhigh", perPath: 1 },
+ { model: "nemotron-3.5-super-vl-free", effortLabel: "high", effortSent: "high", perPath: 1 },
  { model: "big-pickle", effortLabel: "max", effortSent: "max", perPath: 1 },
  { model: "big-pickle", effortLabel: "high", effortSent: "high", perPath: 1 },
- { model: "mimo-v2.5-free", effortLabel: "high", effortSent: "high", perPath: 1 },
  { model: "mimo-v2.6-flash-free", effortLabel: "high", effortSent: "high", perPath: 1 },
  { model: "nemotron-3-ultra-free", effortLabel: "high", effortSent: "high", perPath: 1 },
  { model: "nemotron-3.5-lightning-free", effortLabel: "high", effortSent: "high", perPath: 1 },
- { model: "space-bunny-free", effortLabel: "high", effortSent: "high", perPath: 1 },
  { model: "longcat-2.5-preview-free", effortLabel: "high", effortSent: "high", perPath: 1 },
  { model: "ling-3.1-flash-free", effortLabel: "high", effortSent: "high", perPath: 1 },
+ { model: "glm-5.3-flash-free", effortLabel: "high", effortSent: "high", perPath: 1 },
+ { model: "beam-free", effortLabel: "high", effortSent: "high", perPath: 1 },
 ];
 
 function buildPlan(): PlanItem[] {
@@ -363,7 +361,7 @@ async function runAttempt(
  try {
   const res = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
    method: "POST",
-   headers: { "content-type": "application/json" },
+   headers: { "content-type": "application/json", ...tokenAuthHeaders() },
    body: JSON.stringify(body),
    signal: controller.signal,
   });

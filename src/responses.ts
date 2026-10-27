@@ -24,6 +24,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { renameWithRetry } from "./atomic-write.ts";
 import { resolveSessionPinPath } from "./config.ts";
 
 /** Upstream rejection for a reasoning blob issued to a different caller. */
@@ -296,6 +297,12 @@ export function prepareChatFailoverBody(parsedBody: Record<string, unknown>): vo
  if (typeof parsedBody.max_tokens === "number" && parsedBody.max_tokens > KILO_FAILOVER_MAX_OUTPUT_TOKENS) {
   parsedBody.max_tokens = KILO_FAILOVER_MAX_OUTPUT_TOKENS;
  }
+ if (
+  typeof parsedBody.max_completion_tokens === "number" &&
+  parsedBody.max_completion_tokens > KILO_FAILOVER_MAX_OUTPUT_TOKENS
+ ) {
+  parsedBody.max_completion_tokens = KILO_FAILOVER_MAX_OUTPUT_TOKENS;
+ }
 }
 
 /**
@@ -533,7 +540,7 @@ function persistSessionPins(): void {
   const tmp = `${file}.${randomUUID()}.tmp`;
   fs.writeFileSync(tmp, body, "utf8");
   try {
-   fs.renameSync(tmp, file);
+   renameWithRetry(tmp, file);
   } catch {
    try {
     fs.rmSync(tmp, { force: true });

@@ -1,30 +1,58 @@
 /**
  * OpenCode Free-Tier Models Health Checker & Action Bot
  *
- * Probes all OpenCode Zen free-tier models via the local proxy to detect:
- * - 403 FreeTierError
- * - 410 ModelDeprecated
- * - 404 ModelNotFound
- * - Upstream failures / regressions
+ * Probes all OpenCode Zen free-tier models via the local proxy and gives every
+ * sample a severity:
+ * - `dead` — model-level answer (400/401/403/410, or a 404 that is not an
+ *   "Endpoint is unavailable" body): the catalog is wrong, so this alerts.
+ * - `unavailable` — availability fault (402, 408, 429, 5xx, network errors, and
+ *   the 404 "Endpoint is unavailable" answer): retried, never alerts. 402
+ *   belongs here: Zen answers 402 "Endpoint is unavailable" while a model is
+ *   healthy, and issue #107 was filed from exactly that blip.
+ * - `timeout` — the probe's own AbortSignal cap fired: inconclusive, never alerts.
  *
  * Probes stream (chat and responses alike) so a model is healthy on a 2xx status
- * line instead of a whole generation fitting the timeout budget; status-0
- * timeout/network failures get one retry before a model is reported affected.
+ * line instead of a whole generation fitting the timeout budget.
+ *
+ * Every probe carries the installation token: the local proxy requires
+ * `Authorization: Bearer <token>` on /v1/*, and a missing header is a 401 of
+ * ours, not a verdict on the model.
  *
  * CLI options:
  *   --output <file>  Write markdown report to file
- *   --json           Print structured JSON to stdout
+ *   --json           Print structured JSON after the progress lines
+ *   --json-output <file>  Write the same structured JSON as a bare file (no logs)
+ *
+ * Exit codes: 0 = no dead model (healthy, unavailable, and timeout all exit 0),
+ * 1 = at least one dead model, 2 = fatal/infra.
  */
 import fs from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { startProxy } from "../src/proxy.ts";
 import { OPENCODE_MODELS } from "../src/models.ts";
+import { tokenAuthHeaders } from "../src/token.ts";
 import type { ModelDef } from "../src/types.ts";
 
 const BASE_TEST_PORT = 29680;
-const TIMEOUT_MS = 25000;
-/** One attempt plus a single retry, only for status-0 timeout/network failures. */
-const MAX_PROBE_ATTEMPTS = 2;
+export const TIMEOUT_MS = 25000;
+/**
+ * Total attempts per model: the first probe plus two retries for transient
+ * faults. A single non-2xx sample is not evidence of an outage — this runs
+ * from a shared GitHub runner IP, where 402/429 ("Endpoint is unavailable",
+ * "shared free-tier IP quota reached"), 5xx blips, and 404 "Endpoint is
+ * unavailable" answers have all cleared on a later sample. Model-level answers
+ * (410 deprecated, 401 not supported, 404 does not exist) stay single-shot, and
+ * a probe-cap timeout is inconclusive rather than retryable.
+ */
+export const MAX_PROBE_ATTEMPTS = 3;
+/** Delay before each retry, indexed by the attempt that just failed (ms). */
+export const RETRY_BACKOFF_MS = [2000, 5000];
+
+/**
+ * Severity of one probe sample. Only `dead` describes a catalog defect; the
+ * other two degraded verdicts are observations about availability, not models.
+ */
+export type ProbeVerdict = "healthy" | "dead" | "unavailable" | "timeout";
 
 export interface ModelHealthResult {
   id: string;
@@ -32,8 +60,33 @@ export interface ModelHealthResult {
   status: number;
   latencyMs: number;
   healthy: boolean;
+  verdict: ProbeVerdict;
   error?: string;
   attempts?: number;
+}
+
+/**
+ * Classify one finished sample. Pure so the alerting contract can be tested
+ * without a proxy or a network.
+ *
+ * `dead` is the only alert-worthy verdict and must describe the model itself:
+ * the upstream answered that the model is rejected, unauthorized, or missing.
+ * A 404 is only model-level when its body is not the shared
+ * "Endpoint is unavailable" availability answer.
+ */
+export function classifyProbeResult(
+  result: Pick<ModelHealthResult, "healthy" | "status" | "error">,
+): ProbeVerdict {
+  if (result.healthy) return "healthy";
+  const { status } = result;
+  const error = result.error ?? "";
+  if (status === 0) return /abort|timed? ?out|timeout/i.test(error) ? "timeout" : "unavailable";
+  if (status === 404) return /endpoint is unavailable/i.test(error) ? "unavailable" : "dead";
+  if (status === 402 || status === 408 || status === 429 || status >= 500) return "unavailable";
+  // 400/401/403/410 are model-level answers. An unrecognized 4xx (405, 422, …)
+  // is also model-level: surfacing it gets a human look instead of silence.
+  if (status >= 400 && status < 500) return "dead";
+  return "unavailable";
 }
 
 async function startOwnedProxy() {
@@ -56,7 +109,7 @@ async function attemptProbe(
   try {
     const res = await fetchImpl(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...tokenAuthHeaders() },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
@@ -66,7 +119,8 @@ async function attemptProbe(
       // Health is the status line: drop the streaming body instead of waiting for a
       // whole generation to land inside the timeout budget.
       await res.body?.cancel().catch(() => {});
-      return { id: model.id, api, status: res.status, latencyMs, healthy: true };
+      const healthy = { id: model.id, api, status: res.status, latencyMs, healthy: true };
+      return { ...healthy, verdict: classifyProbeResult(healthy) };
     }
 
     const text = await res.text();
@@ -76,7 +130,7 @@ async function attemptProbe(
       errMessage = parsed.error?.message || parsed.message || errMessage;
     } catch { }
 
-    return {
+    const failed = {
       id: model.id,
       api,
       status: res.status,
@@ -84,8 +138,9 @@ async function attemptProbe(
       healthy: false,
       error: errMessage,
     };
+    return { ...failed, verdict: classifyProbeResult(failed) };
   } catch (e) {
-    return {
+    const unreachable = {
       id: model.id,
       api,
       status: 0,
@@ -93,6 +148,7 @@ async function attemptProbe(
       healthy: false,
       error: (e as Error).message,
     };
+    return { ...unreachable, verdict: classifyProbeResult(unreachable) };
   }
 }
 
@@ -100,6 +156,7 @@ export async function probeModel(
   port: number,
   model: ModelDef,
   fetchImpl: typeof fetch = fetch,
+  options: { maxAttempts?: number; backoffMs?: number[] } = {},
 ): Promise<ModelHealthResult> {
   const isResponses = model.api === "openai-responses";
   const endpoint = isResponses
@@ -119,39 +176,123 @@ export async function probeModel(
       };
 
   const start = Date.now();
+  const maxAttempts = options.maxAttempts ?? MAX_PROBE_ATTEMPTS;
+  const backoff = options.backoffMs ?? RETRY_BACKOFF_MS;
   let attempts = 1;
   let last = await attemptProbe(endpoint, payload, model, fetchImpl);
-  // Only status-0 (timeout/network) failures get a retry; a real HTTP status is the
-  // upstream's own answer and is reported as-is.
-  while (!last.healthy && last.status === 0 && attempts < MAX_PROBE_ATTEMPTS) {
-    console.log(`  ↻ retry after status-0 (${last.error || "network failure"})`);
+  // Availability blips — every `unavailable` verdict, explicitly including the
+  // 402 "Endpoint is unavailable" answer (issue #107) plus 408/429/5xx,
+  // non-timeout network faults and the endpoint-unavailable 404 — get two more
+  // samples. A model-level answer (410/401/404 not-found) and the probe's own
+  // timeout are reported as-is: neither is a blip a retry can settle.
+  while (!last.healthy && attempts < maxAttempts && classifyProbeResult(last) === "unavailable") {
+    const delayMs = backoff[Math.min(attempts - 1, backoff.length - 1)] ?? 0;
+    console.log(`  ↻ retry ${attempts} after ${last.status || "network"} (${last.error || "unknown"})`);
+    if (delayMs > 0) {
+      const sleep = Promise.withResolvers<void>();
+      setTimeout(sleep.resolve, delayMs);
+      await sleep.promise;
+    }
     last = await attemptProbe(endpoint, payload, model, fetchImpl);
     attempts += 1;
   }
 
-  return { ...last, latencyMs: Date.now() - start, attempts };
+  return { ...last, latencyMs: Date.now() - start, attempts, verdict: classifyProbeResult(last) };
 }
 
-function generateMarkdownReport(results: ModelHealthResult[]): string {
-  const affected = results.filter((r) => !r.healthy);
-  const total = results.length;
-  const healthyCount = total - affected.length;
+export interface ProbeSummary {
+  total: number;
+  healthyCount: number;
+  /** Every non-healthy sample, under its original name for JSON consumers. */
+  affectedCount: number;
+  deadCount: number;
+  /** Availability faults plus inconclusive timeouts: reported, never alerting. */
+  degradedCount: number;
+  dead: ModelHealthResult[];
+  unavailable: ModelHealthResult[];
+  timeouts: ModelHealthResult[];
+  /** 1 only when a model-level failure makes the catalog wrong. */
+  exitCode: 0 | 1;
+}
+
+/** Pure roll-up of probe samples into report counts and the CLI exit contract. */
+export function summarizeResults(results: ModelHealthResult[]): ProbeSummary {
+  const dead = results.filter((r) => r.verdict === "dead");
+  const unavailable = results.filter((r) => r.verdict === "unavailable");
+  const timeouts = results.filter((r) => r.verdict === "timeout");
+  return {
+    total: results.length,
+    healthyCount: results.filter((r) => r.verdict === "healthy").length,
+    affectedCount: dead.length + unavailable.length + timeouts.length,
+    deadCount: dead.length,
+    degradedCount: unavailable.length + timeouts.length,
+    dead,
+    unavailable,
+    timeouts,
+    exitCode: dead.length > 0 ? 1 : 0,
+  };
+}
+
+const VERDICT_LABELS: Record<ProbeVerdict, string> = {
+  healthy: "✅ Healthy",
+  dead: "❌ Dead",
+  unavailable: "🚦 Unavailable",
+  timeout: "⏱ Timeout",
+};
+
+export function generateMarkdownReport(results: ModelHealthResult[]): string {
+  const summary = summarizeResults(results);
+  const headline =
+    summary.deadCount > 0
+      ? `🚨 ${summary.deadCount} Model(s) Dead`
+      : summary.degradedCount > 0
+        ? `🚦 ${summary.degradedCount} Model(s) Unavailable (no alert)`
+        : "✅ All OpenCode Free Models Healthy";
 
   const lines: string[] = [];
   lines.push(`## 🤖 OpenCode Free Tier Model Health Check`);
   lines.push("");
-  lines.push(`- **Status**: ${affected.length === 0 ? "✅ All OpenCode Free Models Healthy" : `🚨 ${affected.length} Model(s) Affected`}`);
-  lines.push(`- **Healthy**: ${healthyCount} / ${total}`);
+  lines.push(`- **Status**: ${headline}`);
+  lines.push(`- **Healthy**: ${summary.healthyCount} / ${summary.total}`);
+  if (summary.deadCount > 0) lines.push(`- **Dead (model-level, alerts)**: ${summary.deadCount}`);
+  if (summary.unavailable.length > 0) {
+    lines.push(`- **Unavailable (availability fault, retried, no catalog action)**: ${summary.unavailable.length}`);
+  }
+  if (summary.timeouts.length > 0) {
+    lines.push(`- **Timeout (inconclusive, probe cap)**: ${summary.timeouts.length}`);
+  }
   lines.push(`- **Timestamp**: ${new Date().toISOString()}`);
   lines.push("");
 
-  if (affected.length > 0) {
-    lines.push(`### ⚠️ Affected Models`);
+  if (summary.dead.length > 0) {
+    lines.push(`### ❌ Dead Models (alerting)`);
     lines.push("");
-    lines.push(`| Model ID | HTTP Status | Error Detail |`);
-    lines.push(`|---|---|---|`);
-    for (const m of affected) {
-      lines.push(`| \`${m.id}\` | ${m.status || "ERR"} | ${m.error || "Unknown error"} |`);
+    lines.push(`| Model ID | HTTP Status | Attempts | Error Detail |`);
+    lines.push(`|---|---|---|---|`);
+    for (const m of summary.dead) {
+      lines.push(`| \`${m.id}\` | ${m.status || "ERR"} | ${m.attempts ?? 1} | ${tableCell(m.error || "Unknown error")} |`);
+    }
+    lines.push("");
+  }
+
+  if (summary.unavailable.length > 0) {
+    lines.push(`### 🚦 Unavailable (retried; availability fault, no catalog action)`);
+    lines.push("");
+    lines.push(`| Model ID | HTTP Status | Attempts | Error Detail |`);
+    lines.push(`|---|---|---|---|`);
+    for (const m of summary.unavailable) {
+      lines.push(`| \`${m.id}\` | ${m.status || "network"} | ${m.attempts ?? 1} | ${tableCell(m.error || "Unknown error")} |`);
+    }
+    lines.push("");
+  }
+
+  if (summary.timeouts.length > 0) {
+    lines.push(`### ⏱ Timeout (inconclusive, probe cap)`);
+    lines.push("");
+    lines.push(`| Model ID | HTTP Status | Attempts | Error Detail |`);
+    lines.push(`|---|---|---|---|`);
+    for (const m of summary.timeouts) {
+      lines.push(`| \`${m.id}\` | ${m.status || "network"} | ${m.attempts ?? 1} | ${tableCell(m.error || "Unknown error")} |`);
     }
     lines.push("");
   }
@@ -161,18 +302,24 @@ function generateMarkdownReport(results: ModelHealthResult[]): string {
   lines.push(`| Model ID | Wire API | Status | Latency | Verdict |`);
   lines.push(`|---|---|---|---|---|`);
   for (const r of results) {
-    const verdict = r.healthy ? "✅ Healthy" : "❌ Affected";
-    lines.push(`| \`${r.id}\` | \`${r.api}\` | ${r.status} | ${r.latencyMs}ms | ${verdict} |`);
+    lines.push(`| \`${r.id}\` | \`${r.api}\` | ${r.status} | ${r.latencyMs}ms | ${VERDICT_LABELS[r.verdict]} |`);
   }
   lines.push("");
 
   return lines.join("\n");
 }
 
+/** Table cells must not smuggle pipes or newlines into the markdown table. */
+function tableCell(value: string): string {
+  return value.replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const outputIdx = args.indexOf("--output");
   const outputFile = outputIdx !== -1 ? args[outputIdx + 1] : null;
+  const jsonFileIdx = args.indexOf("--json-output");
+  const jsonFile = jsonFileIdx !== -1 ? args[jsonFileIdx + 1] : null;
   const isJson = args.includes("--json");
 
   const { server, port } = await startOwnedProxy();
@@ -183,30 +330,57 @@ async function main() {
     process.stdout.write(`  Probing ${model.id}... `);
     const result = await probeModel(port, model);
     results.push(result);
-    console.log(result.healthy ? `✅ OK (${result.latencyMs}ms)` : `❌ ${result.status}: ${result.error}`);
+    console.log(
+      result.healthy
+        ? `✅ OK (${result.latencyMs}ms)`
+        : `${VERDICT_LABELS[result.verdict]} ${result.status || "network"}: ${result.error}`,
+    );
   }
 
   server.close();
 
+  const summary = summarizeResults(results);
   const report = generateMarkdownReport(results);
-  const affected = results.filter((r) => !r.healthy);
 
   if (outputFile) {
     await fs.writeFile(outputFile, report, "utf8");
     console.log(`[check-opencode] Report written to ${outputFile}`);
   }
 
-  if (isJson) {
-    console.log(JSON.stringify({ affectedCount: affected.length, results }, null, 2));
+  const payload = {
+    affectedCount: summary.affectedCount,
+    deadCount: summary.deadCount,
+    degradedCount: summary.degradedCount,
+    results,
+  };
+  // The file form is what the workflow reads. It is written as a bare JSON
+  // document so no progress or summary line can break the parse; stdout mode
+  // below keeps the same object as the stream's last line.
+  if (jsonFile) {
+    await fs.writeFile(jsonFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   }
 
-  if (affected.length > 0) {
-    console.error(`[check-opencode] ${affected.length} OpenCode model(s) affected!`);
-    process.exit(1);
+  if (summary.exitCode === 1) {
+    console.error(`[check-opencode] ${summary.deadCount} OpenCode model(s) dead (model-level failure).`);
   } else {
-    console.log(`[check-opencode] All ${results.length} models healthy.`);
-    process.exit(0);
+    // Availability faults and probe timeouts exit 0: they are reported, never
+    // alerted on, so a shared-runner blip can never file an issue.
+    for (const result of [...summary.unavailable, ...summary.timeouts]) {
+      console.log(
+        `[check-opencode] ${VERDICT_LABELS[result.verdict]}: ${result.id} — HTTP ${result.status || "network"} ${result.error ?? ""}`.trimEnd(),
+      );
+    }
+    if (summary.degradedCount > 0) {
+      console.log(
+        `[check-opencode] ${summary.degradedCount} model(s) degraded by availability or probe timeout — no dead model, no alert.`,
+      );
+    } else {
+      console.log(`[check-opencode] All ${results.length} models healthy.`);
+    }
   }
+
+  if (isJson) console.log(JSON.stringify(payload, null, 2));
+  process.exit(summary.exitCode);
 }
 
 // Run the CLI only when this file is the process entry point; tests import

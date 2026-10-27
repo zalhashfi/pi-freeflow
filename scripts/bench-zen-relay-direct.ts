@@ -44,17 +44,17 @@
  * Usage:
  *   node --experimental-strip-types scripts/bench-zen-relay-direct.ts [--smoke] [--quick] [--reps <n>] [--only <id-substring>] [--out <path>]
  *   --smoke runs 1 direct + 1 relay attempt on nemotron-3.5-lightning-free/high.
- *   --quick runs the full 14-cell matrix at 1 attempt/path (28 rows, TTFB+outcome signal, no ranking).
+ *   --quick runs the full 11-cell matrix at 1 attempt/path (22 rows, TTFB+outcome signal, no ranking).
  */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { startProxy } from "../src/proxy.ts";
 import { getActiveRelayState, setActiveRelayState } from "../src/relay-state.ts";
+import { tokenAuthHeaders } from "../src/token.ts";
 import type { RelayState } from "../src/types.ts";
 
 const RESPONSES_MODELS: Record<string, true> = {
- "muse-spark-1.2-contributor-free": true,
- "muse-spark-1.3-contributor-free": true,
+ "nemotron-3.5-super-vl-free": true,
 };
 const PORT = 29365;
 const PROMPT = "Write a TypeScript LRU cache with JSDoc, ~80 lines, no preamble.";
@@ -91,21 +91,19 @@ interface BenchRow {
  notes: string;
 }
 
-/* 14 cells: sparks + big-pickle at 3 attempts/path, other 8 live Zen at 2/path. */
+/* 11 cells: spark + big-pickle at 3 attempts/path, other 7 live Zen at 2/path. */
 const CELLS: Cell[] = [
- { model: "muse-spark-1.3-contributor-free", effortLabel: "xhigh", effortSent: "xhigh", perPath: 3 },
- { model: "muse-spark-1.3-contributor-free", effortLabel: "high", effortSent: "high", perPath: 3 },
- { model: "muse-spark-1.2-contributor-free", effortLabel: "xhigh", effortSent: "xhigh", perPath: 3 },
- { model: "muse-spark-1.2-contributor-free", effortLabel: "high", effortSent: "high", perPath: 3 },
+ { model: "nemotron-3.5-super-vl-free", effortLabel: "xhigh", effortSent: "xhigh", perPath: 3 },
+ { model: "nemotron-3.5-super-vl-free", effortLabel: "high", effortSent: "high", perPath: 3 },
  { model: "big-pickle", effortLabel: "max", effortSent: "max", perPath: 3 },
  { model: "big-pickle", effortLabel: "high", effortSent: "high", perPath: 3 },
- { model: "mimo-v2.5-free", effortLabel: "high", effortSent: "high", perPath: 2 },
  { model: "mimo-v2.6-flash-free", effortLabel: "high", effortSent: "high", perPath: 2 },
  { model: "nemotron-3-ultra-free", effortLabel: "high", effortSent: "high", perPath: 2 },
  { model: "nemotron-3.5-lightning-free", effortLabel: "high", effortSent: "high", perPath: 2 },
- { model: "space-bunny-free", effortLabel: "high", effortSent: "high", perPath: 2 },
  { model: "longcat-2.5-preview-free", effortLabel: "high", effortSent: "high", perPath: 2 },
  { model: "ling-3.1-flash-free", effortLabel: "high", effortSent: "high", perPath: 2 },
+ { model: "glm-5.3-flash-free", effortLabel: "high", effortSent: "high", perPath: 2 },
+ { model: "beam-free", effortLabel: "high", effortSent: "high", perPath: 2 },
 ];
 
 function buildPlan(perPathOverride?: number, onlyFilter?: string): PlanItem[] {
@@ -383,7 +381,7 @@ async function runAttempt(
  try {
   const res = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
    method: "POST",
-   headers: { "content-type": "application/json" },
+   headers: { "content-type": "application/json", ...tokenAuthHeaders() },
    body: JSON.stringify(body),
    signal: controller.signal,
   });
@@ -531,7 +529,7 @@ async function main(): Promise<void> {
    { model: "nemotron-3.5-lightning-free", effortLabel: "high", effortSent: "high", perPath: 1, wantPath: "relay", attemptInPath: 1 },
   ]
   : buildPlan(quick ? 1 : reps, only);
- console.log(`bench-zen-relay-direct: ${plan.length} attempt(s)${smoke ? " (smoke: 1 direct + 1 relay)" : quick ? " (quick: 14 cells x D/R x 1)" : " (full direct-vs-relay matrix)"}`);
+ console.log(`bench-zen-relay-direct: ${plan.length} attempt(s)${smoke ? " (smoke: 1 direct + 1 relay)" : quick ? " (quick: 11 cells x D/R x 1)" : " (full direct-vs-relay matrix)"}`);
 
  const { server, port } = await startProxy(PORT);
  if (server === null) throw new Error(`port ${PORT} already held; refusing to attach (relay state would be foreign)`);

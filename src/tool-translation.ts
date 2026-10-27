@@ -25,15 +25,18 @@
  *   `description`/`parameters`/`strict` verbatim plus every other top-level
  *   caller field, except the wire-shape-forbidden keys which are remapped:
  *   chat `function` wrapper <-> flat `name`, `parameters` <-> `input_schema`,
- *   and `type` is set per target shape. Never injects `additionalProperties`.
+ *   and `type` is set per target shape. `strict` rides top-level on the
+ *   Responses/Anthropic shapes and inside the chat `function` wrapper. Never
+ *   injects `additionalProperties`.
  * - Non-function tools (e.g. Responses built-ins like { type: "web_search" })
  *   pass through verbatim.
  * - `parameters` and Anthropic `input_schema` are treated as the same schema.
  * - First-seen wins on duplicate names, compared case-insensitively on the
  *   upstream name (so `Bash` never duplicates `bash`, `find` collapses with
  *   `glob`). Re-translating translated output adds zero tools (idempotent).
- * - `tool_choice` is never imposed; use retargetToolChoiceForUpstream to carry
- *   a caller choice across the find->glob rename. Request-side only: no
+ * - `tool_choice` is never imposed and never rewritten: Zen accepts only
+ *   "auto", so the fingerprint lane drops every other choice (see
+ *   enforceAutoToolChoice) and no carrier is needed. Request-side only: no
  *   response path carries a choice back to the caller.
  */
 
@@ -190,6 +193,59 @@ export const OMP_FINGERPRINT_DEFS: Record<Exclude<FingerprintToolName, "edit">, 
  },
 };
 
+/** Verbatim OpenCode 1.19.0 bash/read parameter schemas (capture, word-for-word). */
+export const BASH_READ_119_PARAM_SCHEMAS: Record<"bash" | "read", Record<string, unknown>> = {
+ bash: {
+  type: "object",
+  properties: {
+   command: { type: "string", description: "The command to execute" },
+   timeout: { type: "integer", description: "Optional timeout in milliseconds" },
+   workdir: { type: "string", description: "The working directory to run the command in" },
+  },
+  required: ["command"],
+ },
+ read: {
+  type: "object",
+  properties: {
+   filePath: { type: "string", description: "The absolute path to the file or directory to read" },
+   offset: { type: "integer", description: "The line number to start reading from (1-indexed)" },
+   limit: { type: "integer", description: "The maximum number of lines to read" },
+  },
+  required: ["filePath"],
+ },
+};
+
+/** Verbatim OpenCode v2.0.26 read/shell tool definitions (capture, word-for-word). */
+export const READ_SHELL_V2_DEFS: Record<"read" | "shell", { description: string; parameters: Record<string, unknown> }> = {
+ read: {
+  description: "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+  parameters: {
+   type: "object",
+   properties: {
+    path: { type: "string", description: "File or directory to read" },
+    offset: { type: "integer", minimum: 0, description: "The line or directory entry to start reading from (1-based)" },
+    limit: { type: "integer", minimum: 0, description: "The maximum number of lines or directory entries to read (defaults to and capped at 2000)" },
+   },
+   required: ["path"],
+   additionalProperties: false,
+  },
+ },
+ shell: {
+  description: "Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete. DO NOT poll for completion.",
+  parameters: {
+   type: "object",
+   properties: {
+    command: { type: "string", description: "Shell command string to execute" },
+    workdir: { type: "string", description: "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead." },
+    timeout: { type: "integer", minimum: 0, description: "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default." },
+    background: { type: "boolean", description: "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using the shell tool. You will be notified when it completes. DO NOT poll for completion." },
+   },
+   required: ["command"],
+   additionalProperties: false,
+  },
+ },
+};
+
 /** Minimal valid schemas for injected compat tools to satisfy upstream inference gate. */
 export const COMPAT_FINGERPRINT_SCHEMAS: Record<FingerprintToolName, Record<string, unknown>> = {
  bash: {
@@ -277,8 +333,9 @@ function schemaOf(t: Record<string, unknown>, fn: Record<string, unknown> | null
 /**
  * Normalize one wire tool to canonical form. Returns null for entries that
  * are not function tools (they must pass through verbatim, not be dropped).
- * Captures `strict` when the caller set a boolean (top-level only; the
- * function wrapper never carries it on the wire).
+ * Captures `strict` when the caller set a boolean, at either wire placement:
+ * top-level (the Responses/Kilo/Anthropic position) or inside the chat
+ * `function` wrapper (the canonical chat position).
  */
 export function canonicalizeTool(tool: unknown): CanonicalTool | null {
  if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return null;
@@ -306,21 +363,21 @@ export function canonicalizeTool(tool: unknown): CanonicalTool | null {
   parameters: schemaOf(t, fn),
  };
  if (typeof t.strict === "boolean") canon.strict = t.strict;
+ else if (fn && typeof fn.strict === "boolean") canon.strict = fn.strict;
  return canon;
 }
 
 /** Canonical tool -> Chat Completions shape. Carries `strict` verbatim when set. */
 export function toChatTool(t: CanonicalTool): Record<string, unknown> {
- const out: Record<string, unknown> = {
-  type: "function",
-  function: {
-   name: t.name,
-   description: t.description,
-   parameters: t.parameters,
-  },
+ const fn: Record<string, unknown> = {
+  name: t.name,
+  description: t.description,
+  parameters: t.parameters,
  };
- if (typeof t.strict === "boolean") out.strict = t.strict;
- return out;
+ // The chat wire puts `strict` inside the `function` wrapper (canonical
+ // position); a top-level `strict` on the tool object is not the chat shape.
+ if (typeof t.strict === "boolean") fn.strict = t.strict;
+ return { type: "function", function: fn };
 }
 /** Canonical tool -> Responses shape. Carries `strict` verbatim when set. */
 export function toResponsesTool(t: CanonicalTool): Record<string, unknown> {
@@ -491,44 +548,6 @@ export function restoreToolNameForCaller(name: string, restore: FindGlobRestore)
 	if (restore.renamedFindToGlob && name.trim().toLowerCase() === "glob") return "find";
 	return name;
 }
-function retargetChoice(value: unknown, from: string, to: string): unknown {
- if (typeof value === "string") {
-  return value.trim().toLowerCase() === from ? to : value;
- }
- if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
- const rec = value as Record<string, unknown>;
- let changed = false;
- let out: Record<string, unknown> = rec;
- const clone = (): void => {
-  if (!changed) {
-   out = { ...rec };
-   changed = true;
-  }
- };
- if (typeof rec.name === "string" && rec.name.trim().toLowerCase() === from) {
-  clone();
-  out.name = to;
- }
- const fn = rec.function;
- if (typeof fn === "object" && fn !== null && !Array.isArray(fn)) {
-  const fnRec = fn as Record<string, unknown>;
-  if (typeof fnRec.name === "string" && fnRec.name.trim().toLowerCase() === from) {
-   clone();
-   out.function = { ...fnRec, name: to };
-  }
- }
- return out;
-}
-/**
- * Carry a caller `tool_choice` upstream across the rename (`find`->`glob`).
- * Strings, `{ name }`, and `{ function: { name } }` shapes are retargeted;
- * everything else (notably `"auto"`) passes through untouched. Never imposed:
- * callers without a choice get no choice added.
- */
-export function retargetToolChoiceForUpstream(choice: unknown, restore: FindGlobRestore): unknown {
- if (!restore.renamedFindToGlob) return choice;
- return retargetChoice(choice, "find", "glob");
-}
 /** Extra top-level caller fields survive cross-shape conversion verbatim. */
 function carryExtraFields(
  rec: Record<string, unknown>,
@@ -558,7 +577,7 @@ function carryExtraFields(
  * entry passes through verbatim. Duplicates collapse first-seen-wins on the
  * lowercased upstream name, so `Bash` never duplicates `bash`. Re-translating
  * translated output adds zero tools. Never returns null entries.
- * `tool_choice` is never imposed here; use the retarget helpers to carry it.
+ * `tool_choice` is never imposed here.
  *
  * Names ride the caller's own unless `forFingerprint` is set — that flag exists
  * for the OpenCode free tier alone, whose gate expects the sextet name `glob`

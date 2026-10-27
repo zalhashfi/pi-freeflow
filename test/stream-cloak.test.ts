@@ -315,7 +315,265 @@ test("chat stream: caller-owned same-name call survives with restored casing", a
  assert.ok(!body.includes("SECRET_GREP_TAIL"), "dropped call continuations never reach the host");
 });
 
-test("messages stream: synthesized flush carries its content_block_delta event line", async () => {
+ // Delta helper for the parallel-collision tests: one-choice chat chunk.
+ const chatDelta = (tool_calls: unknown[]): string =>
+	`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls } }] })}`;
+ const finishDelta = (): string =>
+	`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}`;
+
+ /** One tool_call riding a streamed chat delta; name/arguments optional so omitted keys never serialize. */
+ const chatToolCall = (id: string, fn: { name?: string; arguments?: string }): Record<string, unknown> => (
+	{ index: 0, id, type: "function", function: fn }
+ );
+
+ /** Decoded `data:` frames of a streamed body (single-choice chat). */
+ const dataFrames = (body: string): Array<Record<string, any>> =>
+	body
+		.split("\n\n")
+		.filter((block) => block.startsWith("data: ") && !block.includes("[DONE]"))
+		.map((block) => JSON.parse(block.slice(6)));
+
+ /** Emitted tool_calls entries that carry name+arguments — the flushed whole calls. */
+ const flushedChatCalls = (
+	body: string,
+ ): Array<{ index: number; type: string; function: { name: string; arguments: string } }> => {
+	const out: Array<{ index: number; type: string; function: { name: string; arguments: string } }> = [];
+	for (const frame of dataFrames(body)) {
+	 for (const tc of frame.choices?.[0]?.delta?.tool_calls ?? []) {
+		if (
+		 tc &&
+		 typeof tc === "object" &&
+		 typeof tc.index === "number" &&
+		 typeof tc.function?.name === "string" &&
+		 typeof tc.function.arguments === "string"
+		) {
+		 out.push(tc);
+		}
+	 }
+	}
+	return out;
+ };
+
+ test("chat stream: parallel id-bearing calls at one upstream index stay two calls at two host indices", async () => {
+	// Defect K1: glm-style free models label EVERY parallel tool call
+	// `index: 0` while still sending per-call ids on every fragment. Keyed by
+	// index alone the two fragment streams interweaved into one buffer, so the
+	// terminal flush salvaged only the last parseable object: one call was
+	// silently lost. Keyed by id, each call flushes whole at its own
+	// host-visible index; the colliding arrival gets a fresh sequential index.
+	const todoSchema = {
+	 type: "object",
+	 properties: {
+		list: {
+		 type: "array",
+		 items: {
+			type: "object",
+			properties: { phase: { type: "string" }, items: { type: "array", items: { type: "string" } } },
+			required: ["phase", "items"],
+		 },
+		},
+	 },
+	 required: ["list"],
+	};
+	const cloak: StreamCloakOptions = {
+	 callerHadTools: true,
+	 caseRestore: {},
+	 findGlob: { renamedFindToGlob: false },
+	 injected: [],
+	 argSchemas: new Map([["todo", todoSchema]]),
+	 pathname: "/v1/chat/completions",
+	};
+	const sse = [
+	 chatDelta([chatToolCall("a1", { name: "todo", arguments: '{"list":[{"ph' })]),
+	 chatDelta([chatToolCall("b2", { name: "todo", arguments: '{"list":[{"ph' })]),
+	 chatDelta([chatToolCall("a1", { arguments: 'ase":"R","items":["1","2"]}]}' })]),
+	 chatDelta([chatToolCall("b2", { arguments: 'ase":"S","items":["3"]}]}' })]),
+	 finishDelta(),
+	].join("\n\n");
+	const body = await runStreamed(sse, "/v1/chat/completions", cloak, thirds(sse));
+
+	// Name deltas ride the pipe (fragments withheld), collider at a fresh index.
+	const nameDeltas = dataFrames(body)
+	 .flatMap((frame) => frame.choices?.[0]?.delta?.tool_calls ?? [])
+	 .filter((c) => typeof c.id === "string" && c.function?.arguments === undefined);
+	assert.deepEqual(nameDeltas.map((c) => [c.id, c.index]), [["a1", 0], ["b2", 1]], "the colliding second call gets the next fresh host index");
+	assert.equal(nameDeltas.length, 2, "exactly the two name-bearing deltas flow; the id-bearing fragments are absorbed");
+
+	const flushed = flushedChatCalls(body);
+	assert.equal(flushed.length, 2, "both id-bearing calls flush whole, not one merged call");
+	const byIndex = new Map(flushed.map((call) => [call.index, call]));
+	assert.deepEqual([...byIndex.keys()].sort(), [0, 1], "two distinct host indices, one per call");
+	const first = byIndex.get(0);
+	const second = byIndex.get(1);
+	assert.equal(first?.function.name, "todo");
+	assert.deepEqual(JSON.parse(first!.function.arguments), { list: [{ phase: "R", items: ["1", "2"] }] }, "first call's own arguments");
+	assert.equal(second?.function.name, "todo");
+	assert.deepEqual(JSON.parse(second!.function.arguments), { list: [{ phase: "S", items: ["3"] }] }, "second call's own arguments");
+	const payloads = flushedChatCalls(body).map((call) => call.function.arguments);
+	assert.equal(payloads.filter((p) => p.includes('"phase":"R"')).length, 1, "first call's payload appears exactly once — no salvage of merged junk");
+	assert.equal(payloads.filter((p) => p.includes('"phase":"S"')).length, 1, "second call's payload appears exactly once");
+ });
+
+ test("chat stream: real id-bearing call reusing a dropped injected call's index survives whole", async () => {
+	// Regression pin for the observed `Received arguments: {}` / missing_required
+	// shape: an injected placeholder dropped at an upstream index, with its
+	// id-bearing fragment arriving AFTER a real id-bearing call reusing that
+	// same index. Keyed by index alone the fragment joined the real call's
+	// repair buffer, shipping the placeholder's payload as the real call's
+	// arguments. Drops are per call now, so the real call stays clean.
+	const readSchema = { type: "object", properties: { path: { type: "string" } }, required: ["path"] };
+	const cloak: StreamCloakOptions = {
+	 callerHadTools: true,
+	 caseRestore: {},
+	 findGlob: { renamedFindToGlob: false },
+	 injected: ["edit"],
+	 argSchemas: new Map([["read", readSchema]]),
+	 pathname: "/v1/chat/completions",
+	};
+	const sse = [
+	 chatDelta([chatToolCall("call_e", { name: "edit", arguments: "{}" })]),
+	 chatDelta([chatToolCall("call_r", { name: "read", arguments: '{"path":"a.txt"}' })]),
+	 chatDelta([chatToolCall("call_e", { arguments: '{"command":"echo hi"}' })]),
+	 finishDelta(),
+	].join("\n\n");
+	const body = await runStreamed(sse, "/v1/chat/completions", cloak, thirds(sse));
+
+	assert.ok(!body.includes("echo hi"), "the injected call's own fragment never reaches the host");
+	assert.ok(!body.includes('"name":"edit"'), "the injected placeholder name never reaches the host");
+	const flushed = flushedChatCalls(body);
+	assert.equal(flushed.length, 1, "exactly the real call flushes");
+	assert.equal(flushed[0].index, 1, "the real call was re-homed: index 0 was claimed by the (dropped) placeholder");
+	assert.deepEqual(JSON.parse(flushed[0].function.arguments), { path: "a.txt" }, "complete arguments, untouched by the dropped call's fragment");
+ });
+
+ test("chat stream: colliding non-repairable and repairable calls rewrite indices without cross-contamination", async () => {
+	// One upstream index shared by a repairable (buffered) id-bearing call and
+	// a non-repairable one: the repairable packet is withheld and flushes
+	// whole at its first index; the non-repairable call keeps streaming
+	// incrementally at the fresh index, its fragments never touching the
+	// buffered packet.
+	const todoSchema = {
+	 type: "object",
+	 properties: {
+		list: {
+		 type: "array",
+		 items: {
+			type: "object",
+			properties: { phase: { type: "string" }, items: { type: "array", items: { type: "string" } } },
+			required: ["phase", "items"],
+		 },
+		},
+	 },
+	 required: ["list"],
+	};
+	const cloak: StreamCloakOptions = {
+	 callerHadTools: true,
+	 caseRestore: {},
+	 findGlob: { renamedFindToGlob: false },
+	 injected: [],
+	 argSchemas: new Map([["todo", todoSchema]]),
+	 pathname: "/v1/chat/completions",
+	};
+	const sse = [
+	 chatDelta([chatToolCall("call_t", { name: "todo", arguments: JSON.stringify({ list: [{ phase: "R", items: ["a"] }] }) })]),
+	 chatDelta([chatToolCall("call_w", { name: "widget" })]),
+	 chatDelta([chatToolCall("call_w", { arguments: '{"q":"cats"}' })]),
+	 finishDelta(),
+	].join("\n\n");
+	const body = await runStreamed(sse, "/v1/chat/completions", cloak, thirds(sse));
+
+	const flushed = flushedChatCalls(body);
+	assert.equal(flushed.length, 1);
+	assert.equal(flushed[0].index, 0, "the repairable call keeps its first index");
+	assert.deepEqual(JSON.parse(flushed[0].function.arguments), { list: [{ phase: "R", items: ["a"] }] }, "whole packet, uncontaminated");
+	assert.ok(!JSON.stringify(flushed).includes("cats"), "the widget's streamed fragment never lands in the buffered packet");
+
+	const widgetDeltas = dataFrames(body)
+	 .flatMap((frame) => frame.choices?.[0]?.delta?.tool_calls ?? [])
+	 .filter((c) => c.id === "call_w");
+	assert.deepEqual(widgetDeltas.map((c) => c.index), [1, 1], "both widget deltas rewritten to the fresh host index");
+	const fragment = widgetDeltas.filter((c) => typeof c.function?.arguments === "string")[0];
+	assert.equal(fragment.function.arguments, '{"q":"cats"}', "non-repairable arguments keep streaming unchanged");
+ });
+
+ test("chat stream: id-less fragments colliding at one index stay merged (legacy pin)", async () => {
+	// Explicit PIN, not a regression fix: id-less calls all labelled index 0
+	// that genuinely merge into one fragment stream keep today's salvage-last
+	// behavior — one state bucket per index (idx:N), the buffer is the raw
+	// concatenation, and the terminal flush salvages the last parseable
+	// object. Without an id there is no truth to split by; this stays
+	// unmanaged by design.
+	const todoSchema = {
+	 type: "object",
+	 properties: {
+		list: {
+		 type: "array",
+		 items: {
+			type: "object",
+			properties: { phase: { type: "string" }, items: { type: "array", items: { type: "string" } } },
+			required: ["phase", "items"],
+		 },
+		},
+	 },
+	 required: ["list"],
+	};
+	const cloak: StreamCloakOptions = {
+	 callerHadTools: true,
+	 caseRestore: {},
+	 findGlob: { renamedFindToGlob: false },
+	 injected: [],
+	 argSchemas: new Map([["todo", todoSchema]]),
+	 pathname: "/v1/chat/completions",
+	};
+	const sse = [
+	 chatDelta([{ index: 0, type: "function", function: { name: "todo", arguments: '{"list":[{"phase":"R","items":["a"]}]}' } }]),
+	 chatDelta([{ index: 0, function: { arguments: '{"list":[{"phase":"S","items":["b"]}]}' } }]),
+	 finishDelta(),
+	].join("\n\n");
+	const body = await runStreamed(sse, "/v1/chat/completions", cloak, thirds(sse));
+
+	const flushed = flushedChatCalls(body);
+	assert.equal(flushed.length, 1, "the merged bucket flushes exactly one call");
+	assert.equal(flushed[0].index, 0);
+	assert.equal(flushed[0].function.name, "todo");
+	assert.deepEqual(
+	 JSON.parse(flushed[0].function.arguments),
+	 { list: [{ phase: "S", items: ["b"] }] },
+	 "the last parseable object wins the salvage, exactly as before",
+	);
+ });
+
+ test("chat stream: single-call classic stream is byte-identical across the rework", async () => {
+	// Byte-identity pin (requirement 5): one tool call, no collisions — same
+	// delta passthrough (arguments removed only for buffered calls), same
+	// flush shape {index,type,function}, same index values.
+	const readSchema = { type: "object", properties: { path: { type: "string" } }, required: ["path"] };
+	const cloak: StreamCloakOptions = {
+	 callerHadTools: true,
+	 caseRestore: {},
+	 findGlob: { renamedFindToGlob: false },
+	 injected: [],
+	 argSchemas: new Map([["read", readSchema]]),
+	 pathname: "/v1/chat/completions",
+	};
+	const sse = [
+	 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_r","type":"function","function":{"name":"read","arguments":"{\\"path\\":\\"a.txt\\"}"}}]}}]}',
+	 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+	 "data: [DONE]",
+	].join("\n\n");
+	const body = await runStreamed(sse, "/v1/chat/completions", cloak, thirds(sse));
+
+	assert.equal(
+	 body,
+	 [
+		'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_r","type":"function","function":{"name":"read"}}]}}]}\n\n',
+		'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read","arguments":"{\\"path\\":\\"a.txt\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+		"data: [DONE]\n\n",
+	 ].join(""),
+	);
+ });
+
+ test("messages stream: synthesized flush carries its content_block_delta event line", async () => {
  // Both hosts filter SSE frames by their `event:` field, so a synthesized
  // frame emitted data-only was dropped and the repaired arguments never
  // reached the tool call.
@@ -371,4 +629,65 @@ test("messages stream: synthesized flush carries its content_block_delta event l
   { list: [{ phase: "R", items: ["a"] }] },
   "the frame carries the repaired (envelope-unwrapped) arguments",
  );
+});
+
+test("chat stream: a restated full name on the arguments frame reaches the host once", async () => {
+ // OpenCode Zen streams one call as a name-only frame followed by a frame
+ // restating the whole name WITH the arguments (observed live 2026-10-22).
+ // Hosts concatenate streamed name deltas, so forwarding the second copy hands
+ // them `get_weatherget_weather` — a name no declared tool matches. The repeat
+ // header is authoritative: it replaces the accumulated name and stays off the
+ // wire when the host already holds it.
+ const cloak: StreamCloakOptions = {
+  callerHadTools: true,
+  caseRestore: { get_weather: "Get_Weather" },
+  findGlob: { renamedFindToGlob: false },
+  injected: [],
+  pathname: "/v1/chat/completions",
+ };
+ const sse = [
+  chatDelta([chatToolCall("call_w", { name: "get_weather" })]),
+  chatDelta([chatToolCall("call_w", { name: "get_weather", arguments: '{"city":"Tokyo"}' })]),
+  finishDelta(),
+ ].join("\n\n");
+ const body = await runStreamed(sse, "/v1/chat/completions", cloak, thirds(sse));
+
+ const deltas = dataFrames(body).flatMap((frame) => frame.choices?.[0]?.delta?.tool_calls ?? []);
+ assert.deepEqual(
+  deltas.filter((c) => typeof c.function?.name === "string").map((c) => c.function.name),
+  ["Get_Weather"],
+  "the name is emitted exactly once, restored to the caller's casing",
+ );
+ assert.deepEqual(
+  deltas.filter((c) => typeof c.function?.arguments === "string").map((c) => c.function.arguments),
+  ['{"city":"Tokyo"}'],
+  "the arguments still flow, on their own frame",
+ );
+ assert.ok(!body.includes("get_weatherget_weather"), "the doubled name never reaches the host");
+});
+
+test("chat stream: a name split across deltas reassembles into the flushed call", async () => {
+ // The piecewise shape must keep appending: replacing on every name delta
+ // would leave the flushed call named after its last fragment only.
+ const weatherSchema = { type: "object", properties: { city: { type: "string" } }, required: ["city"] };
+ const cloak: StreamCloakOptions = {
+  callerHadTools: true,
+  caseRestore: {},
+  findGlob: { renamedFindToGlob: false },
+  injected: [],
+  argSchemas: new Map([["get_weather", weatherSchema]]),
+  pathname: "/v1/chat/completions",
+ };
+ const sse = [
+  chatDelta([chatToolCall("call_w", { name: "get_" })]),
+  chatDelta([chatToolCall("call_w", { name: "weather" })]),
+  chatDelta([chatToolCall("call_w", { arguments: '{"city":"Tokyo"}' })]),
+  finishDelta(),
+ ].join("\n\n");
+ const body = await runStreamed(sse, "/v1/chat/completions", cloak, thirds(sse));
+
+ const flushed = flushedChatCalls(body);
+ assert.equal(flushed.length, 1, "one call flushes");
+ assert.equal(flushed[0].function.name, "get_weather", "name fragments append, so the flush carries the whole name");
+ assert.deepEqual(JSON.parse(flushed[0].function.arguments), { city: "Tokyo" });
 });

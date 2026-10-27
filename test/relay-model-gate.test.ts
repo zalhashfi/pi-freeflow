@@ -13,8 +13,9 @@ import { isRelayEligibleModel, startProxy } from "../src/proxy.ts";
 import { resetAllRelayHealth, setActiveRelayState } from "../src/relay-state.ts";
 import type { KnownRelay, RelayState } from "../src/types.ts";
 import { clearSandboxFiles, withIsolatedSandboxFiles } from "./_sandbox-helpers.ts";
+import { authHeaders } from "./_auth.ts";
 
-const ZEN_FREE = "muse-spark-1.2-contributor-free";
+const ZEN_FREE = "nemotron-3.5-super-vl-free";
 const KILO_FREE = "dots-studio/dots-3-note-preview:free";
 const UNKNOWN_MODEL = "gpt-9-ultra-paid";
 const OVH_FREE = "ovh-free/gpt-oss-20b";
@@ -32,12 +33,10 @@ test("isRelayEligibleModel allows kilo free catalog ids", () => {
  assert.equal(isRelayEligibleModel(KILO_FREE), true);
 });
 
-test("isRelayEligibleModel rejects direct-only lanes (Cline, OVH)", () => {
- // Both lanes fetch upstream themselves and are deliberately absent from
- // the deployed relay allowlist, so neither may ever be labeled eligible.
- assert.equal(isRelayEligibleModel(OVH_FREE), false, "ovh catalog ids are never relay-eligible");
- assert.equal(isRelayEligibleModel("gpt-oss-20b"), false, "an ovh alias resolves to an ovh id first");
- assert.equal(isRelayEligibleModel("z-ai/glm-5.3-flash"), false, "cline stays direct-only");
+test("isRelayEligibleModel rejects direct-only lanes (Cline), allows OVH", () => {
+ assert.equal(isRelayEligibleModel(OVH_FREE), true, "ovh catalog ids are relay-eligible");
+ assert.equal(isRelayEligibleModel("gpt-oss-20b"), true, "an ovh alias resolves to an ovh id first");
+ assert.equal(isRelayEligibleModel("cline/nemotron-3.5-super-vl"), false, "cline stays direct-only");
 });
 
 test("isRelayEligibleModel rejects unknown/paid models and non-strings", () => {
@@ -112,7 +111,7 @@ test("unknown-model POST bypasses the relay pool while free-model POST uses it",
     // Free catalog model rides the relay even with the pool on.
     const freeRes = await fetch(`${localPrefix}/v1/chat/completions`, {
      method: "POST",
-     headers: { "content-type": "application/json" },
+     headers: { "content-type": "application/json", ...authHeaders() },
      body: chatBody(ZEN_FREE),
     });
     assert.equal(freeRes.status, 200);
@@ -126,7 +125,7 @@ test("unknown-model POST bypasses the relay pool while free-model POST uses it",
     seen.length = 0;
     const paidRes = await fetch(`${localPrefix}/v1/chat/completions`, {
      method: "POST",
-     headers: { "content-type": "application/json" },
+     headers: { "content-type": "application/json", ...authHeaders() },
      body: chatBody(UNKNOWN_MODEL),
     });
     assert.equal(paidRes.status, 200);
@@ -149,11 +148,8 @@ test("unknown-model POST bypasses the relay pool while free-model POST uses it",
  });
 });
 
-test("ovh-model POST bypasses the relay pool while a zen free-model POST uses it", async () => {
- // Direct-only lane: the OVH branch fetches upstream itself, so with the
- // pool on an OVH request must still land on the OVH endpoint and must never
- // touch a relay URL. The zen request in the same live pool proves the pool
- // is genuinely armed, so the OVH bypass is a decision and not a no-op test.
+test("ovh-model POST uses the relay pool when armed", async () => {
+ // When relay pool is armed, OVH models ride the relay pool to spread burst requests.
  await withIsolatedSandboxFiles(async () => {
   clearSandboxFiles();
   const relay = "http://127.0.0.1:19373";
@@ -184,37 +180,19 @@ test("ovh-model POST bypasses the relay pool while a zen free-model POST uses it
     },
    );
    try {
-    // Zen free model rides the relay: the pool is armed and reachable.
-    const zenRes = await fetch(`${localPrefix}/v1/chat/completions`, {
-     method: "POST",
-     headers: { "content-type": "application/json" },
-     body: chatBody(ZEN_FREE),
-    });
-    assert.equal(zenRes.status, 200);
-    await zenRes.text();
-    assert.ok(
-     seen.some((u) => u.startsWith(relay)),
-     `zen free-model POST must touch the relay URL, saw: ${seen.join(", ")}`,
-    );
-
-    // OVH model never rides it, by catalog id and by short alias.
     for (const model of [OVH_FREE, "gpt-oss-20b"]) {
      seen.length = 0;
      const ovhRes = await fetch(`${localPrefix}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...authHeaders() },
       body: chatBody(model),
      });
      assert.equal(ovhRes.status, 200);
      await ovhRes.text();
-     assert.ok(seen.length > 0, "ovh POST must still reach upstream");
+     assert.ok(seen.length > 0, "ovh POST must reach upstream");
      assert.ok(
-      seen.every((u) => !u.startsWith(relay)),
-      `ovh POST (${model}) must never touch a relay URL, saw: ${seen.join(", ")}`,
-     );
-     assert.ok(
-      seen.some((u) => u.includes("oai.endpoints.kepler.ai.cloud.ovh.net")),
-      `ovh POST (${model}) must go direct to OVH, saw: ${seen.join(", ")}`,
+      seen.some((u) => u.startsWith(relay)),
+      `ovh POST (${model}) must touch a relay URL, saw: ${seen.join(", ")}`,
      );
     }
    } finally {

@@ -21,6 +21,7 @@ import { createCommandSpec, stopLogsFollow, updateStatusBar } from "./commands.t
 import { HOST, ONBOARDED_FLAG_FILE, PORT } from "./config.ts";
 import { logInfo, logWarn } from "./logger.ts";
 import { ALL_MODELS, MODEL_MAP, getModelUpstream, resolveCanonicalModelId } from "./models.ts";
+import { ensureToken } from "./token.ts";
 import { checkForUpdateInBackground } from "./update-checker.ts";
 import {
  ensureRelay,
@@ -105,6 +106,11 @@ export function bindWidgetClick(ui: ExtensionUIContext): void {
 
 /**
  * Construct standard ProviderConfig for pi-ai / OMP registration.
+ *
+ * `apiKey` carries the local installation token (src/token.ts) so the host
+ * sends `Authorization: Bearer <token>` on every /v1 request; the proxy
+ * validates it and strips it before going upstream. Read-or-create: the host
+ * may build its provider config before the daemon has written the file.
  */
 export function buildProviderConfig(
  models: RegisteredModel[],
@@ -112,7 +118,7 @@ export function buildProviderConfig(
 ): ProviderConfig {
  return {
   baseUrl: `http://${HOST}:${port}/v1`,
-  apiKey: "public",
+  apiKey: ensureToken(),
   api: "openai-completions",
   compat: { supportsDeveloperRole: false },
   models: models.map((m) => {
@@ -139,22 +145,44 @@ export function buildProviderConfig(
     contextWindow: m.contextWindow,
     maxTokens: m.maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: m.thinkingFormat
+    compat: {
+     ...(m.thinkingFormat
      ? {
       supportsDeveloperRole: false,
       thinkingFormat: m.thinkingFormat,
      }
      : m.api === "openai-responses"
       ? { sessionAffinityFormat: "openai-nosession" }
-      : m.source === "kilo" || m.source === "cline" || m.source === "ovh"
+      : m.source === "kilo" || m.source === "cline"
        ? {
         supportsDeveloperRole: false,
         supportsReasoningEffort: !!m.thinkingLevelMap,
        }
-       : {
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
-       },
+       // OVH is a plain OpenAI chat endpoint. Without an explicit format the
+       // host sees the loopback proxy URL, classifies the lane as a local
+       // backend and treats `Qwen3.x` ids as template-dialect Qwen, emitting
+       // `chat_template_kwargs` that OVH rejects with
+       // `400 feature 'extra arguments: ...' is not currently supported`.
+       // Pin the format so the host sends `reasoning_effort` instead.
+       : m.source === "ovh"
+        ? {
+         supportsDeveloperRole: false,
+         supportsReasoningEffort: !!m.thinkingLevelMap,
+         thinkingFormat: "openai",
+         // The host derives these two from the loopback base URL before the
+         // spec override lands: `thinkingFormat` is overridden above, but
+         // `qwenPreserveThinking` was already latched on and still emits
+         // `chat_template_kwargs.preserve_thinking`. Clear it explicitly.
+         qwenPreserveThinking: false,
+        }
+        : {
+         supportsDeveloperRole: false,
+         supportsReasoningEffort: true,
+        }),
+     ...(m.requiresReasoningContentOnAssistantMessages !== undefined
+      ? { requiresReasoningContentOnAssistantMessages: m.requiresReasoningContentOnAssistantMessages }
+      : {}),
+    },
    };
   }),
  };

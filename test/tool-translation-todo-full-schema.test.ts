@@ -123,12 +123,14 @@ test("todo full schema: canonicalize keeps description/parameters/strict on ever
 
 test("todo full schema: converters carry description/parameters/strict verbatim", () => {
  const canon = canonicalizeTool(chatTodo(true))!;
- assert.deepEqual(toChatTool(canon).function, {
+ const chatOut = toChatTool(canon);
+ assert.deepEqual(chatOut.function, {
   name: "todo",
   description: TODO_DESCRIPTION,
   parameters: canon.parameters,
- });
- assert.equal((toChatTool(canon) as Record<string, unknown>).strict, true);
+  strict: true,
+ }, "the chat shape nests strict inside the function wrapper");
+ assert.ok(!("strict" in chatOut), "no top-level strict on the chat shape");
  const responses = toResponsesTool(canonicalizeTool(responsesTodo(false))!);
  assert.equal(responses.name, "todo");
  assert.equal(responses.description, TODO_DESCRIPTION);
@@ -140,6 +142,12 @@ test("todo full schema: converters carry description/parameters/strict verbatim"
  assert.equal(anthropic.strict, true);
 });
 
+function wireStrict(tool: Record<string, unknown>): unknown {
+ const fn = tool.function as Record<string, unknown> | undefined;
+ if (fn && typeof fn.strict === "boolean") return fn.strict;
+ return tool.strict;
+}
+
 test("todo full schema: translateToolsForPath is lossless on all three paths", () => {
  const callers = [chatTodo(true), responsesTodo(false), anthropicTodo(true)] as Array<Record<string, unknown>>;
  for (const path of PATHS) {
@@ -148,7 +156,7 @@ test("todo full schema: translateToolsForPath is lossless on all three paths", (
    assert.equal(wireName(out), "todo", `${path}: canonical name survives verbatim`);
    assert.equal(wireDescription(out), TODO_DESCRIPTION, `${path}: description survives`);
    assert.deepEqual(wireSchema(out), todoParameters(), `${path}: nested list/items shape intact`);
-   assert.equal(out.strict, (caller.strict ?? (caller.function as Record<string, unknown> | undefined)?.strict), `${path}: strict survives`);
+   assert.equal(wireStrict(out), (caller.strict ?? (caller.function as Record<string, unknown> | undefined)?.strict), `${path}: strict survives`);
   }
  }
 });

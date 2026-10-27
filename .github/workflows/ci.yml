@@ -20,28 +20,92 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Classify the change so heavy work only runs where it can find something:
+  # a docs-only push builds the docs, a shipped-file change checks the tarball,
+  # and everything else runs the full matrix.
+  changes:
+    name: Detect changed areas
+    if: "!inputs.use_self_hosted"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      pack: ${{ steps.filter.outputs.pack }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            RANGE="origin/${BASE_REF:-main}...HEAD"
+          elif [ -n "${BEFORE_SHA:-}" ] && [ "${BEFORE_SHA:-}" != "0000000000000000000000000000000000000000" ]; then
+            RANGE="${BEFORE_SHA}..${HEAD_SHA}"
+          else
+            RANGE=""
+          fi
+
+          if [ -z "$RANGE" ]; then
+            FILES=$(git ls-files)
+          else
+            FILES=$(git diff --name-only "$RANGE")
+          fi
+
+          has() { printf '%s\n' "$FILES" | grep -Eq "$1"; }
+          code=false
+          pack=false
+          docs=false
+          if has '^(src/|test/|scripts/|extensions/|package\.json|pnpm-lock\.yaml|tsconfig\.json|\.github/workflows/)'; then code=true; fi
+          if has '^(src/|extensions/|package\.json|LICENSE|README\.md|CHANGELOG\.md|\.npmignore)'; then pack=true; fi
+          # A dependency change can break the docs build (vitepress) with no docs/ edit.
+          if has '^(docs/|package\.json|pnpm-lock\.yaml)'; then docs=true; fi
+
+          {
+            echo "code=$code"
+            echo "pack=$pack"
+            echo "docs=$docs"
+          } >> "$GITHUB_OUTPUT"
+          echo "changed files: $(printf '%s\n' "$FILES" | grep -c . || true) → code=$code pack=$pack docs=$docs"
+
   test:
     name: Test (${{ matrix.os }} - Node ${{ matrix.node-version }})
-    if: "!inputs.use_self_hosted"
+    needs: changes
+    if: "!inputs.use_self_hosted && needs.changes.outputs.code == 'true'"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
         node-version: ["lts/*", "22.19.0"]
+        include:
+          - os: windows-latest
+            node-version: "lts/*"
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
 
       - name: Setup Node.js (LTS)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: "pnpm"
@@ -52,14 +116,41 @@ jobs:
       - name: Typecheck (tsc --noEmit)
         run: pnpm run typecheck
 
-      - name: Build docs (vitepress)
-        run: pnpm run docs:build
-
       - name: Smoke test (extension entrypoint)
         run: pnpm run smoke
 
       - name: Run test suite
         run: pnpm test
+
+  docs:
+    name: Build docs (vitepress)
+    needs: changes
+    if: "!inputs.use_self_hosted && needs.changes.outputs.docs == 'true'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9
+
+      - name: Setup Node.js (LTS)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "lts/*"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build docs (vitepress)
+        run: pnpm run docs:build
 
   # Fallback runner: only used when explicitly requested (e.g. GitHub Actions minutes limit reached)
   test-local:
@@ -70,15 +161,17 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
 
       - name: Setup Node.js (LTS)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "lts/*"
           cache: "pnpm"
@@ -100,19 +193,23 @@ jobs:
 
   package-check:
     name: Package Integrity & Tarball Whitelist
+    needs: changes
+    if: "!inputs.use_self_hosted && needs.changes.outputs.pack == 'true'"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
 
       - name: Setup Node.js (LTS)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "lts/*"
           cache: "pnpm"

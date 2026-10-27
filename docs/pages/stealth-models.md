@@ -46,8 +46,11 @@ the free-model picker.
 
 - Space Bunny (`space-bunny-free`, OpenCode Zen free list, 2026-09-23):
   stealth preview with the lab undisclosed, but live on the free list and
-  answering keyless probes (1M context, vision + tool calls). In the
-  picker as `space-bunny`.
+  answering keyless probes (1M context, vision + tool calls). **Deprecated
+  upstream on 2026-10-20** — the endpoint answers `410 ModelDeprecated` and
+  points at `minimax-m3.1-flash-free` (that replacement itself was retired on
+  2026-10-23: `410`, pointing at `deepseek-v4.1-flash-free`). Out of the
+  picker and recorded in the dead-model list.
 - Glyph Cluster (`stealth/glyph-cluster`, KiloCode Gateway free list,
   2026-10-09): masked-namespace id, added to the picker under the short alias
   `glyph-cluster`. Live on the Kilo free list when added (free pricing, 256K
@@ -77,11 +80,10 @@ Free slots with a printed expiry leave the picker when the window closes:
   (absent from the listing, keyless 404) and left the picker with it; the
   paid versions under other names don't count.
 - `space-bunny-free` (OpenCode Zen free list) — OpenCode announced on
-  2026-10-08 that the free period is ending, with the model sponsored in
-  the free tier for a few more days before reveal. Still answering
-  keyless probes, still in the picker. The self-hosted relay now probes
-  it every pass, so a withdrawal shows up as one actionable log line
-  instead of surfacing to whoever picks the model next.
+  2026-10-08 that the free period was ending. **Removed from the picker on
+  2026-10-20**: the endpoint answers `410 ModelDeprecated` and points at
+  `minimax-m3.1-flash-free` (itself retired on 2026-10-23 with a `410` pointing
+  at `deepseek-v4.1-flash-free`). Recorded in the dead-model list.
 
 ## Sources
 

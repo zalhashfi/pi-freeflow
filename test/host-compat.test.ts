@@ -28,6 +28,7 @@ import defaultExtension, {
 } from "../src/index.ts";
 import { createCommandSpec, updateStatusBar } from "../src/commands.ts";
 import { isLinkedInstall } from "../src/update-checker.ts";
+import { ensureToken } from "../src/token.ts";
 import wrapperDefault from "../extensions/index.ts";
 import {
 	HOST,
@@ -36,7 +37,7 @@ import {
 	UPDATE_CACHE_FILE,
 	ONBOARDED_FLAG_FILE,
 } from "../src/config.ts";
-import { ALL_MODELS, KILO_MODEL_IDS } from "../src/models.ts";
+import { ALL_MODELS, KILO_MODEL_IDS, OVH_MODELS } from "../src/models.ts";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -54,9 +55,10 @@ type RegistryMode = "reject" | { version: string };
 
 /**
  * URL-aware fetch mock. The activation "reuses" an already-running daemon
- * (instead of binding a real server) by answering the /v1/models probe as
- * alive and /_health with the current PKG_VERSION; the registry is the only
- * other endpoint consulted and can be made to reject (offline) or answer.
+ * (instead of binding a real server) by answering the /health identity probe
+ * with our service+port body, /v1/models with a catalog and /_health with the
+ * current PKG_VERSION; the registry is the only other endpoint consulted and
+ * can be made to reject (offline) or answer.
  */
 function makeFetchHandler(registry: RegistryMode = "reject") {
 	return async (input: RequestInfo | URL): Promise<unknown> => {
@@ -66,6 +68,13 @@ function makeFetchHandler(registry: RegistryMode = "reject") {
 				: input instanceof URL
 					? input.href
 					: ((input as Request)?.url ?? "");
+		if (url.startsWith(`http://${HOST}:${PORT}/health`)) {
+			return {
+				ok: true,
+				headers: { get: () => "application/json" },
+				json: async () => ({ ok: true, service: "pi-freeflow", port: PORT, version: PKG_VERSION }),
+			};
+		}
 		if (url.startsWith(`http://${HOST}:${PORT}/v1/models`)) {
 			return { ok: true, headers: { get: () => "application/json" }, json: async () => [] };
 		}
@@ -73,7 +82,7 @@ function makeFetchHandler(registry: RegistryMode = "reject") {
 			return {
 				ok: true,
 				headers: { get: () => "application/json" },
-				json: async () => ({ version: PKG_VERSION, activeRequests: 0 }),
+				json: async () => ({ port: PORT, version: PKG_VERSION, activeRequests: 0 }),
 			};
 		}
 		if (url.includes("registry.npmjs.org")) {
@@ -296,7 +305,10 @@ test("F: buildProviderConfig emits the host-compatible provider contract", () =>
 		"baseUrl must be loopback",
 	);
 	assert.ok(cfg.baseUrl.includes(`:${port}/v1`), `baseUrl must point at the test port ${port}`);
-	assert.equal(cfg.apiKey, "public");
+	// apiKey carries the installation token so the host authenticates to the
+	// loopback proxy; the proxy strips it before going upstream.
+	assert.equal(cfg.apiKey, ensureToken(), "apiKey must be the local installation token");
+	assert.match(cfg.apiKey, /^[0-9a-f]{64}$/, "the token is 32 bytes of hex");
 	assert.equal(cfg.api, "openai-completions");
 	assert.equal(cfg.compat?.supportsDeveloperRole, false);
 	assert.ok(cfg.models.length >= 26, "at least 26 static models registered");
@@ -311,24 +323,98 @@ test("F: buildProviderConfig emits the host-compatible provider contract", () =>
 		assert.equal(m.cost?.cacheWrite, 0);
 	}
 
-	// known model: OpenCode Zen responses model with a thinkingLevelMap
-	const muse = cfg.models.find((m) => m.id === "muse-spark-1.2-contributor-free");
-	assert.ok(muse, "muse model must be present");
-	assert.equal(muse!.reasoning, true);
-	assert.equal(muse!.api, "openai-responses");
-	assert.equal(muse!.thinking?.mode, "effort");
+ // No static entry declares a non-chat api since the responses lane's last
+ // model retired (Cline Muse Spark 1.3, 2026-10-22). The responses compat
+ // mapping stays wired for stale host registrations and future ids, so lock
+ // it with a synthetic model — same pattern as the messages passthrough in F2.
+	assert.equal(
+		cfg.models.some((m) => m.api !== undefined && m.api !== "openai-completions"),
+		false,
+		"no static model may declare a non-chat api",
+	);
+	const responsesCfg = buildProviderConfig(
+		[{
+			id: "flavor-fixture-responses",
+			name: "Flavor Fixture Responses",
+			reasoning: true,
+			contextWindow: 262_144,
+			maxTokens: 131_072,
+			api: "openai-responses",
+			input: ["text", "image"],
+			thinkingLevelMap: {
+				off: null,
+				minimal: "minimal",
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+				max: null,
+			},
+			source: "cline",
+		}],
+		port,
+	);
+	const responsesModel = responsesCfg.models[0];
+	assert.ok(responsesModel);
+	assert.equal(responsesModel!.api, "openai-responses");
+	assert.equal(responsesModel!.thinking?.mode, "effort");
 	assert.ok(
-		Array.isArray(muse!.thinking?.efforts) && muse!.thinking!.efforts!.length > 0,
+		Array.isArray(responsesModel!.thinking?.efforts) && responsesModel!.thinking!.efforts!.length > 0,
 		"efforts must be derived from the non-null thinkingLevelMap",
 	);
-	assert.equal(muse!.compat?.sessionAffinityFormat, "openai-nosession");
-	assert.equal(muse!.compat?.supportsDeveloperRole, undefined);
+	assert.equal(responsesModel!.compat?.sessionAffinityFormat, "openai-nosession");
+	assert.equal(responsesModel!.compat?.supportsDeveloperRole, undefined);
 
 	// known model: Kilo model with thinkingFormat
 	const kilo = cfg.models.find((m) => m.id === "dots-studio/dots-3-note-preview:free");
 	assert.ok(kilo, "kilo model must be present");
 	assert.equal(kilo!.compat?.thinkingFormat, "openrouter");
 	assert.equal(kilo!.compat?.supportsDeveloperRole, false);
+
+	const deepseek = cfg.models.find((m) => m.id === "deepseek-v4.1-flash-free");
+	assert.ok(deepseek);
+	assert.equal(deepseek.compat?.requiresReasoningContentOnAssistantMessages, true,
+		"DeepSeek requires reasoning content even when earlier assistant turns have none");
+	for (const model of cfg.models.filter((m) => m.id !== deepseek.id)) {
+		assert.equal(model.compat?.requiresReasoningContentOnAssistantMessages, undefined,
+			`${model.id} must retain its existing reasoning replay policy`);
+	}
+});
+
+test("model reasoning replay flags pass through independently of model name and source", () => {
+	for (const source of ["opencode", "kilo", "cline", "ovh"] as const) {
+		for (const required of [true, false, undefined]) {
+			const model: RegisteredModel = {
+				id: "reasoning-fixture",
+				name: "Reasoning Fixture",
+				reasoning: true,
+				contextWindow: 262_144,
+				maxTokens: 65_536,
+				source,
+				thinkingFormat: source === "kilo" ? "openrouter" : undefined,
+				requiresReasoningContentOnAssistantMessages: required,
+			};
+			const config = buildProviderConfig([model]);
+			assert.equal(config.models[0].compat?.requiresReasoningContentOnAssistantMessages, required);
+		}
+	}
+});
+
+test("F1: OVH models pin the plain openai thinking format and clear the Qwen template flag", () => {
+	// The host classifies the loopback proxy as a local OpenAI-compatible
+	// backend before the spec overrides land. For `Qwen3.x` ids that means
+	// `thinkingFormat: "qwen"` and `qwenPreserveThinking: true`, which makes
+	// the request carry `chat_template_kwargs` — OVH answers
+	// `400 feature 'extra arguments: …' is not currently supported`.
+	const cfg = buildProviderConfig(
+		OVH_MODELS.map((m) => ({ ...m, source: "ovh" as const })),
+		29751,
+	);
+	assert.equal(cfg.models.length, 8, "the OVH lane registers eight models");
+	for (const model of cfg.models) {
+		assert.equal(model.compat?.thinkingFormat, "openai", `${model.id} must not ride the Qwen template dialect`);
+		assert.equal(model.compat?.qwenPreserveThinking, false, `${model.id} must not set preserve_thinking`);
+	}
 });
 
 test("F2: buildProviderConfig passes the anthropic-messages api through", () => {

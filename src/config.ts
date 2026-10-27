@@ -25,6 +25,16 @@ export const UPSTREAM_OPENCODE = "https://opencode.ai/inference";
 export const KILO_CHAT_URL = "https://api.kilo.ai/api/gateway/chat/completions";
 export const KILO_RESPONSES_URL = "https://api.kilo.ai/api/gateway/responses";
 export const OPENCODE_API_URL = `${UPSTREAM_OPENCODE}/v1`;
+/**
+ * OpenAI-compat Zen lane (opt-in A/B only — the default lane stays /v1).
+ * The official CLI addresses the free tier here rather than on the plain
+ * /v1 chat path; same gateway, same Bearer public credential, but the path
+ * carries the extra `/openai` segment and the body carries `stream_options`.
+ * Relay probes address it via OPENCODE_OPENAI_COMPAT_PATH (the x-relay-path
+ * the workers forward as target + path).
+ */
+export const OPENCODE_OPENAI_COMPAT_URL = `${UPSTREAM_OPENCODE}/openai/v1/chat/completions`;
+export const OPENCODE_OPENAI_COMPAT_PATH = "/inference/openai/v1/chat/completions";
 // Cline serves chat completions only — responses-path requests are translated
 // to chat upstream and back (see tool-translation.ts). Direct-only: Cline
 // traffic never rides the relay pool and carries a per-user bearer token
@@ -51,7 +61,9 @@ export function resolvePort(): number {
  const envPort = process.env.PI_FREEFLOW_PORT;
  if (envPort) {
   const parsed = Number(envPort);
-  if (Number.isFinite(parsed) && parsed > 0 && parsed <= 65535) {
+  // Integers only: 28180.5 is finite and in range but net.Server.listen
+  // rejects it with an uncatchable ERR_SOCKET_BAD_PORT.
+  if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) {
    return parsed;
   }
  }
@@ -73,7 +85,7 @@ export const PORT = resolvePort();
 // OPENCODE_VERSION_FLOOR pins the minimum; OPENCODE_VERSION_FALLBACK is the
 // last-known-good npm version used when the live lookup is stale/offline.
 export const OPENCODE_VERSION_FLOOR = "1.17.0";
-export const OPENCODE_VERSION_FALLBACK = "1.19.0";
+export const OPENCODE_VERSION_FALLBACK = "1.19.4";
 /** Live npm lookup TTL: 6h — within one window the cached UA is reused. */
 export const OPENCODE_VERSION_TTL_MS = 6 * 60 * 60 * 1_000;
 /** Env override: exact `opencode/<version>` UA (or bare version) for tests/pins. */
@@ -203,10 +215,113 @@ export async function refreshOpenCodeUserAgent(fetchImpl: typeof fetch = fetch):
   return `opencode/${version}`;
  } catch { return getOpenCodeUserAgent(); }
 }
+/** Live version already fetched in-process, else the pinned fallback. No network, no side effect. */
+export function getLiveOpenCodeVersion(): string { return liveOpenCodeVersion ?? OPENCODE_VERSION_FALLBACK; }
+
+/**
+ * Pinned fallback for the v2 (channel/version/client) User-Agent shape.
+ * The free-tier CLI that passes the gate today reports the 2.x line, while
+ * the v1 fallback above pins the 1.x line the default lane sends — the two
+ * shapes need separate pins so a v2 A/B never emits `opencode/latest/1.x/...`.
+ */
+export const OPENCODE_V2_VERSION_FALLBACK = "2.0.27";
+
+/**
+ * Live 2.x version for the v2 UA shape, else the v2 pinned fallback.
+ * A live 1.x lookup never leaks into a v2 UA: only a major-2 version is used.
+ * No network, no side effect.
+ */
+export function getLiveOpenCodeV2Version(): string {
+ if (typeof liveOpenCodeVersion === "string" && /^2\.\d+\.\d+$/.test(liveOpenCodeVersion)) {
+  return liveOpenCodeVersion;
+ }
+ return OPENCODE_V2_VERSION_FALLBACK;
+}
+
+/**
+ * Build an OpenCode User-Agent string.
+ * v1: `opencode/<version>` (legacy shape); full: verbatim CLI 1.19.0 capture
+ * (`opencode/<version> ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`);
+ * v2: `opencode/<channel>/<version>/<client>` (CLI shape).
+ */
+export function buildOpenCodeUserAgent(shape: "v1" | "full" | "v2", version: string, channel = "latest", client = "opencode"): string {
+ if (shape === "full") return `opencode/${version} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`;
+ if (shape === "v2") return `opencode/${channel}/${version}/${client}`;
+ return `opencode/${version}`;
+}
+
+const STABLE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const STABLE_SESSION_CAP = 1000;
+const stableSessionCache = new Map<string, string>();
+const TIME48_MASK = (1n << 48n) - 1n;
+
+/**
+ * Stable per-conversation session id. A valid `ses_*` key passes through
+ * verbatim; "" allocates a fresh random id; anything else maps deterministically
+ * via sha256("pi-freeflow\\0" + key): 48-bit time field from the digest with the
+ * descending counter pinned at 1, plus 14 base62 chars from later digest bytes.
+ * Results are memoized in an LRU (cap 1000, hit moves to back); `now` is accepted
+ * for signature compatibility and ignored so the same key always maps the same.
+ */
+export function stableOpenCodeSessionId(key: string, now = Date.now()): string {
+ void now;
+ if (STABLE_SESSION_RE.test(key)) return key;
+ if (key === "") return createOpenCodeSessionId();
+ const hit = stableSessionCache.get(key);
+ if (hit !== undefined) {
+  stableSessionCache.delete(key);
+  stableSessionCache.set(key, hit);
+  return hit;
+ }
+ const digest = createHash("sha256").update(`pi-freeflow\0${key}`).digest();
+ const time48 = (BigInt(digest[0]!) << 40n) | (BigInt(digest[1]!) << 32n) | (BigInt(digest[2]!) << 24n) | (BigInt(digest[3]!) << 16n) | (BigInt(digest[4]!) << 8n) | BigInt(digest[5]!);
+ const time = ((~(time48 * 0x1000n + 1n)) & TIME48_MASK).toString(16).padStart(12, "0");
+ let rand = "";
+ for (let i = 0; i < 14; i++) rand += ID_CHARS[digest[(6 + i) % digest.length]! % 62];
+ const id = `ses_${time}${rand}`;
+ stableSessionCache.set(key, id);
+ if (stableSessionCache.size > STABLE_SESSION_CAP) {
+  const oldest = stableSessionCache.keys().next();
+  if (!oldest.done) stableSessionCache.delete(oldest.value);
+ }
+ return id;
+}
+
+/** Test-only: clear the stable session memo. */
+export function _resetStableSessionCacheForTest(): void { stableSessionCache.clear(); }
+
+/** Test-only: current stable session memo size (proves the LRU cap). */
+export function _stableSessionCacheSizeForTest(): number { return stableSessionCache.size; }
+
+/** Test-only: whether a key is currently memoized (proves LRU eviction). */
+export function _stableSessionHasKeyForTest(key: string): boolean { return stableSessionCache.has(key); }
 // OpenCode project ID: 40-character sha1 hex hash
 export const OPENCODE_PROJECT = createHash("sha1")
  .update("git-remote:github.com/anomalyco/opencode")
  .digest("hex");
+
+/**
+ * Project-header variants for the x-opencode-project A/B (opt-in only —
+ * the default lane keeps OPENCODE_PROJECT above).
+ * - "fixed": the pinned sha1 above (what the default lane sends today).
+ * - "global": the literal `global` project the CLI sends outside a repo.
+ * - "cwd": sha1 hex of the working directory, matching the CLI inside a repo.
+ */
+export const OPENCODE_PROJECT_GLOBAL = "global";
+export type OpenCodeProjectVariant = "fixed" | "global" | "cwd";
+/** sha1 hex digest of a working directory (what the CLI sends as the project). */
+export function openCodeProjectForCwd(cwd: string): string {
+ return createHash("sha1").update(cwd).digest("hex");
+}
+/**
+ * Resolve one project-header variant. "cwd" without a usable cwd falls back
+ * to the fixed pin rather than emitting an empty or garbage header.
+ */
+export function resolveOpenCodeProject(variant: OpenCodeProjectVariant, cwd?: string): string {
+ if (variant === "global") return OPENCODE_PROJECT_GLOBAL;
+ if (variant === "cwd" && typeof cwd === "string" && cwd.length > 0) return openCodeProjectForCwd(cwd);
+ return OPENCODE_PROJECT;
+}
 
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 let idTimestamp = 0;
@@ -237,6 +352,10 @@ export function createOpenCodeId(descending: boolean, timestamp = Date.now()): s
  return time + Array.from(bytes, (byte) => ID_CHARS[byte % 62]).join("");
 }
 
+// Upstream v1.19.4 refactored `SessionID.create` to compose the prefix itself
+// (`schema.make("ses_" + descending())` in packages/schema/src/session-id.ts).
+// The identifier generator is unchanged, so this call is still byte-for-byte
+// equivalent: `ses_` + 12 hex timestamp chars + 14 base62 random chars.
 export function createOpenCodeSessionId(): string {
  return `ses_${createOpenCodeId(true)}`;
 }
@@ -271,7 +390,7 @@ export const VERCEL_API = "https://api.vercel.com";
 // ── Catalog & Logging constants ─────────────────────────────────────
 export const CATALOG_CACHE_TTL_MS = 86_400_000; // 24 hours — delegate to host fetchDynamicModels
 export const LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB per file
-export const LOG_MAX_FILES = 10; // 10 archived + current ≈ 110MB max (≈100MB per your request, rotated, not single 100MB blob)
+export const LOG_MAX_FILES = 10; // 10 archived + current ≈ 110MB cap (rotated, never a single 100MB blob)
 
 // ── Whitelists & Security ───────────────────────────────────────────
 export const ALLOWED_PATH_PATTERN = /^\/v1\/[a-zA-Z0-9/_.,\-?&= %]*$/;
@@ -328,6 +447,22 @@ function dataFilePath(name: string): string {
  const override = dataDirOverride();
  if (override) return path.join(override, name);
  return path.join(defaultAgentDir(), name);
+}
+
+/**
+ * Per-installation proxy token file (src/token.ts reads/creates it at 0600).
+ * Sits with the other data files so a sandboxed data dir relocates it too.
+ */
+export function resolveTokenPath(): string {
+ try {
+  return dataFilePath("token");
+ } catch {
+  return path.join(
+   path.dirname(fileURLToPath(import.meta.url)),
+   "..",
+   ".pi-freeflow-token",
+  );
+ }
 }
 
 export function resolveRelayStatePath(): string {
@@ -428,6 +563,19 @@ export function resolveUpstreamHealthPath(): string {
    path.dirname(fileURLToPath(import.meta.url)),
    "..",
    ".upstream-health.json",
+  );
+ }
+}
+
+/** JSONL audit of tool-call turns that failed or needed repair (src/toolcall-audit.ts). */
+export function resolveToolcallAuditPath(): string {
+ try {
+  return dataFilePath("toolcall-audit.jsonl");
+ } catch {
+  return path.join(
+   path.dirname(fileURLToPath(import.meta.url)),
+   "..",
+   ".toolcall-audit.jsonl",
   );
  }
 }

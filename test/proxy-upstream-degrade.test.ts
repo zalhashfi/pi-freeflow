@@ -36,10 +36,11 @@ import {
 } from "../src/relay-state.ts";
 import { KILO_MODEL_IDS, resolveCanonicalModelId } from "../src/models.ts";
 import { withIsolatedRelayFiles } from "./_sandbox-helpers.ts";
+import { authHeaders } from "./_auth.ts";
 
 const TEST_PORT = 19291;
 const ZEN_MODEL = "mimo-v2.6-flash-free";
-const RESPONSES_MODEL = "muse-spark-1.3-contributor-free";
+const RESPONSES_MODEL = "nemotron-3.5-super-vl-free";
 const GATE_BODY = JSON.stringify({
  error: {
   code: "FreeTierError",
@@ -275,6 +276,30 @@ test("degrade: responses failover bodies drop Zen-bound state and clamp output t
  prepareChatFailoverBody(chat);
  assert.ok(!("prompt_cache_key" in chat));
  assert.equal(chat.max_tokens, KILO_FAILOVER_MAX_OUTPUT_TOKENS);
+
+ // The chat spelling carries both fields on the wire now: the same clamp
+ // algebra applies to `max_completion_tokens` — clamp only when above the
+ // ceiling, leave anything else untouched, and never touch the sibling
+ // spelling the caller did not send.
+ const chatFlat = newChat();
+ chatFlat.prompt_cache_key = "zen-chat-cache";
+ chatFlat.max_completion_tokens = 131_072;
+ prepareChatFailoverBody(chatFlat);
+ assert.ok(!("prompt_cache_key" in chatFlat));
+ assert.equal(chatFlat.max_completion_tokens, KILO_FAILOVER_MAX_OUTPUT_TOKENS);
+ assert.ok(!("max_tokens" in chatFlat), "only the spelling the caller sent is clamped");
+
+ const chatUnder = newChat();
+ chatUnder.max_completion_tokens = 1_024;
+ chatUnder.max_tokens = 1_024;
+ prepareChatFailoverBody(chatUnder);
+ assert.equal(chatUnder.max_completion_tokens, 1_024, "sub-ceiling value untouched");
+ assert.equal(chatUnder.max_tokens, 1_024, "sub-ceiling value untouched");
+
+ const chatAtCeiling = newChat();
+ chatAtCeiling.max_completion_tokens = KILO_FAILOVER_MAX_OUTPUT_TOKENS;
+ prepareChatFailoverBody(chatAtCeiling);
+ assert.equal(chatAtCeiling.max_completion_tokens, KILO_FAILOVER_MAX_OUTPUT_TOKENS, "ceiling-exact value is kept");
 });
 
 test("degrade: non-gate failures never trip the zen gate", () => {
@@ -283,7 +308,7 @@ test("degrade: non-gate failures never trip the zen gate", () => {
  recordUpstreamFailure("zen", 403, JSON.stringify({ error: "forbidden" }));
  recordUpstreamFailure("zen", 500, GATE_BODY);
  assert.equal(isUpstreamGated("zen"), false);
- assert.equal(isRetriableStatus(403), false, "403 stays a terminal verdict");
+ assert.equal(isRetriableStatus(403), false, "isRetriableStatus alone never covers 403 (relayFetch rolls it via its own branch)");
  _resetUpstreamHealthForTest();
 });
 
@@ -352,14 +377,14 @@ test("degrade e2e: gate x2 then new chat served as Kilo, proven stays on zen", a
    const post = (body: string): Promise<Response> =>
     fetch(`${localPrefix}/v1/chat/completions`, {
      method: "POST",
-     headers: { "content-type": "application/json" },
+     headers: { "content-type": "application/json", ...authHeaders() },
      body,
     });
 
    const postResponses = (body: string): Promise<Response> =>
     fetch(`${localPrefix}/v1/responses`, {
      method: "POST",
-     headers: { "content-type": "application/json" },
+     headers: { "content-type": "application/json", ...authHeaders() },
      body,
     });
 
@@ -477,7 +502,7 @@ test("degrade e2e: kilo 400 bad request recovers by clamping tokens and falling 
    const postResponses = (body: string): Promise<Response> =>
     fetch(`${localPrefix}/v1/responses`, {
      method: "POST",
-     headers: { "content-type": "application/json" },
+     headers: { "content-type": "application/json", ...authHeaders() },
      body,
     });
 
@@ -490,6 +515,118 @@ test("degrade e2e: kilo 400 bad request recovers by clamping tokens and falling 
    const body: Record<string, unknown> = await res.json();
    assert.equal(body.served_by, "kilo");
    assert.equal(kiloAttempts, 2, "must have retried once to recover from 400");
+  } finally {
+   _resetUpstreamHealthForTest();
+   _resetFreeTierHintForTest();
+   resetAllRelayHealth();
+   setActiveRelayState(priorState, false);
+   if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+ });
+});
+
+// ── Relay-served 403 never primes the zen gate; direct 403 still does ────────
+
+test("degrade e2e: relay-served 403 gates never prime the zen gate", async (t) => {
+ await withIsolatedRelayFiles(async () => {
+  const priorState = getActiveRelayState();
+  const RELAY = "https://zen-gate-403-relay.example.com";
+  setActiveRelayState({ enabled: true, url: RELAY, relays: [{ url: RELAY }], mode: "auto" }, false);
+  resetAllRelayHealth();
+  _resetUpstreamHealthForTest();
+  _resetFreeTierHintForTest();
+
+  const { server, port } = await startProxy(19281);
+  const effectivePort = port ?? 19281;
+  const localPrefix = `http://127.0.0.1:${effectivePort}`;
+  const realFetch = globalThis.fetch.bind(globalThis);
+  try {
+   t.mock.method(
+    globalThis,
+    "fetch",
+    async (url: unknown, init?: RequestInit) => {
+     const u = String(url);
+     if (u.startsWith(localPrefix)) return realFetch(u, init);
+     if (u === RELAY) return jsonResponse(403, GATE_BODY);
+     // Direct leg unreachable: relayFetch salvages the relay's 403 as the
+     // terminal response — relay-served, so it must not prime the gate.
+     throw new Error("direct upstream unreachable in this test");
+    },
+   );
+
+   const post = (body: string): Promise<Response> =>
+    fetch(`${localPrefix}/v1/chat/completions`, {
+     method: "POST",
+     headers: { "content-type": "application/json", ...authHeaders() },
+     body,
+    });
+
+   const first = await post(chatBody(ZEN_MODEL, "relay-gated-1"));
+   assert.equal(first.status, 403, "the salvaged relay 403 must surface to the caller");
+   await first.text();
+   assert.equal(
+    isUpstreamGated("zen"),
+    false,
+    "one relay-served 403 must not feed the machine-wide zen gate",
+   );
+
+   const second = await post(chatBody(ZEN_MODEL, "relay-gated-2"));
+   assert.equal(second.status, 403, "the second salvaged relay 403 must surface too");
+   await second.text();
+   assert.equal(
+    isUpstreamGated("zen"),
+    false,
+    "two relay-served 403s still must not trip the zen gate",
+   );
+  } finally {
+   _resetUpstreamHealthForTest();
+   _resetFreeTierHintForTest();
+   resetAllRelayHealth();
+   setActiveRelayState(priorState, false);
+   if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+ });
+});
+
+test("degrade e2e: direct 403 gates still prime the zen gate when relays are off", async (t) => {
+ await withIsolatedRelayFiles(async () => {
+  const priorState = getActiveRelayState();
+  setActiveRelayState({ enabled: false, url: "", relays: [] }, false);
+  resetAllRelayHealth();
+  _resetUpstreamHealthForTest();
+  _resetFreeTierHintForTest();
+
+  const { server, port } = await startProxy(19282);
+  const effectivePort = port ?? 19282;
+  const localPrefix = `http://127.0.0.1:${effectivePort}`;
+  const realFetch = globalThis.fetch.bind(globalThis);
+  try {
+   t.mock.method(
+    globalThis,
+    "fetch",
+    async (url: unknown, init?: RequestInit) => {
+     const u = String(url);
+     if (u.startsWith(localPrefix)) return realFetch(u, init);
+     return jsonResponse(403, GATE_BODY);
+    },
+   );
+
+   const post = (body: string): Promise<Response> =>
+    fetch(`${localPrefix}/v1/chat/completions`, {
+     method: "POST",
+     headers: { "content-type": "application/json", ...authHeaders() },
+     body,
+    });
+
+   const first = await post(chatBody(ZEN_MODEL, "direct-gated-1"));
+   assert.equal(first.status, 403);
+   await first.text();
+   assert.equal(isUpstreamGated("zen"), false, "a single direct gate must not trip yet");
+
+   const second = await post(chatBody(ZEN_MODEL, "direct-gated-2"));
+   assert.equal(second.status, 403);
+   await second.text();
+   assert.equal(isUpstreamGated("zen"), true, "two consecutive direct 403 gates must trip the zen gate");
   } finally {
    _resetUpstreamHealthForTest();
    _resetFreeTierHintForTest();

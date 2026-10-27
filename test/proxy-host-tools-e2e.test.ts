@@ -9,18 +9,15 @@ import {
 } from "../src/cline-accounts.ts";
 import http from "node:http";
 import { startProxy } from "../src/proxy.ts";
-import {
-	OPENCODE_FINGERPRINT_TOOLS,
-	convertSseToJson,
-	enforceOpencodeFingerprint,
-} from "../src/opencode-fingerprint.ts";
+import { authHeaders } from "./_auth.ts";
+import { OPENCODE_FINGERPRINT_TOOLS } from "../src/opencode-fingerprint.ts";
 import {
 	_resetFreeTierHintForTest,
 	_resetUpstreamHealthForTest,
 } from "../src/upstream-health.ts";
 
-const CHAT_MODEL = "muse-spark-1.2-contributor-free";
-const RESPONSES_MODEL = "muse-spark-1.3-contributor-free";
+const CHAT_MODEL = "mimo-v2.6-flash-free";
+const RESPONSES_MODEL = "nemotron-3.5-super-vl-free";
 const KILO_MODEL = "dots-studio/dots-3-note-preview:free";
 
 const FIND_DESC = "Find files by name";
@@ -80,7 +77,7 @@ function postJson(port: number, path: string, payload: unknown): Promise<{ statu
 			port,
 			path,
 			method: "POST",
-			headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data) },
+			headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data), ...authHeaders() },
 		});
 		req.on("response", (res) => {
 			const chunks: Buffer[] = [];
@@ -97,13 +94,15 @@ function postJson(port: number, path: string, payload: unknown): Promise<{ statu
  * Start a mock upstream capturing its request body, redirect global fetch at
  * it, start the real proxy, run the client flow, then tear everything down.
  * `capture.path` (optional) receives the upstream pathname, for assertions
- * about which endpoint a lane actually called.
+ * about which endpoint a lane actually called; `capture.bodies` receives every
+ * upstream request body in order, so a test can prove a retry happened (or
+ * never happened) and which model each attempt asked for.
  */
 async function withProxyAndMock(
 	proxyPort: number,
 	respond: (res: http.ServerResponse) => void,
 	client: (port: number) => Promise<void>,
-	capture?: { path?: string },
+	capture?: { path?: string; bodies?: Array<Record<string, unknown>> },
 ): Promise<Record<string, unknown> | null> {
 	_resetUpstreamHealthForTest();
 	_resetFreeTierHintForTest();
@@ -113,7 +112,9 @@ async function withProxyAndMock(
 		req.on("data", (c) => chunks.push(c as Buffer));
 		req.on("end", () => {
 			if (capture) capture.path = req.url ?? "";
-			upstreamReceivedBody = JSON.parse(Buffer.concat(chunks).toString());
+			const received = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+			upstreamReceivedBody = received;
+			capture?.bodies?.push(received);
 			respond(res);
 		});
 	});
@@ -144,6 +145,42 @@ function chatChunk(delta: unknown, finish?: string): string {
 function chatToolDelta(index: number, id: string, name: string, args: string): unknown {
 	return { tool_calls: [{ index, id, type: "function", function: { name, arguments: args } }] };
 }
+
+/**
+ * Frozen accepted answer for the chat `rawSse` below: the exact aggregated body
+ * a non-streaming caller must receive — upstream ids/arguments verbatim, the
+ * upstream `glob` restored to the caller's `find`, the caller's `Bash` casing
+ * back, one choice with finish_reason "tool_calls".
+ *
+ * This is a literal on purpose. Deriving the expectation by re-running the
+ * aggregator (`convertSseToJson`) over the same bytes lets both sides of the
+ * assertion move together, so the test could not fail for the real contract
+ * (that is what it did before). Change this literal only when the wire contract
+ * itself changes, and say why in the commit.
+ */
+const FROZEN_CHAT_AGGREGATE: Record<string, unknown> = {
+	id: "chatcmpl-e2e",
+	object: "chat.completion",
+	// Wall clock at capture; normalized away before the comparison below.
+	created: 1_792_406_084,
+	model: CHAT_MODEL,
+	choices: [
+		{
+			index: 0,
+			message: {
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					{ id: "call_find_1", type: "function", function: { name: "find", arguments: '{"pattern":"*.ts"}' } },
+					{ id: "call_bash_1", type: "function", function: { name: "Bash", arguments: '{"command":"ls"}' } },
+					{ id: "call_ask_1", type: "function", function: { name: "ask", arguments: '{"question":"q?"}' } },
+					{ id: "call_read_1", type: "function", function: { name: "read", arguments: '{"path":"x"}' } },
+				],
+			},
+			finish_reason: "tool_calls",
+		},
+	],
+};
 
 test("proxy e2e: chat non-stream carries mixed host tools upstream and restores names on aggregate", async () => {
 	const callerTools = mixedCallerTools();
@@ -216,25 +253,39 @@ test("proxy e2e: chat non-stream carries mixed host tools upstream and restores 
 	assert.equal(custom.strict, false);
 	assert.equal(custom["x-custom"], true);
 	for (const extra of ["todo", "ast_grep", "ls", "powershell"]) byUpstreamName(tools, extra);
-	// Client non-stream gets aggregated JSON via the convertSseToJson path.
-	const probe: Record<string, unknown> = { tools: JSON.parse(JSON.stringify(callerTools)), stream: false };
-	const fp = enforceOpencodeFingerprint(probe, "/v1/chat/completions");
+	// Client non-stream gets aggregated JSON: compare against the frozen body,
+	// never against a second aggregation of the same bytes.
 	const actual = JSON.parse(clientBody) as Record<string, unknown>;
-	const expected = JSON.parse(convertSseToJson(rawSse, "/v1/chat/completions", true, fp.caseRestore, fp.findGlob, fp.injected)) as Record<string, unknown>;
 	// `created` is stamped from the wall clock when each body is built, so a
-	// second boundary between the proxy's answer and this expectation moves it
+	// second boundary between the proxy's answer and this expectation moved it
 	// by one — comparing it made this test fail about once every few hundred
-	// runs (seen on CI). Compare every other field strictly, and check the
-	// stamp is a real epoch-seconds value rather than pinning its digit.
+	// runs (seen on CI). Pin the stamp on both sides, and check it is a real
+	// epoch-seconds value rather than pinning its digit.
 	assert.ok(Number.isInteger(actual.created) && (actual.created as number) > 1_600_000_000, "created must be an epoch-seconds stamp");
-	assert.equal(typeof expected.created, "number");
-	delete actual.created;
-	delete expected.created;
-	assert.deepEqual(actual, expected);
+	assert.deepEqual({ ...actual, created: 0 }, { ...FROZEN_CHAT_AGGREGATE, created: 0 });
 	const msg = (JSON.parse(clientBody) as { choices: Array<{ message: { tool_calls?: Array<{ function: { name: string } }> } }> }).choices[0].message;
 	const names = (msg.tool_calls ?? []).map((tc) => tc.function.name);
 	assert.deepEqual(names, ["find", "Bash", "ask", "read"], "upstream glob restores to caller find, bash restores to caller Bash, injected read executes (real def, not cloaked)");
 });
+
+/**
+ * Frozen accepted answer for the responses `rawSse` below: the
+ * `response.completed` payload, with upstream `glob`/`bash` restored to the
+ * caller's `find`/`Bash` and every id/argument/other output item verbatim.
+ * Literal on purpose; see FROZEN_CHAT_AGGREGATE.
+ */
+const FROZEN_RESPONSES_AGGREGATE: Record<string, unknown> = {
+	id: "resp_e2e",
+	object: "response",
+	status: "completed",
+	output: [
+		{ type: "function_call", id: "fc_find", name: "find", arguments: '{"pattern":"*.ts"}' },
+		{ type: "function_call", id: "fc_bash", name: "Bash", arguments: '{"command":"ls"}' },
+		{ type: "function_call", id: "fc_ask", name: "ask", arguments: '{"question":"q?"}' },
+		{ type: "function_call", id: "fc_read", name: "read", arguments: '{"path":"x"}' },
+		{ type: "message", id: "msg_done", role: "assistant", status: "completed", content: [{ type: "output_text", text: "done" }] },
+	],
+};
 
 test("proxy e2e: responses non-stream stores false, flat tools, function_call restore", async () => {
 	const callerTools = mixedCallerTools();
@@ -293,15 +344,38 @@ test("proxy e2e: responses non-stream stores false, flat tools, function_call re
 	const custom = byUpstreamName(tools, "my_custom_tool");
 	assert.equal(custom.strict, false);
 	assert.equal(custom["x-custom"], true);
-	const probe: Record<string, unknown> = { tools: JSON.parse(JSON.stringify(callerTools)), stream: false };
-	const fp = enforceOpencodeFingerprint(probe, "/v1/responses");
-	const expected = JSON.parse(convertSseToJson(rawSse, "/v1/responses", true, fp.caseRestore, fp.findGlob, fp.injected));
-	assert.deepEqual(JSON.parse(clientBody), expected);
+	// Frozen accepted answer: the response.completed object with the upstream
+	// `glob`/`bash` restored to the caller's `find`/`Bash`, ids and arguments
+	// verbatim, every non-call output item untouched. A literal, not a second
+	// aggregation of rawSse — see FROZEN_CHAT_AGGREGATE for why.
+	assert.deepEqual(JSON.parse(clientBody), FROZEN_RESPONSES_AGGREGATE);
 	const calls = ((JSON.parse(clientBody) as { output: Array<Record<string, unknown>> }).output ?? [])
 		.filter((item) => item.type === "function_call")
 		.map((item) => String(item.name));
 	assert.deepEqual(calls, ["find", "Bash", "ask", "read"], "upstream glob restores to caller find, injected read executes (real def, not cloaked)");
 });
+
+/**
+ * Frozen accepted answer for the messages `rawSse` below: the aggregated
+ * Anthropic message — one tool_use block per streamed call, upstream `glob`
+ * restored to the caller's `find` and `bash` to the caller's `Bash`, the
+ * injected `grep` call surfaced as itself, stop_reason from message_delta,
+ * no usage (the stream carried none). Literal on purpose; see
+ * FROZEN_CHAT_AGGREGATE.
+ */
+const FROZEN_MESSAGES_AGGREGATE: Record<string, unknown> = {
+	id: "msg_e2e",
+	type: "message",
+	role: "assistant",
+	model: RESPONSES_MODEL,
+	content: [
+		{ type: "tool_use", id: "tu_find", name: "find", input: { pattern: "*.ts" } },
+		{ type: "tool_use", id: "tu_bash", name: "Bash", input: { command: "ls" } },
+		{ type: "tool_use", id: "tu_ask", name: "ask", input: { question: "q?" } },
+		{ type: "tool_use", id: "tu_grep", name: "grep", input: { pat: "x" } },
+	],
+	stop_reason: "tool_use",
+};
 
 test("proxy e2e: messages non-stream uses anthropic shape and restores tool_use names", async () => {
 	const callerTools = mixedCallerTools();
@@ -353,10 +427,8 @@ test("proxy e2e: messages non-stream uses anthropic shape and restores tool_use 
 	assert.equal(glob.description, FIND_DESC);
 	assert.deepEqual(glob.input_schema, FIND_PARAMS);
 	assert.equal(String(byUpstreamName(tools, "bash").name), "bash");
-	const probe: Record<string, unknown> = { tools: JSON.parse(JSON.stringify(callerTools)), stream: false };
-	const fp = enforceOpencodeFingerprint(probe, "/v1/messages");
-	const expected = JSON.parse(convertSseToJson(rawSse, "/v1/messages", true, fp.caseRestore, fp.findGlob, fp.injected));
-	assert.deepEqual(JSON.parse(clientBody), expected);
+	// Frozen accepted answer; never a second aggregation of rawSse.
+	assert.deepEqual(JSON.parse(clientBody), FROZEN_MESSAGES_AGGREGATE);
 	const blocks = ((JSON.parse(clientBody) as { content: Array<Record<string, unknown>> }).content ?? [])
 		.filter((b) => b.type === "tool_use")
 		.map((b) => String(b.name));
@@ -422,7 +494,7 @@ test("proxy e2e: kilo path bypass leaves caller tools untouched", async () => {
 	assert.deepEqual(JSON.parse(clientBody), JSON.parse(kiloJson));
 });
 
-const CLINE_MODEL = "z-ai/glm-5.3-flash";
+const CLINE_MODEL = "cline/nemotron-3.5-super-vl";
 
 test("proxy e2e: cline responses path reshapes tools with zero fingerprint", async () => {
 	// Cline bypass (observable contract): a Cline-model request never carries
@@ -607,8 +679,8 @@ test("proxy e2e: ovh responses path translates to chat upstream and answers a Re
 			stream: false,
 			tools: callerTools,
 			tool_choice: "auto",
+			max_output_tokens: 32,
 		});
-		assert.equal(res.status, 200);
 		clientBody = res.body;
 	}, capture);
 	assert.ok(upstream);
@@ -617,6 +689,7 @@ test("proxy e2e: ovh responses path translates to chat upstream and answers a Re
 	assert.equal(upstream.stream, true, "ovh upstream always streams for aggregation");
 	assert.ok(!("store" in upstream), "ovh never adds store");
 	assert.ok(!("input" in upstream), "the responses-only input field never reaches the chat endpoint");
+	assert.ok(!("max_output_tokens" in upstream), "max_output_tokens must be stripped so OVH does not reject it as an extra argument");
 	assert.ok(Array.isArray(upstream.messages), "the caller's input array became chat messages");
 	assert.deepEqual(upstream.messages, [{ role: "user", content: "Say OK" }], "the caller's input text survives the mapping");
 	assert.ok(Array.isArray(upstream.tools));
@@ -732,6 +805,110 @@ test("proxy e2e: ovh chat streaming restores the caller's tool names", async () 
 	assert.ok(clientBody.includes("git status --short"), "the glued bash payload is repaired on the streamed ovh lane too");
 });
 
+test("proxy e2e: ovh qwen3.8 drops reasoning_effort before the wire", async () => {
+	// Measured 2026-10-22: Qwen3.8-27B on OVH answers HTTP 200 whose body is a
+	// bare `data: [DONE]` whenever `reasoning_effort` is present (max_tokens
+	// 4000 and 32000 alike); without the field it streams its own reasoning.
+	// The lane strips the field for this model only.
+	let clientBody = "";
+	const upstream = await withProxyAndMock(29330, (res) => {
+		res.writeHead(200, { "content-type": "text/event-stream" });
+		res.end(ovhChatSse("Qwen3.8-27B", "answered"));
+	}, async (port) => {
+		const res = await postJson(port, "/v1/chat/completions", {
+			model: "ovh-free/Qwen3.8-27B",
+			messages: [{ role: "user", content: "hi" }],
+			stream: false,
+			reasoning_effort: "high",
+		});
+		assert.equal(res.status, 200);
+		clientBody = res.body;
+	});
+	assert.ok(upstream);
+	assert.ok(!("reasoning_effort" in upstream), "qwen3.8 must never receive reasoning_effort upstream");
+	const client = JSON.parse(clientBody) as Record<string, unknown>;
+	const message = (client.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>;
+	assert.equal(message.content, "answered", "the model answers normally once the field is gone");
+});
+
+test("proxy e2e: ovh gpt-oss-20b keeps reasoning_effort verbatim", async () => {
+	// The strip above is model-scoped: every other OVH model tolerates the
+	// field, so the lane must not silently rewrite their sampling knobs.
+	const upstream = await withProxyAndMock(29331, (res) => {
+		res.writeHead(200, { "content-type": "text/event-stream" });
+		res.end(ovhChatSse("gpt-oss-20b", "kept"));
+	}, async (port) => {
+		const res = await postJson(port, "/v1/chat/completions", {
+			model: OVH_MODEL,
+			messages: [{ role: "user", content: "hi" }],
+			stream: false,
+			reasoning_effort: "high",
+		});
+		assert.equal(res.status, 200);
+	});
+	assert.ok(upstream);
+	assert.equal(upstream.reasoning_effort, "high", "the qwen-only strip must not touch another ovh model");
+});
+
+test("proxy e2e: ovh mistral small normalizes non-conforming tool-call ids", async () => {
+	// Upstream rejects any replayed id that is not 9 alphanumerics: 400
+	// "Tool call id was ll_loop_1 but must be a-z, A-Z, 0-9, with a length of 9"
+	// when not streaming, and the same silent `[DONE]`-only 200 when it is. A
+	// host history id such as `call_loop_1` must be rewritten consistently on
+	// the assistant call and the tool message that answers it.
+	let clientBody = "";
+	const upstream = await withProxyAndMock(29332, (res) => {
+		res.writeHead(200, { "content-type": "text/event-stream" });
+		res.end(ovhChatSse("Mistral-Small-3.2-24B-Instruct-2506", "done"));
+	}, async (port) => {
+		const res = await postJson(port, "/v1/chat/completions", {
+			model: "ovh-free/Mistral-Small-3.2-24B-Instruct-2506",
+			messages: [
+				{ role: "user", content: "hi" },
+				{ role: "assistant", content: null, tool_calls: [{ id: "call_loop_1", type: "function", function: { name: "find", arguments: '{"pattern":"*.ts"}' } }] },
+				{ role: "tool", tool_call_id: "call_loop_1", content: "a.ts" },
+			],
+			stream: false,
+		});
+		assert.equal(res.status, 200);
+		clientBody = res.body;
+	});
+	assert.ok(upstream);
+	const messages = upstream.messages as Array<Record<string, unknown>>;
+	const assistantId = String((messages[1].tool_calls as Array<Record<string, unknown>>)[0].id);
+	assert.match(assistantId, /^[A-Za-z0-9]{9}$/, "the replayed id must satisfy upstream's 9-alphanumeric rule");
+	assert.equal(messages[2].tool_call_id, assistantId, "the tool message must carry the same rewritten id");
+	assert.ok(!JSON.stringify(upstream.messages).includes("call_loop_1"), "no non-conforming id may survive upstream");
+	const client = JSON.parse(clientBody) as Record<string, unknown>;
+	const message = (client.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>;
+	assert.equal(message.content, "done", "the turn passes through once the ids conform");
+});
+
+test("proxy e2e: an empty ovh upstream stream surfaces as a 502, never a fabricated turn", async () => {
+	// Starved OVH requests (defects above) close with a bare `data: [DONE]`.
+	// Aggregating that used to yield `chatcmpl-freeflow` with `content: null`
+	// and `finish_reason: "stop"` — a fabricated 200 completion that hid the
+	// upstream failure. It must surface as an error.
+	let clientBody = "";
+	let clientType = "";
+	await withProxyAndMock(29333, (res) => {
+		res.writeHead(200, { "content-type": "text/event-stream" });
+		res.end("data: [DONE]\n\n");
+	}, async (port) => {
+		const res = await postJson(port, "/v1/chat/completions", {
+			model: "ovh-free/Qwen3.8-27B",
+			messages: [{ role: "user", content: "hi" }],
+			stream: false,
+		});
+		assert.equal(res.status, 502, "an upstream that returns nothing is an upstream error");
+		clientType = String(res.headers["content-type"] ?? "");
+		clientBody = res.body;
+	});
+	assert.ok(clientType.includes("application/json"), "the error is JSON, not an SSE stream");
+	assert.ok(clientBody.includes("upstream returned an empty stream"), "the error names the emptiness");
+	assert.ok(!clientBody.includes("chatcmpl-freeflow"), "never emit the fabricated empty completion");
+});
+
 test("proxy e2e: cline responses returns the caller's own tool name", async () => {
 	const read = (p: string): string | null => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null);
 	const mainBefore = read(CLINE_POOL_FILE);
@@ -810,5 +987,138 @@ test("proxy e2e: kilo repairs a non-stream JSON answer", async () => {
 	const calls = message.tool_calls as Array<Record<string, unknown>>;
 	const bashArgs = JSON.parse((calls[1].function as Record<string, unknown>).arguments as string) as { command: string };
 	assert.equal(bashArgs.command, "git status --short", "a non-streaming kilo answer is repaired too");
+});
+
+test("proxy e2e: a plain-JSON answer that merely mentions data: passes through byte-identical", async () => {
+	// Reproduced live: the Kilo lane forwards `stream:false` untouched, so a
+	// non-streaming caller gets plain JSON. The aggregator guard tested
+	// `includes("data:")`, which this bash command triggers — the JSON body was
+	// fed to the SSE parser and replaced by an empty synthesized completion
+	// (content null, tool call gone, HTTP 200). The guard is line-anchored now:
+	// a body with no `data:`/`event:` field line is not an event stream.
+	const answer = {
+		id: "chatcmpl-data",
+		object: "chat.completion",
+		model: "dots-3",
+		choices: [{
+			index: 0,
+			message: {
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					{ id: "c0", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: 'grep -n "data:" src/stream-pipe.ts' }) } },
+				],
+			},
+			finish_reason: "tool_calls",
+		}],
+	};
+	const upstreamJson = JSON.stringify(answer);
+	let clientBody = "";
+	const upstream = await withProxyAndMock(29332, (res) => {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(upstreamJson);
+	}, async (port) => {
+		const res = await postJson(port, "/v1/chat/completions", {
+			model: KILO_MODEL,
+			messages: [{ role: "user", content: "hi" }],
+			stream: false,
+			tools: piCallerTools(),
+		});
+		assert.equal(res.status, 200);
+		assert.ok(res.headers["content-type"]?.includes("application/json"));
+		clientBody = res.body;
+	});
+	assert.ok(upstream);
+	assert.equal(clientBody, upstreamJson, "a non-SSE 200 must reach the client exactly as upstream wrote it");
+	const client = JSON.parse(clientBody) as { choices: Array<{ message: { content: unknown; tool_calls: Array<{ function: { arguments: string } }> } }> };
+	assert.equal(client.choices[0].message.tool_calls.length, 1, "the tool call must not be swallowed by an SSE aggregation");
+	const bashArgs = JSON.parse(client.choices[0].message.tool_calls[0].function.arguments) as { command: string };
+	assert.equal(bashArgs.command, 'grep -n "data:" src/stream-pipe.ts', "the arguments survive verbatim");
+});
+
+test("proxy e2e: a kilo 400 surfaces upstream's verdict for the requested model — one call, no substitution", async () => {
+	// The 400 recovery used to rewrite `dots-studio/dots-3-note-preview:free`
+	// to `nvidia/nemotron-3.5-lightning:free` and retry, so the caller could be
+	// handed another model's answer (or another model's error body) with only
+	// the `model` field as a trace. The upstream verdict must surface as-is.
+	const upstreamError = JSON.stringify({ error: { message: "dots-3-note-preview is not available right now" } });
+	const capture: { bodies: Array<Record<string, unknown>> } = { bodies: [] };
+	await withProxyAndMock(29333, (res) => {
+		res.writeHead(400, { "content-type": "application/json" });
+		res.end(upstreamError);
+	}, async (port) => {
+		const res = await postJson(port, "/v1/chat/completions", {
+			model: KILO_MODEL,
+			messages: [{ role: "user", content: "hi" }],
+			stream: false,
+			tools: piCallerTools(),
+		});
+		assert.equal(res.status, 400);
+		assert.equal(res.body, upstreamError, "the authentic upstream 400 body must reach the caller");
+	}, capture);
+	assert.equal(capture.bodies.length, 1, "a named-model 400 must never be retried on another model");
+	assert.equal(capture.bodies[0].model, KILO_MODEL, "upstream saw the model the caller asked for");
+});
+
+test("proxy e2e: a client that abandons a cline turn aborts the upstream roll", async () => {
+	// The cline lane aborted only on `res.writableEnded`, which stays false for
+	// a socket the caller destroyed: an abandoned turn left the upstream body
+	// paused forever and the handler never finished. The roll now carries an
+	// AbortController wired to the response's close.
+	const read = (p: string): string | null => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null);
+	const mainBefore = read(CLINE_POOL_FILE);
+	const bakBefore = read(CLINE_POOL_BACKUP_FILE);
+	try {
+		fs.rmSync(CLINE_POOL_FILE, { force: true });
+		fs.rmSync(CLINE_POOL_BACKUP_FILE, { force: true });
+		_resetClinePoolCacheForTest();
+		savePool({ accounts: [{ slot: "main", token: "workos:test-key-aaa111", addedAt: new Date().toISOString() }] });
+		_resetClinePoolCacheForTest();
+		// The mock has the upstream request; the roll's socket was closed;
+		// the safety valve released the held turn itself.
+		const upstreamSeen = Promise.withResolvers<void>();
+		const aborted = Promise.withResolvers<void>();
+		const releasedByValve = Promise.withResolvers<void>();
+		let valveFired = false;
+		await withProxyAndMock(29334, (res) => {
+			upstreamSeen.resolve();
+			res.req.once("close", () => {
+				(valveFired ? releasedByValve : aborted).resolve();
+			});
+			// The held turn must not wedge the harness when no abort ever
+			// arrives (the pre-fix behaviour this test locks out). A real
+			// socket cannot be released by fake timers.
+			setTimeout(() => {
+				valveFired = true;
+				try { res.destroy(); } catch { }
+			}, 3000).unref();
+		}, async (port) => {
+			const data = JSON.stringify({ model: CLINE_MODEL, input: "hi", stream: false });
+			const clientReq = http.request({
+				hostname: "127.0.0.1",
+				port,
+				path: "/v1/responses",
+				method: "POST",
+				headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data), ...authHeaders() },
+			});
+			clientReq.on("error", () => { });
+			clientReq.write(data);
+			// The roll is in flight once upstream has the request; walk away.
+			await upstreamSeen.promise;
+			clientReq.destroy();
+			const verdict = await Promise.race([
+				aborted.promise.then(() => "aborted" as const),
+				releasedByValve.promise.then(() => "held" as const),
+			]);
+			assert.equal(verdict, "aborted", "abandoning the caller must abort the in-flight upstream roll");
+		});
+	} finally {
+		_resetClinePoolCacheForTest();
+		if (mainBefore !== null) fs.writeFileSync(CLINE_POOL_FILE, mainBefore, "utf8");
+		else fs.rmSync(CLINE_POOL_FILE, { force: true });
+		if (bakBefore !== null) fs.writeFileSync(CLINE_POOL_BACKUP_FILE, bakBefore, "utf8");
+		else fs.rmSync(CLINE_POOL_BACKUP_FILE, { force: true });
+		_resetClinePoolCacheForTest();
+	}
 });
 

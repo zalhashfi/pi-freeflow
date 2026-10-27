@@ -3,21 +3,23 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
 import { relayFetch, _resetRollNotifyForTest } from "../src/relay.ts";
 import {
 	getRelayHealth,
 	isRelayHealthy,
+	markRelayFailure,
+	saveRelayState,
 	setActiveRelayState,
 	setStatusUi,
 	resetAllRelayHealth,
 } from "../src/relay-state.ts";
+import { LOG_FILE, RELAY_STATE_FILE } from "../src/config.ts";
 import { startProxy } from "../src/proxy.ts";
+import { authHeaders } from "./_auth.ts";
+import { withIsolatedRelayFiles, withIsolatedSandboxFiles } from "./_sandbox-helpers.ts";
 
-test("relayFetch uses global fetch (keep-alive via Node default)", () => {
-	// 0 deps now — global fetch pools keep-alive without custom undici Agent
-	assert.equal(typeof relayFetch, "function");
-});
 test("relayFetch direct uses keepAlive dispatcher (connection: keep-alive)", async () => {
 	const seen: string[] = [];
 	const server = http.createServer((req, res) => {
@@ -54,7 +56,7 @@ test("proxy direct path responds with keep-alive header", async () => {
 	const { server, port } = await startProxy(testPort);
 	assert.ok(server);
 	try {
-		const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
+		const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: authHeaders() });
 		assert.equal(res.status, 200);
 		// Node http server should keep connection alive; our proxy explicitly sets connection keep-alive for upstream,
 		// and for /v1/models the server default is keep-alive. Accept either explicit header or implicit keep-alive via not-closed.
@@ -113,6 +115,151 @@ function stubResponse(status: number, cancelled: number[]): Response {
 		},
 	} as unknown as Response;
 }
+
+test("429 rotation is silent: no rate-limit toast while a sibling relay serves", async (t) => {
+	await withIsolatedSandboxFiles(async () => {
+		_resetRollNotifyForTest();
+		resetAllRelayHealth();
+		const messages: string[] = [];
+		setStatusUi({
+			notify: (message: string) => {
+				messages.push(message);
+			},
+			setStatus() {},
+		} as unknown as Parameters<typeof setStatusUi>[0]);
+
+		t.mock.method(globalThis, "fetch", async (input: unknown) => {
+			const target = String(input);
+			if (target.startsWith("https://limited.example.com")) {
+				return new Response(JSON.stringify({ error: "rate limited" }), {
+					status: 429,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response(JSON.stringify({ id: "after-429" }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+
+		const limited = "https://limited.example.com";
+		const healthy = "https://healthy.example.com";
+		setActiveRelayState({
+			enabled: true,
+			url: limited,
+			relays: [{ url: limited }, { url: healthy }],
+			mode: "auto",
+		} as unknown as Parameters<typeof setActiveRelayState>[0], false);
+
+		try {
+			const res = await relayFetch(
+				"https://opencode.ai/zen/v1/chat/completions",
+				{ method: "POST", body: "{}" },
+				"silent429",
+			);
+			assert.equal(res.status, 200, "the sibling relay must serve the turn");
+			assert.equal((await res.json() as { id?: string }).id, "after-429");
+			assert.deepEqual(messages, [], "an intermediate 429 must never toast");
+			const lines = fs.readFileSync(LOG_FILE, "utf8").split(/\r?\n/).filter((l) => l.includes("silent429"));
+			assert.ok(
+				lines.some((l) => l.includes("[INFO]") && l.includes("rate-limited")),
+				"the rotation should leave one quiet INFO trace",
+			);
+			assert.ok(
+				!lines.some((l) => l.includes("[WARN]")),
+				"an intermediate 429 must not produce a WARN line",
+			);
+		} finally {
+			setStatusUi(null);
+			resetAllRelayHealth();
+			setActiveRelayState({ enabled: true, url: "", relays: [], mode: "auto" } as unknown as Parameters<typeof setActiveRelayState>[0], false);
+		}
+	});
+});
+
+test("exhaustion summary is INFO for an all-429 pool; mixed failures keep the WARN", async (t) => {
+	await withIsolatedSandboxFiles(async () => {
+		_resetRollNotifyForTest();
+		resetAllRelayHealth();
+		const fetchMock = t.mock.method(globalThis, "fetch", async (input: unknown) => {
+			const target = String(input);
+			if (target.startsWith("https://limited.example.com")) {
+				return new Response(JSON.stringify({ error: "rate limited" }), {
+					status: 429,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			if (target.startsWith("https://broken.example.com")) {
+				return new Response(JSON.stringify({ error: "unavailable" }), {
+					status: 503,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			// Direct fallback.
+			return new Response(JSON.stringify({ error: "rate limited" }), {
+				status: 429,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		try {
+			const limited = "https://limited.example.com";
+			setActiveRelayState({
+				enabled: true,
+				url: limited,
+				relays: [{ url: limited }],
+				mode: "auto",
+			} as unknown as Parameters<typeof setActiveRelayState>[0], false);
+			const all429 = await relayFetch(
+				"https://opencode.ai/zen/v1/chat/completions",
+				{ method: "POST", body: "{}" },
+				"exhausted429",
+			);
+			assert.equal(all429.status, 429);
+			const all429Lines = fs.readFileSync(LOG_FILE, "utf8").split(/\r?\n/).filter((l) => l.includes("exhausted429"));
+			assert.equal(
+				all429Lines.filter((l) => l.includes("all relays rate-limited")).length,
+				1,
+				"the all-429 pool logs exactly one summary",
+			);
+			assert.ok(
+				all429Lines.some((l) => l.includes("[INFO]") && l.includes("all relays rate-limited")),
+				"an all-429 pool is a quiet INFO recovery, not a WARN",
+			);
+			assert.ok(
+				!all429Lines.some((l) => l.includes("relays bypassed/exhausted")),
+				"an all-429 pool must not claim a generic exhaustion",
+			);
+
+			resetAllRelayHealth();
+			const broken = "https://broken.example.com";
+			setActiveRelayState({
+				enabled: true,
+				url: broken,
+				relays: [{ url: broken }],
+				mode: "auto",
+			} as unknown as Parameters<typeof setActiveRelayState>[0], false);
+			const mixed = await relayFetch(
+				"https://opencode.ai/zen/v1/chat/completions",
+				{ method: "POST", body: "{}" },
+				"mixed503",
+			);
+			assert.equal(mixed.status, 429);
+			const mixedLines = fs.readFileSync(LOG_FILE, "utf8").split(/\r?\n/).filter((l) => l.includes("mixed503"));
+			assert.ok(
+				mixedLines.some((l) => l.includes("[WARN]") && l.includes("relays bypassed/exhausted")),
+				"a mixed 503 + 429 pool keeps the generic WARN summary",
+			);
+			assert.ok(
+				!mixedLines.some((l) => l.includes("all relays rate-limited")),
+				"a mixed pool must never be labelled all-rate-limited",
+			);
+		} finally {
+			fetchMock.mock.restore();
+			resetAllRelayHealth();
+			setActiveRelayState({ enabled: true, url: "", relays: [], mode: "auto" } as unknown as Parameters<typeof setActiveRelayState>[0], false);
+		}
+	});
+});
 
 test("roll-notify throttle: one toast per 5min window, reset hook re-arms it", async (t) => {
 	_resetRollNotifyForTest();
@@ -309,18 +456,100 @@ test("relayFetch rolls on a relay auth rejection (401) and cools the rejecting r
 	}
 });
 
-test("relayFetch keeps a 403 free-tier gate terminal (no roll, no penalty)", async (t) => {
+test("relayFetch rolls on a relay 403 (rejected egress fingerprint) and cools the relay", async (t) => {
+	_resetRollNotifyForTest();
 	resetAllRelayHealth();
-	const RELAY = "https://gated-relay.example.com";
+	const messages: string[] = [];
+	setStatusUi({
+		notify: (message: string) => {
+			messages.push(message);
+		},
+		setStatus() {},
+	} as unknown as Parameters<typeof setStatusUi>[0]);
+
+	const RELAY_403 = "https://gated-egress-relay.example.com";
+	const RELAY_OK = "https://healthy-relay.example.com";
 	const seen: string[] = [];
 	t.mock.method(globalThis, "fetch", async (input: string | URL) => {
-		seen.push(String(input));
-		return new Response(
-			JSON.stringify({
-				error: { code: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode" },
-			}),
-			{ status: 403, headers: { "content-type": "application/json" } },
+		const target = String(input);
+		seen.push(target);
+		if (target === RELAY_403) {
+			// Exactly what OpenCode Zen answers when the relay's egress
+			// fingerprint is not the client's (stripped User-Agent etc.).
+			return new Response(
+				JSON.stringify({
+					error: { code: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode" },
+				}),
+				{ status: 403, headers: { "content-type": "application/json" } },
+			);
+		}
+		return new Response("ok", { status: 200 });
+	});
+
+	try {
+		setActiveRelayState(
+			{
+				enabled: true,
+				url: RELAY_403,
+				relays: [{ url: RELAY_403 }, { url: RELAY_OK }],
+				mode: "auto",
+			} as unknown as Parameters<typeof setActiveRelayState>[0],
+			false,
 		);
+
+		const res = await relayFetch(
+			"https://opencode.ai/zen/v1/chat/completions",
+			{ method: "POST", body: "{}" },
+			"gate403roll",
+		);
+
+		assert.equal(res.status, 200, "the next candidate must serve after a relay 403");
+		assert.deepEqual(
+			seen,
+			[RELAY_403, RELAY_OK],
+			"the 403-ing relay must roll to the next candidate (never straight to direct)",
+		);
+
+		// A relay-forwarded 403 is a relay-host fault: failed and cooled,
+		// never recorded as a success.
+		const health = getRelayHealth(RELAY_403);
+		assert.ok(health, "the 403-ing relay must carry a health record");
+		assert.equal(health.consecutiveFailures, 1, "403 must count as a relay failure");
+		assert.equal(health.lastStatus, 403, "the failure must record the 403 status");
+		assert.equal(health.successCount ?? 0, 0, "403 must never be marked a success");
+		assert.equal(isRelayHealthy(RELAY_403), false, "403 must put the relay in cooldown");
+		assert.equal(isRelayHealthy(RELAY_OK), true, "the healthy relay must stay healthy");
+
+		assert.equal(messages.length, 1, "the roll must notify once");
+		assert.match(messages[0], /403/, "the toast must name the relay's 403");
+	} finally {
+		setStatusUi(null);
+		_resetRollNotifyForTest();
+		resetAllRelayHealth();
+		setActiveRelayState(
+			{ enabled: true, url: "", relays: [], mode: "auto" } as unknown as Parameters<typeof setActiveRelayState>[0],
+			false,
+		);
+	}
+});
+
+test("relayFetch falls back to direct when every relay answers 403", async (t) => {
+	resetAllRelayHealth();
+	const RELAY = "https://gated-egress-relay.example.com";
+	const UPSTREAM = "https://opencode.ai/zen/v1/chat/completions";
+	const seen: string[] = [];
+	t.mock.method(globalThis, "fetch", async (input: string | URL) => {
+		const target = String(input);
+		seen.push(target);
+		if (target === RELAY) {
+			return new Response(
+				JSON.stringify({
+					error: { code: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode" },
+				}),
+				{ status: 403, headers: { "content-type": "application/json" } },
+			);
+		}
+		return new Response("ok", { status: 200 });
 	});
 
 	try {
@@ -331,13 +560,14 @@ test("relayFetch keeps a 403 free-tier gate terminal (no roll, no penalty)", asy
 			false,
 		);
 
-		const res = await relayFetch("https://opencode.ai/zen/v1/chat/completions", { method: "POST" }, "gate403");
+		const res = await relayFetch(UPSTREAM, { method: "POST", body: "{}" }, "gate403direct");
 
-		assert.equal(res.status, 403, "a 403 gate must surface unchanged");
-		assert.deepEqual(seen, [RELAY], "a 403 gate must never roll or hit the direct fallback");
+		assert.equal(res.status, 200, "the direct fallback must serve after a relay 403");
+		assert.deepEqual(seen, [RELAY, UPSTREAM], "the 403-ing relay must roll, then fall back to direct");
 		const health = getRelayHealth(RELAY);
-		assert.equal(health?.failureCount ?? 0, 0, "a 403 gate is an upstream verdict, not a relay fault");
-		assert.equal(isRelayHealthy(RELAY), true, "a 403 gate must not cool the relay");
+		assert.ok(health, "the 403-ing relay must carry a health record");
+		assert.equal(health.consecutiveFailures, 1, "403 must mark the relay failed");
+		assert.equal(health.lastStatus, 403, "the failure must record the 403 status");
 	} finally {
 		resetAllRelayHealth();
 		setActiveRelayState(
@@ -345,4 +575,150 @@ test("relayFetch keeps a 403 free-tier gate terminal (no roll, no penalty)", asy
 			false,
 		);
 	}
+});
+
+test("relayFetch surfaces the direct 403 when relay and direct both answer 403", async (t) => {
+	resetAllRelayHealth();
+	const RELAY = "https://gated-egress-relay.example.com";
+	const UPSTREAM = "https://opencode.ai/zen/v1/chat/completions";
+	const relayBody = JSON.stringify({
+		error: { code: "FreeTierError", message: "relay-shaped rejection" },
+	});
+	const directBody = JSON.stringify({
+		error: { code: "FreeTierError", message: "direct-shaped rejection" },
+	});
+	const seen: string[] = [];
+	t.mock.method(globalThis, "fetch", async (input: string | URL) => {
+		const target = String(input);
+		seen.push(target);
+		const body = target === RELAY ? relayBody : directBody;
+		return new Response(body, { status: 403, headers: { "content-type": "application/json" } });
+	});
+
+	try {
+		setActiveRelayState(
+			{ enabled: true, url: RELAY, relays: [{ url: RELAY }], mode: "auto" } as unknown as Parameters<
+				typeof setActiveRelayState
+			>[0],
+			false,
+		);
+
+		const res = await relayFetch(UPSTREAM, { method: "POST", body: "{}" }, "gate403both");
+
+		assert.equal(res.status, 403, "the direct 403 must surface unchanged");
+		assert.equal(await res.text(), directBody, "the surfaced body must be the direct leg's, not the relay's");
+		assert.equal(seen[seen.length - 1], UPSTREAM, "the direct URL must be the last one fetched");
+		assert.deepEqual(seen, [RELAY, UPSTREAM], "the relay must be tried first, then direct");
+	} finally {
+		resetAllRelayHealth();
+		setActiveRelayState(
+			{ enabled: true, url: "", relays: [], mode: "auto" } as unknown as Parameters<typeof setActiveRelayState>[0],
+			false,
+		);
+	}
+});
+
+test("relayFetch salvages last relay 429 when direct fallback answers 403", async (t) => {
+	resetAllRelayHealth();
+	const RELAY = "https://gated-egress-relay.example.com";
+	const UPSTREAM = "https://opencode.ai/zen/v1/chat/completions";
+	const relayBody = JSON.stringify({
+		error: { code: "rate_limit_exceeded", message: "Too Many Requests" },
+	});
+	const directBody = JSON.stringify({
+		error: { code: "FreeTierError", message: "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address." },
+	});
+	const seen: string[] = [];
+	t.mock.method(globalThis, "fetch", async (input: string | URL) => {
+		const target = String(input);
+		seen.push(target);
+		const body = target === RELAY ? relayBody : directBody;
+		const status = target === RELAY ? 429 : 403;
+		return new Response(body, { status, headers: { "content-type": "application/json" } });
+	});
+
+	try {
+		setActiveRelayState(
+			{ enabled: true, url: RELAY, relays: [{ url: RELAY }], mode: "auto" } as unknown as Parameters<
+				typeof setActiveRelayState
+			>[0],
+			false,
+		);
+
+		const res = await relayFetch(UPSTREAM, { method: "POST", body: "{}" }, "salvage429");
+
+		assert.equal(res.status, 429, "the salvaged 429 must surface instead of the direct 403");
+		assert.equal(await res.text(), relayBody, "the surfaced body must be the relay's 429, not the direct 403");
+		assert.equal(seen[seen.length - 1], UPSTREAM, "the direct URL must be the last one fetched");
+		assert.deepEqual(seen, [RELAY, UPSTREAM], "the relay must be tried first, then direct");
+	} finally {
+		resetAllRelayHealth();
+		setActiveRelayState(
+			{ enabled: true, url: "", relays: [], mode: "auto" } as unknown as Parameters<typeof setActiveRelayState>[0],
+			false,
+		);
+	}
+});
+
+/** Count the "burst >5/min" relay warnings appended to the sandbox log. */
+function count429BurstWarnings(): number {
+	try {
+		return fs.readFileSync(LOG_FILE, "utf8").split("429 burst").length - 1;
+	} catch {
+		return 0;
+	}
+}
+
+test("relay health: 429 burst warns once per window episode, never per event", () => {
+	resetAllRelayHealth();
+	const before = count429BurstWarnings();
+
+	// Five 429s inside the 60-second window sit at the >5/min threshold.
+	for (let i = 0; i < 5; i++) markRelayFailure(`https://burst-a${i}.example.com`, 429);
+	assert.equal(count429BurstWarnings() - before, 0, "5 events in the window must not warn");
+
+	// The sixth crosses it: exactly one warning for the episode.
+	markRelayFailure("https://burst-a5.example.com", 429);
+	assert.equal(count429BurstWarnings() - before, 1, "crossing the threshold must warn once");
+
+	// Further 429s belong to the same episode, so nothing re-warns.
+	for (let i = 6; i < 12; i++) markRelayFailure(`https://burst-a${i}.example.com`, 429);
+	assert.equal(count429BurstWarnings() - before, 1, "the same burst episode must not re-warn");
+
+	// Clearing the window (the health reset seam) opens a fresh episode.
+	resetAllRelayHealth();
+	for (let i = 0; i < 6; i++) markRelayFailure(`https://burst-b${i}.example.com`, 429);
+	assert.equal(count429BurstWarnings() - before, 2, "a fresh window must warn on its own transition");
+
+	resetAllRelayHealth();
+});
+
+test("relay state file carries per-relay secrets and is written 0600", () => {
+	withIsolatedRelayFiles(() => {
+		const pool = {
+			mode: "auto",
+			enabled: true,
+			url: "https://secret-relay.example.com",
+			relays: [{ url: "https://secret-relay.example.com", auth: "shared-secret" }],
+		} as unknown as Parameters<typeof saveRelayState>[0];
+		saveRelayState(pool);
+		assert.ok(
+			fs.readFileSync(RELAY_STATE_FILE, "utf8").includes("shared-secret"),
+			"the state file genuinely holds the relay secret",
+		);
+		// A second save backs the first one up: the backup holds the same secret.
+		saveRelayState(pool);
+
+		if (process.platform === "win32") return; // Windows: POSIX mode bits are best-effort only
+		assert.equal(
+			fs.statSync(RELAY_STATE_FILE).mode & 0o777,
+			0o600,
+			"relay-state.json must not be group/world readable",
+		);
+		assert.equal(
+			fs.statSync(`${RELAY_STATE_FILE}.bak`).mode & 0o777,
+			0o600,
+			"the relay-state backup must not be group/world readable",
+		);
+	});
 });

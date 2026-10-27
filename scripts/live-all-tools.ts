@@ -35,6 +35,7 @@ import {
  translateToolsForPath,
 } from "../src/tool-translation.ts";
 import { enforceOpencodeFingerprint } from "../src/opencode-fingerprint.ts";
+import { tokenAuthHeaders } from "../src/token.ts";
 
 const BAK_FILE = `${RELAY_STATE_FILE}.bak`;
 const PORT = 29481;
@@ -214,10 +215,13 @@ function liveSpec(only: string): LiveSpec {
  const respTools = [...ALL_HOST_TOOL_NAMES, ...EXTRA_TOOLS].map((n, i) => callerTool(n, "/v1/responses", i));
  const msgTools = [...ALL_HOST_TOOL_NAMES, ...EXTRA_TOOLS].map((n, i) => callerTool(n, "/v1/messages", i));
  if (only === "responses") {
+  // Cline's Muse Spark 1.3 (the retired responses-native entry) no longer
+  // resolves upstream, so the responses path is exercised through the
+  // translation the proxy still performs: a chat model on /v1/responses.
   return {
-   only, path: "/v1/responses", model: "muse-spark-1.3-contributor-free", verdict: "hard",
+   only, path: "/v1/responses", model: "z-ai/glm-5.3-flash", verdict: "hard",
    body: {
-    model: "muse-spark-1.3-contributor-free",
+    model: "z-ai/glm-5.3-flash",
     input: [{ role: "user", content: "Reply with exactly: OK" }],
     tools: respTools, tool_choice: "auto", max_output_tokens: 64, stream: false,
    },
@@ -290,7 +294,7 @@ async function phaseB(spec: LiveSpec): Promise<number> {
   await new Promise((r) => setTimeout(r, 1_000));
   const res = await fetch(`http://127.0.0.1:${port}${spec.path}`, {
    method: "POST",
-   headers: { "content-type": "application/json", accept: "application/json" },
+   headers: { "content-type": "application/json", accept: "application/json", ...tokenAuthHeaders() },
    body: JSON.stringify(spec.body),
    signal: AbortSignal.timeout(LIVE_TIMEOUT_MS),
   });

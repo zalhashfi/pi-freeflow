@@ -39,6 +39,13 @@ const GATE_BODY = JSON.stringify({
 const GATE_BODY_VARIANT =
  "Error from provider (Console): FreeTierError: " +
  "OpenCode's free tier can only be used from within OpenCode (ses_abc)";
+const GATE_BODY_ABUSIVE_TRAFFIC = JSON.stringify({
+ type: "error",
+ error: {
+  type: "FreeTierError",
+  message: "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address. This isn't related to your account. If you're on a VPN or proxy, turn it off and try again, or subscribe to OpenCode Go at https://opencode.ai/go to keep building.",
+ },
+});
 const OTHER_403_BODY = JSON.stringify({
  error: { code: "Forbidden", message: "Forbidden" },
 });
@@ -75,10 +82,11 @@ function withIsolatedHealthFiles(fn: () => void): void {
 
 // ── Gate detection ────────────────────────────────────────────────────
 
-test("gate detection: 403 FreeTierError bodies are gates, incl. the provider-console variant", () => {
+test("gate detection: 403 FreeTierError bodies are gates, incl. the provider-console and abusive-traffic variants", () => {
  withIsolatedHealthFiles(() => {
   assert.equal(isFreeTierGate(403, GATE_BODY), true);
   assert.equal(isFreeTierGate(403, GATE_BODY_VARIANT), true);
+  assert.equal(isFreeTierGate(403, GATE_BODY_ABUSIVE_TRAFFIC), true);
  });
 });
 
@@ -299,12 +307,12 @@ test("403 gate bodies gain a hint; everything else passes through byte-identical
 
 test("gate rejections are remembered by key, then forgotten on recovery", () => {
  withIsolatedHealthFiles(() => {
-  const body = { model: "muse-spark-1.3-contributor-free", input: "hi", prompt_cache_key: "sess-resume-1" };
+  const body = { model: "nemotron-3.5-super-vl-free", input: "hi", prompt_cache_key: "sess-resume-1" };
   assert.equal(wasGateRejected(body, "/v1/responses"), false);
   rememberGateRejection(body, "/v1/responses", 403, GATE_BODY);
   assert.equal(wasGateRejected(body, "/v1/responses"), true);
   assert.equal(
-   wasGateRejected({ model: "muse-spark-1.3-contributor-free", input: "other" }, "/v1/responses"),
+   wasGateRejected({ model: "nemotron-3.5-super-vl-free", input: "other" }, "/v1/responses"),
    false,
    "different sessions are unaffected",
   );
@@ -349,6 +357,49 @@ test("403 gate hint is visible inside error.message", () => {
   assert.ok(hinted.error.message.includes("only be used from within OpenCode"), "upstream text survives");
   assert.ok(hinted.error.message.includes("fallback model"), "guidance is host-visible");
   assert.ok(hinted.hint.length > 0, "hint sibling kept for compat");
+ });
+});
+
+test("persisted gate schema carries only the upstream that can trip (zen)", () => {
+ withIsolatedHealthFiles(() => {
+  // Two consecutive gate 403s flip the gate, which forces a persist.
+  recordUpstreamFailure("zen", 403, GATE_BODY);
+  recordUpstreamFailure("zen", 403, GATE_BODY);
+  const onDisk = JSON.parse(fs.readFileSync(HEALTH_FILE, "utf8")) as {
+   gates?: Record<string, { gated?: boolean }>;
+  };
+  assert.deepEqual(
+   Object.keys(onDisk.gates ?? {}),
+   ["zen"],
+   "the dead kilo gate entry must not be persisted",
+  );
+  assert.equal(onDisk.gates?.["zen"]?.gated, true, "the live zen gate still persists");
+ });
+});
+
+test("legacy state files carrying a dead kilo gate entry still load", () => {
+ withIsolatedHealthFiles(() => {
+  fs.writeFileSync(
+   HEALTH_FILE,
+   JSON.stringify({
+    version: 1,
+    sessions: {},
+    gates: {
+     zen: { gated: true, consecutiveFreeTier403: 2, firstGatedAt: 1, lastTransitionAt: 1, lastCanaryAt: 0 },
+     kilo: { gated: true, consecutiveFreeTier403: 9, firstGatedAt: 1, lastTransitionAt: 1, lastCanaryAt: 0 },
+    },
+   }),
+   "utf8",
+  );
+  // Pin a distinct mtime so the reload never depends on timestamp granularity.
+  fs.utimesSync(HEALTH_FILE, new Date(1_700_000_000_000), new Date(1_700_000_000_000));
+
+  assert.equal(isUpstreamGated("zen"), true, "the live zen gate still loads from a legacy file");
+  assert.equal(
+   isUpstreamGated("kilo"),
+   false,
+   "the dead kilo gate entry is ignored on load, never adopted",
+  );
  });
 });
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-freeflow",
   "type": "module",
-  "version": "1.38.2",
+  "version": "1.42.1",
   "description": "Thin provider for OMP/Pi — model list + dumb relay proxy + log; host pi-ai owns thinking/normalization",
   "main": "extensions/index.ts",
   "types": "src/index.ts",
@@ -52,13 +52,13 @@
     "docs:build": "vitepress build docs"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.27.0",
+    "@changesets/cli": "^3.0.3",
     "@types/node": "^22.13.9",
-    "js-yaml": "^4.1.0",
-    "typescript": "^5.8.2",
+    "js-yaml": "^5.5.0",
+    "typescript": "^7.0.2",
     "vitepress": "^1.6.4"
   },
   "dependencies": {
-    "undici": "7.30.0"
+    "undici": "7.30.1"
   }
 }

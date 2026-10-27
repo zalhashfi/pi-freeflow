@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { startProxy } from "../src/proxy.ts";
 import { getActiveRelayState, resetAllRelayHealth, setActiveRelayState } from "../src/relay-state.ts";
 import { withIsolatedSandboxFiles } from "./_sandbox-helpers.ts";
+import { authHeaders } from "./_auth.ts";
 import {
 	_resetReasoningStateForTest,
 	isReasoningCallerMismatch,
@@ -45,7 +46,7 @@ function reasoning(blob: string, summary = ""): Record<string, unknown> {
 /** Responses body shaped like the captured production payload. */
 function responsesBody(key: string, blobs: string[]): string {
 	return JSON.stringify({
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		store: false,
 		stream: false,
 		prompt_cache_key: key,
@@ -140,7 +141,7 @@ async function withProxy(
 async function postResponses(port: number, body: string): Promise<Response> {
 	return await fetch(`http://127.0.0.1:${port}/v1/responses`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...authHeaders() },
 		body,
 	});
 }

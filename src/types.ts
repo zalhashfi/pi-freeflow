@@ -16,7 +16,7 @@ export type ThinkingLevel =
 
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 
-export type ModelInputType = "text" | "image" | "video";
+export type ModelInputType = "text" | "image";
 
 export interface ModelDef {
  id: string;
@@ -28,6 +28,7 @@ export interface ModelDef {
  input?: ModelInputType[];
  thinkingFormat?: "openrouter";
  thinkingLevelMap?: ThinkingLevelMap;
+ requiresReasoningContentOnAssistantMessages?: boolean;
 }
 
 export type RegisteredModel = ModelDef & {
@@ -119,6 +120,7 @@ export interface ProviderModelCost {
 export interface ProviderModelCompat {
  supportsDeveloperRole?: boolean;
  supportsReasoningEffort?: boolean;
+ requiresReasoningContentOnAssistantMessages?: boolean;
  thinkingFormat?: "openrouter" | string;
  sessionAffinityFormat?: "openai-nosession" | string;
  [key: string]: unknown;

@@ -27,10 +27,10 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { startProxy } from "../src/proxy.ts";
 import { getActiveRelayState, setActiveRelayState } from "../src/relay-state.ts";
+import { tokenAuthHeaders } from "../src/token.ts";
 
 const RESPONSES_MODELS: Record<string, true> = {
-	"muse-spark-1.2-contributor-free": true,
-	"muse-spark-1.3-contributor-free": true,
+	"nemotron-3.5-super-vl-free": true,
 };
 const PORT = 29361;
 const PROMPT = "Write a TypeScript LRU cache with JSDoc, ~80 lines, no preamble.";
@@ -62,20 +62,13 @@ interface BenchRow {
 }
 
 const FULL_PLAN: PlanItem[] = [
-	// muse-spark-1.3: xhigh x3 + high x3, interleaved A-B-A-B
-	{ model: "muse-spark-1.3-contributor-free", effortLabel: "xhigh", effortSent: "xhigh" },
-	{ model: "muse-spark-1.3-contributor-free", effortLabel: "high", effortSent: "high" },
-	{ model: "muse-spark-1.3-contributor-free", effortLabel: "xhigh", effortSent: "xhigh" },
-	{ model: "muse-spark-1.3-contributor-free", effortLabel: "high", effortSent: "high" },
-	{ model: "muse-spark-1.3-contributor-free", effortLabel: "xhigh", effortSent: "xhigh" },
-	{ model: "muse-spark-1.3-contributor-free", effortLabel: "high", effortSent: "high" },
 	// muse-spark-1.2: xhigh x3 + high x3, interleaved
-	{ model: "muse-spark-1.2-contributor-free", effortLabel: "xhigh", effortSent: "xhigh" },
-	{ model: "muse-spark-1.2-contributor-free", effortLabel: "high", effortSent: "high" },
-	{ model: "muse-spark-1.2-contributor-free", effortLabel: "xhigh", effortSent: "xhigh" },
-	{ model: "muse-spark-1.2-contributor-free", effortLabel: "high", effortSent: "high" },
-	{ model: "muse-spark-1.2-contributor-free", effortLabel: "xhigh", effortSent: "xhigh" },
-	{ model: "muse-spark-1.2-contributor-free", effortLabel: "high", effortSent: "high" },
+	{ model: "nemotron-3.5-super-vl-free", effortLabel: "xhigh", effortSent: "xhigh" },
+	{ model: "nemotron-3.5-super-vl-free", effortLabel: "high", effortSent: "high" },
+	{ model: "nemotron-3.5-super-vl-free", effortLabel: "xhigh", effortSent: "xhigh" },
+	{ model: "nemotron-3.5-super-vl-free", effortLabel: "high", effortSent: "high" },
+	{ model: "nemotron-3.5-super-vl-free", effortLabel: "xhigh", effortSent: "xhigh" },
+	{ model: "nemotron-3.5-super-vl-free", effortLabel: "high", effortSent: "high" },
 	// big-pickle: max x3 + high x3, interleaved
 	{ model: "big-pickle", effortLabel: "max", effortSent: "max" },
 	{ model: "big-pickle", effortLabel: "high", effortSent: "high" },
@@ -271,7 +264,7 @@ async function runAttempt(
 	try {
 		const res = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { "content-type": "application/json", ...tokenAuthHeaders() },
 			body: JSON.stringify(body),
 			signal: controller.signal,
 		});

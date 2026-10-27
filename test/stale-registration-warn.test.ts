@@ -1,13 +1,17 @@
 /**
  * Stale provider-registration guard (src/proxy.ts): a model whose catalog
  * entry declares an `api` flavor but arrives on the wrong path means the
- * host still holds a pre-fix provider registration. The proxy must log a
- * "stale provider registration" warning and still proxy the request
+ * host still holds a pre-fix provider registration. The proxy logs a
+ * "stale provider registration" warning and still proxies the request
  * (warn-only, never blocked). A model on its matching path warns nothing.
  *
- * NOTE: only models with a declared `api` can trip the guard — catalog
- * chat models declare no `api`, so a chat model on /v1/responses is
- * (observably) a silent passthrough, locked in below.
+ * NOTE: only models with a declared `api` can reach that branch, and since
+ * 2026-10-22 the static catalog declares none — the Zen muse-spark contributor
+ * ids retired on 2026-10-17/18 and Cline's Muse Spark 1.3 (the last
+ * `api: "openai-responses"` entry) stopped resolving upstream. The guard stays
+ * wired for a future non-chat entry and re-arms by itself; locked in below: it
+ * must never warn for models without a declared api, and a chat model on
+ * /v1/responses is a silent passthrough, not a warning.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -16,9 +20,14 @@ import { startProxy } from "../src/proxy.ts";
 import { getActiveRelayState, resetAllRelayHealth, setActiveRelayState } from "../src/relay-state.ts";
 import { readRecentLogs } from "../src/logger.ts";
 import { _resetFreeTierHintForTest, _resetUpstreamHealthForTest } from "../src/upstream-health.ts";
+import { ALL_MODELS } from "../src/models.ts";
+import { authHeaders } from "./_auth.ts";
 
-const RESPONSES_MODEL = "muse-spark-1.3-contributor-free";
 const CHAT_MODEL = "mimo-v2.6-flash-free";
+// A host that upgraded from a pre-2026-10-22 build still holds this retired
+// Cline id in its provider registration; the proxy sees an id it has no
+// definition for and must neither warn nor block it.
+const RETIRED_CLINE_MODEL = "cline-free/muse-spark-1.3-contributor";
 
 const CHAT_SSE = 'data: {"id":"chatcmpl-1","model":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}\n\ndata: [DONE]\n\n';
 const RESPONSES_SSE = 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[]}}\n\n';
@@ -74,31 +83,29 @@ async function withProxy(fn: (port: number) => Promise<void>): Promise<void> {
 async function post(port: number, path: string, body: unknown): Promise<{ status: number; text: string }> {
  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
   method: "POST",
-  headers: { "content-type": "application/json" },
+  headers: { "content-type": "application/json", ...authHeaders() },
   body: JSON.stringify(body),
  });
  return { status: res.status, text: await res.text() };
 }
 
-test("stale registration: responses model on chat path warns but still proxies", async () => {
- await withProxy(async (port) => {
-  const before = warnCount();
-  const res = await post(port, "/v1/chat/completions", { model: RESPONSES_MODEL, messages: [{ role: "user", content: "hi" }], stream: false });
-  assert.equal(res.status, 200, "mismatched request must still proxy (warn-only, no block)");
-  const fresh = newWarnsSince(before);
-  assert.ok(fresh.length >= 1, "responses model on /v1/chat/completions must log a stale-registration warning");
-  assert.ok(fresh.some((l) => l.includes(RESPONSES_MODEL)), "warning must name the mismatched model");
- });
-});
+test("stale registration guard is dormant: no static model declares a non-chat api", async () => {
+ // The guard's positive branch needs `knownDef.api` to differ from the path.
+ // With the responses entries retired there is nothing left to trip it — if a
+ // future entry declares one, this assertion fails and the guard's live
+ // coverage must be restored alongside it.
+ const declared = ALL_MODELS.filter((m) => m.api !== undefined && m.api !== "openai-completions");
+ assert.deepEqual(declared.map((m) => m.id), [], "no static model may declare a non-chat api while the guard is untested end to end");
 
-test("stale registration: responses model on messages path warns", async () => {
  await withProxy(async (port) => {
   const before = warnCount();
-  const res = await post(port, "/v1/messages", { model: RESPONSES_MODEL, messages: [{ role: "user", content: "hi" }] });
-  const fresh = newWarnsSince(before);
-  assert.ok(fresh.length >= 1, "responses model on /v1/messages must log a stale-registration warning");
-  assert.ok(fresh.some((l) => l.includes(RESPONSES_MODEL)), "warning must name the mismatched model");
-  assert.notEqual(res.status, 400, "mismatched request must not be rejected by the proxy itself");
+  // A stale host still holding the retired Cline id: no definition, so the
+  // request is proxied and never warned about.
+  const chat = await post(port, "/v1/chat/completions", { model: RETIRED_CLINE_MODEL, messages: [{ role: "user", content: "hi" }], stream: false });
+  assert.equal(chat.status, 200, "a retired id must still proxy instead of being rejected by the proxy itself");
+  const messages = await post(port, "/v1/messages", { model: RETIRED_CLINE_MODEL, messages: [{ role: "user", content: "hi" }] });
+  assert.notEqual(messages.status, 400, "a retired id on /v1/messages must not be rejected by the proxy itself");
+  assert.equal(newWarnsSince(before).length, 0, "an id with no catalog definition must never warn");
  });
 });
 
@@ -114,12 +121,8 @@ test("stale registration: chat model without declared api passes silently on res
 test("stale registration: matching model+path emits no warning", async () => {
  await withProxy(async (port) => {
   const before = warnCount();
-  const res = await post(port, "/v1/responses", { model: RESPONSES_MODEL, input: "hi", stream: false });
+  const res = await post(port, "/v1/chat/completions", { model: CHAT_MODEL, messages: [{ role: "user", content: "hi" }], stream: false });
   assert.equal(res.status, 200);
-  assert.equal(newWarnsSince(before).length, 0, "responses model on /v1/responses must not warn");
-  const beforeChat = warnCount();
-  const chat = await post(port, "/v1/chat/completions", { model: CHAT_MODEL, messages: [{ role: "user", content: "hi" }], stream: false });
-  assert.equal(chat.status, 200);
-  assert.equal(newWarnsSince(beforeChat).length, 0, "chat model on /v1/chat/completions must not warn");
+  assert.equal(newWarnsSince(before).length, 0, "chat model on /v1/chat/completions must not warn");
  });
 });

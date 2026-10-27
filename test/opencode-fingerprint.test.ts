@@ -10,7 +10,6 @@ import {
 	isPlaceholderToolName,
 	normalizePlaceholderCase,
 	parseSseEvents,
-	retargetToolChoice,
 	sseToChatCompletionJson,
 	sseToMessagesJson,
 	sseToResponsesJson,
@@ -185,17 +184,14 @@ test("enforceOpencodeFingerprint: a find declaration still rides upstream as glo
 	assert.equal(autoChoice.store, false, "responses cloak still applies");
 });
 
-test("normalizePlaceholderCase + retargetToolChoice: bounded per-request restore", () => {
+test("normalizePlaceholderCase: bounded per-request restore", () => {
 	const body: Record<string, unknown> = {
 		tools: [{ name: "Grep" }, { name: "ls" }],
-		tool_choice: { type: "function", name: "Grep" },
 	};
 	const restore = normalizePlaceholderCase(body);
 	assert.deepEqual(restore, { grep: "Grep" });
 	assert.equal((body.tools as Array<{ name: string }>)[0].name, "grep");
 	assert.equal((body.tools as Array<{ name: string }>)[1].name, "ls");
-	retargetToolChoice(body);
-	assert.deepEqual(body.tool_choice, { type: "function", name: "grep" });
 	assert.ok(isPlaceholderToolName("WRITE"));
 	assert.ok(!isPlaceholderToolName("ls"));
 	assert.ok(!isPlaceholderToolName("find"));
@@ -209,6 +205,134 @@ test("ensureChatFingerprintTools: case-insensitive idempotent, no Bash/bash dup"
 	const names = (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
 	assert.equal(names.filter((n) => n.toLowerCase() === "bash").length, 1);
 	assert.equal(names.length, 6);
+});
+
+test("enforceOpencodeFingerprint: a chat system prompt without an env block gains one", () => {
+	// Zen answers 429 FreeUsageLimitError when the system prompt carries no
+	// complete env block, whatever the headers or tools say (issue #117/#118).
+	const body: Record<string, unknown> = {
+		model: "m",
+		messages: [
+			{ role: "system", content: "You are a coding agent." },
+			{ role: "user", content: "hi" },
+		],
+	};
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const messages = body.messages as Array<{ role: string; content: string }>;
+	const system = messages[0].content;
+	const pairs = system.match(/<env>[\s\S]*?<\/env>/g) ?? [];
+	assert.equal(pairs.length, 1, "exactly one pair: upstream reads only the first");
+	assert.match(pairs[0], /Working directory:/, "the load-bearing key is inside the pair");
+	assert.ok(system.startsWith("You are a coding agent."), "the host's own prompt is preserved");
+});
+
+test("enforceOpencodeFingerprint: the env block lands in the last system message", () => {
+	const body: Record<string, unknown> = {
+		model: "m",
+		messages: [
+			{ role: "system", content: "first" },
+			{ role: "system", content: "second" },
+			{ role: "user", content: "hi" },
+		],
+	};
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const messages = body.messages as Array<{ role: string; content: string }>;
+	assert.equal(messages[0].content, "first", "earlier system prompts stay untouched");
+	assert.match(messages[1].content, /^second\n\n<env>\n  Working directory: [^\n]+\n<\/env>$/);
+});
+
+test("enforceOpencodeFingerprint: a tool-less chat body gains a system message for the block", () => {
+	const body: Record<string, unknown> = { model: "m", messages: [{ role: "user", content: "hi" }] };
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const messages = body.messages as Array<{ role: string; content: string }>;
+	assert.equal(messages[0].role, "system", "the block needs a system message to live in");
+	assert.match(messages[0].content, /Working directory:/);
+	assert.deepEqual(messages[1], { role: "user", content: "hi" });
+});
+
+test("enforceOpencodeFingerprint: a complete host env block rides through byte-for-byte", () => {
+	// The host knows its environment; a correct block is richer than anything
+	// synthesized here, so it is neither rewritten nor duplicated.
+	const hostBlock = "<env>\n  Working directory: /repo\n  Platform: darwin\n</env>";
+	const body: Record<string, unknown> = {
+		model: "m",
+		messages: [
+			{ role: "system", content: `You are a coding agent.\n\n${hostBlock}` },
+			{ role: "user", content: "hi" },
+		],
+	};
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const messages = body.messages as Array<{ content: string }>;
+	assert.equal(messages[0].content, `You are a coding agent.\n\n${hostBlock}`);
+});
+
+test("enforceOpencodeFingerprint: a stale block above the real one is dropped", () => {
+	// Upstream reads only the first pair, so a block missing the key above the
+	// real one shadows it and the request 429s even though the real one passes.
+	const body: Record<string, unknown> = {
+		model: "m",
+		messages: [
+			{
+				role: "system",
+				content: "<env>\n  Platform: darwin\n</env>\n\nYou are a coding agent.\n\n<env>\n  Working directory: /repo\n</env>",
+			},
+			{ role: "user", content: "hi" },
+		],
+	};
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const system = (body.messages as Array<{ content: string }>)[0].content;
+	const pairs = system.match(/<env>[\s\S]*?<\/env>/g) ?? [];
+	assert.equal(pairs.length, 1, "only one pair may survive");
+	assert.match(pairs[0], /Working directory: \/repo/, "the load-bearing block is the survivor");
+	assert.ok(!system.includes("Platform:"), "the shadowing copy is gone");
+});
+
+test("enforceOpencodeFingerprint: a block without Working directory is replaced, not duplicated", () => {
+	const body: Record<string, unknown> = {
+		model: "m",
+		messages: [
+			{ role: "system", content: "<env>\n  Shell: zsh\n</env>\n\nYou are a coding agent." },
+			{ role: "user", content: "hi" },
+		],
+	};
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const system = (body.messages as Array<{ content: string }>)[0].content;
+	const pairs = system.match(/<env>[\s\S]*?<\/env>/g) ?? [];
+	assert.equal(pairs.length, 1);
+	assert.match(pairs[0], /Working directory:/);
+	assert.ok(!system.includes("Shell: zsh"), "the refused block does not linger");
+});
+
+test("enforceOpencodeFingerprint: the env block reaches the responses and messages shapes", () => {
+	const responses: Record<string, unknown> = { model: "m", input: "watchdog inspection" };
+	enforceOpencodeFingerprint(responses, "/v1/responses");
+	assert.equal(typeof responses.instructions, "string");
+	assert.equal((responses.instructions as string).match(/<env>[\s\S]*?<\/env>/g)?.length, 1);
+
+	const messagesString: Record<string, unknown> = { model: "m", system: "You are Claude." };
+	enforceOpencodeFingerprint(messagesString, "/v1/messages");
+	assert.match(messagesString.system as string, /^You are Claude\.\n\n<env>\n  Working directory: [^\n]+\n<\/env>$/);
+
+	const messagesBlocks: Record<string, unknown> = {
+		model: "m",
+		system: [{ type: "text", text: "You are Claude." }],
+	};
+	enforceOpencodeFingerprint(messagesBlocks, "/v1/messages");
+	const blocks = messagesBlocks.system as Array<{ type: string; text: string }>;
+	assert.equal(blocks.length, 1, "the block extends the host's system block");
+	assert.match(blocks[0].text, /Working directory:/);
+	assert.equal(blocks[0].text.match(/<env>/g)?.length, 1);
+});
+
+test("enforceOpencodeFingerprint: the env block is stable across repeated enforcement", () => {
+	const body: Record<string, unknown> = {
+		model: "m",
+		messages: [{ role: "system", content: "You are a coding agent." }],
+	};
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const once = (body.messages as Array<{ content: string }>)[0].content;
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	assert.equal((body.messages as Array<{ content: string }>)[0].content, once);
 });
 
 test("parseSseEvents: parses raw SSE text blocks into events and data", () => {
@@ -372,6 +496,48 @@ test("sseToChatCompletionJson: one call split across deltas still reassembles wh
 	assert.deepEqual(JSON.parse(calls[0].function.arguments), { command: "ls" });
 });
 
+test("sseToChatCompletionJson: a restated name on the arguments frame replaces, never appends", () => {
+	// Observed live from OpenCode Zen on 2026-10-22: the gateway streams one
+	// tool call as TWO frames that both carry the complete name — a name-only
+	// frame, then a frame repeating that name with the arguments. Appending
+	// accumulated `get_weatherget_weather`, a tool name no declaration matches,
+	// which streamed hosts papered over (they bind by index) and non-stream
+	// callers did not.
+	const sse = [
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w","type":"function","function":{"name":"get_weather"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+		"data: [DONE]",
+	].join("\n\n");
+	const res = sseToChatCompletionJson(sse, true) as {
+		choices: Array<{ message: { tool_calls: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+	};
+	const calls = res.choices[0].message.tool_calls;
+	assert.equal(calls.length, 1, "the repeat header must not open a second call");
+	assert.equal(calls[0].function.name, "get_weather", "the restated name is authoritative, not appended");
+	assert.deepEqual(JSON.parse(calls[0].function.arguments), { city: "Tokyo" }, "arguments intact");
+});
+
+test("sseToChatCompletionJson: a name split across deltas still reassembles", () => {
+	// The ordinary piecewise shape: name-only deltas carry the next slice of
+	// the name and must keep appending, so the replace-on-arguments rule above
+	// never truncates a streamed name to its last fragment.
+	const sse = [
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w","type":"function","function":{"name":"get_"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"weather"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":\\"Tokyo\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+		"data: [DONE]",
+	].join("\n\n");
+	const res = sseToChatCompletionJson(sse, true) as {
+		choices: Array<{ message: { tool_calls: Array<{ function: { name: string; arguments: string } }> } }>;
+	};
+	const calls = res.choices[0].message.tool_calls;
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].function.name, "get_weather", "name fragments append in order");
+	assert.deepEqual(JSON.parse(calls[0].function.arguments), { city: "Tokyo" });
+});
+
 test("sseToChatCompletionJson: id-less streams still split on distinct indices", () => {
 	// Providers that send no id at all keep working through the index fallback.
 	const sse = [
@@ -428,7 +594,7 @@ test("sseToMessagesJson: drops placeholder tool_use, keeps caller blocks with re
 
 test("normalizeResponsesBody: canned OMP chat leftovers reach responses shape", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		messages: [{ role: "user", content: "hi" }],
 		max_tokens: 200,
 		temperature: 0.5,
@@ -453,7 +619,7 @@ test("normalizeResponsesBody: canned OMP chat leftovers reach responses shape", 
 
 test("normalizeResponsesBody: auto + parallel true + ultra survive, non-spark untouched", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.2-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		max_completion_tokens: 50,
 		tool_choice: "auto",
@@ -487,7 +653,7 @@ test("normalizeResponsesBody: every assistant commentary item loses its phase", 
 	});
 
 	const terminal: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: [user, narration(), user],
 	};
 	normalizeResponsesBody(terminal);
@@ -504,7 +670,7 @@ test("normalizeResponsesBody: every assistant commentary item loses its phase", 
 	// user message, so a tail-only sweep would miss it. Upstream validates the
 	// whole replayed history, so every commentary item goes.
 	const withSystemBetween: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: [narration(), { role: "developer", content: "extra tools" }, user],
 	};
 	normalizeResponsesBody(withSystemBetween);
@@ -515,7 +681,7 @@ test("normalizeResponsesBody: every assistant commentary item loses its phase", 
 
 	// An earlier turn's commentary must not come back once later turns append.
 	const twoTurns: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: [
 			{ ...narration(), id: "rs_turn_one" },
 			user,
@@ -529,15 +695,15 @@ test("normalizeResponsesBody: every assistant commentary item loses its phase", 
 	assert.equal(twoTurnItems[2].phase, "final_answer", "final_answer is not the rejected shape");
 });
 
-test("tool_choice is auto-or-absent on every Zen path", () => {
+test("tool_choice is auto-or-absent on Zen chat/responses; the messages lane keeps its own semantics", () => {
 	const unsupported = ["none", "required", "any"] as const;
 	for (const value of unsupported) {
-		const body: Record<string, unknown> = { model: "muse-spark-1.3-contributor-free", input: "hi", tool_choice: value };
+		const body: Record<string, unknown> = { model: "nemotron-3.5-super-vl-free", input: "hi", tool_choice: value };
 		normalizeResponsesBody(body);
 		assert.ok(!("tool_choice" in body), `"${value}" dropped — Zen supports only auto`);
 	}
 	const named: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		tool_choice: { type: "function", name: "bash" },
 	};
@@ -545,7 +711,7 @@ test("tool_choice is auto-or-absent on every Zen path", () => {
 	assert.ok(!("tool_choice" in named), "named function choice dropped");
 
 	const auto: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		tool_choice: "auto",
 	};
@@ -564,22 +730,90 @@ test("tool_choice is auto-or-absent on every Zen path", () => {
 	enforceOpencodeFingerprint(chatAuto, "/v1/chat/completions");
 	assert.equal(chatAuto.tool_choice, "auto", "chat auto rides verbatim");
 
-	// The messages path shares the chat branch: Zen accepts only auto there
-	// too, so an unsupported choice is dropped rather than passed through.
-	const messagesPath: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "required" };
-	enforceOpencodeFingerprint(messagesPath, "/v1/messages");
-	assert.ok(!("tool_choice" in messagesPath), "messages path drops an unsupported choice too");
+	// The Zen messages lane keeps its own choice semantics: Anthropic names
+	// choices with `any` / `{ type: "tool", name: ... }`, and the chat drop
+	// would delete them. Nothing is rewritten there, byte-identical.
+	const messagesRequired: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "required" };
+	enforceOpencodeFingerprint(messagesRequired, "/v1/messages");
+	assert.equal(messagesRequired.tool_choice, "required", "messages keeps an unsupported chat-lane choice untouched");
+
+	const messagesAny: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "any" };
+	enforceOpencodeFingerprint(messagesAny, "/v1/messages");
+	assert.equal(messagesAny.tool_choice, "any", "messages keeps the Anthropic any-choice");
+
+	const messagesNamed: Record<string, unknown> = {
+		model: "claude-fable-5",
+		messages: [],
+		tool_choice: { type: "tool", name: "bash" },
+	};
+	enforceOpencodeFingerprint(messagesNamed, "/v1/messages");
+	assert.deepEqual(messagesNamed.tool_choice, { type: "tool", name: "bash" }, "messages keeps a named Anthropic choice");
 
 	const messagesAuto: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "auto" };
 	enforceOpencodeFingerprint(messagesAuto, "/v1/messages");
 	assert.equal(messagesAuto.tool_choice, "auto", "messages auto rides verbatim");
 });
 
+test("enforceOpencodeFingerprint: the chat lane clamps a flat reasoning_effort like the responses lane", () => {
+	// beam-free: `minimal` is not an offered rung — the live gateway
+	// enumerates max/xhigh/high/medium/low only (issue #62). The chat lane
+	// must run the same clampedEffortFor algorithm normalizeResponsesBody
+	// runs on the responses lane, so an unsupported flat effort clamps to the
+	// model's highest supported rung instead of 400ing upstream.
+	const clamp: Record<string, unknown> = {
+		model: "beam-free",
+		messages: [],
+		reasoning_effort: "minimal",
+	};
+	enforceOpencodeFingerprint(clamp, "/v1/chat/completions");
+	assert.equal(clamp.reasoning_effort, "max", "unsupported flat effort clamped to the highest supported rung");
+
+	// The camelCase spelling gets the identical treatment.
+	const camel: Record<string, unknown> = {
+		model: "nemotron-3.5-super-vl-free",
+		reasoningEffort: "max",
+	};
+	enforceOpencodeFingerprint(camel, "/v1/chat/completions");
+	assert.equal(camel.reasoningEffort, "xhigh", "unsupported camelCase effort clamped too");
+
+	// A supported rung, a genuine off, and a key the map does not know all
+	// ride byte-identical, matching normalizeResponsesBody semantics.
+	const chosen: Record<string, unknown> = {
+		model: "beam-free",
+		reasoning_effort: "high",
+	};
+	enforceOpencodeFingerprint(chosen, "/v1/chat/completions");
+	assert.equal(chosen.reasoning_effort, "high", "a supported effort is untouched");
+
+	const off: Record<string, unknown> = {
+		model: "beam-free",
+		reasoning_effort: "off",
+	};
+	enforceOpencodeFingerprint(off, "/v1/chat/completions");
+	assert.equal(off.reasoning_effort, "off", "genuine off is never rewritten");
+
+	const unknown: Record<string, unknown> = {
+		model: "beam-free",
+		reasoningEffort: "bogus",
+	};
+	enforceOpencodeFingerprint(unknown, "/v1/chat/completions");
+	assert.equal(unknown.reasoningEffort, "bogus", "unknown keys stay for upstream to rule on");
+
+	// The Zen messages lane carries no flat effort spelling and stays untouched.
+	const messagesLane: Record<string, unknown> = {
+		model: "beam-free",
+		messages: [],
+		reasoning_effort: "bogus",
+	};
+	enforceOpencodeFingerprint(messagesLane, "/v1/messages");
+	assert.equal(messagesLane.reasoning_effort, "bogus", "messages lane keeps its caller value");
+});
+
 test("a replayed tool call with a malformed name is folded on the wire", () => {
 	// Captured live: space-bunny-free emitted a call named `id id=`, and Pi
 	// replays it in input[] forever, so every later turn 400s.
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: [
 			{ role: "user", content: [{ type: "input_text", text: "go" }] },
 			{ type: "function_call", call_id: "call_983ed385be8d42d1a0841458", name: "id id=", arguments: "{}" },
@@ -594,7 +828,7 @@ test("a replayed tool call with a malformed name is folded on the wire", () => {
 	assert.equal(items[1].arguments, "{}", "arguments untouched");
 
 	const custom: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: [
 			{ type: "custom_tool_call", call_id: "c1", name: "xd://browser__open", input: "{}" },
 			{ type: "custom_tool_call", call_id: "c1", name: "bash", input: "{}" },
@@ -607,7 +841,7 @@ test("a replayed tool call with a malformed name is folded on the wire", () => {
 
 	// A `messages` body copied into `input` is covered by the same sweep.
 	const viaMessages: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		messages: [{ type: "function_call", call_id: "c2", name: "bad name", arguments: "{}" }],
 	};
 	normalizeResponsesBody(viaMessages);
@@ -623,7 +857,7 @@ test("dropping a forced tool call keeps the model's native reasoning on", () => 
 	// reasoning off with effort "none". Dropping the forced call must not leave
 	// the model reasoning-free, and "none" is itself rejected upstream.
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: [{ role: "user", content: [{ type: "input_text", text: "go" }] }],
 		tool_choice: { type: "function", name: "think" },
 		reasoning: { effort: "none" },
@@ -637,7 +871,7 @@ test("dropping a forced tool call keeps the model's native reasoning on", () => 
 	);
 
 	const flat: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		tool_choice: "required",
 		reasoning_effort: "none",
@@ -646,7 +880,7 @@ test("dropping a forced tool call keeps the model's native reasoning on", () => 
 	assert.equal(flat.reasoning_effort, "xhigh", "the flat field is restored too");
 
 	const camel: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		tool_choice: "required",
 		reasoningEffort: "none",
@@ -656,7 +890,7 @@ test("dropping a forced tool call keeps the model's native reasoning on", () => 
 
 	// Genuine reasoning-off is the caller's real intent and must survive.
 	const genuineOff: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		tool_choice: "required",
 		reasoning: { effort: "off" },
@@ -666,7 +900,7 @@ test("dropping a forced tool call keeps the model's native reasoning on", () => 
 
 	// A supported effort is left exactly as the caller set it.
 	const chosen: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		tool_choice: "required",
 		reasoning: { effort: "low" },
@@ -676,7 +910,7 @@ test("dropping a forced tool call keeps the model's native reasoning on", () => 
 
 	// No forced call means no restore: the host's own value stands.
 	const untouched: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		reasoning: { effort: "none" },
 	};
@@ -690,7 +924,7 @@ test("dropping a forced tool call keeps the model's native reasoning on", () => 
 
 test("enforceOpencodeFingerprint: responses path normalizes before fingerprint", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		messages: [{ role: "user", content: "hi" }],
 		max_tokens: 200,
 		temperature: 0.5,
@@ -724,7 +958,7 @@ test("enforceOpencodeFingerprint: responses path normalizes before fingerprint",
 
 test("normalizeResponsesBody: flat reasoning effort max|ultra clamp to xhigh", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		reasoning_effort: "max",
 		reasoningEffort: "ultra",
@@ -733,7 +967,7 @@ test("normalizeResponsesBody: flat reasoning effort max|ultra clamp to xhigh", (
 	assert.equal(body.reasoning_effort, "xhigh");
 	assert.equal(body.reasoningEffort, "xhigh");
 	const upper: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		reasoning_effort: "MAX",
 		reasoningEffort: "Ultra",
@@ -743,7 +977,7 @@ test("normalizeResponsesBody: flat reasoning effort max|ultra clamp to xhigh", (
 	assert.equal(upper.reasoningEffort, "xhigh", "clamp is case-insensitive");
 	for (const level of ["off", "low", "medium", "high", "xhigh"]) {
 		const kept: Record<string, unknown> = {
-			model: "muse-spark-1.3-contributor-free",
+			model: "nemotron-3.5-super-vl-free",
 			input: "hi",
 			reasoning_effort: level,
 			reasoningEffort: level,
@@ -760,12 +994,60 @@ test("normalizeResponsesBody: flat reasoning effort max|ultra clamp to xhigh", (
 	};
 	normalizeResponsesBody(other);
 	assert.equal(other.reasoning_effort, "max", "non-spark flat effort never clamped");
-	assert.equal(other.reasoningEffort, "ultra", "non-spark flat effort never clamped");
+	assert.equal(
+		other.reasoningEffort,
+		"max",
+		"big-pickle's map declares max, so the ultra alias resolves to that value — not the spark clamp",
+	);
+});
+
+test("normalizeResponsesBody: ultra rewrites to the model's mapped max value", () => {
+	// `ultra` is an alias, never a value the gateway enumerates: a model whose
+	// ladder supports `max` (beam-free's live set is max/xhigh/high/medium/
+	// low) used to forward the alias upstream and eat a 400.
+	const nested: Record<string, unknown> = {
+		model: "beam-free",
+		input: "hi",
+		reasoning: { effort: "ultra" },
+	};
+	normalizeResponsesBody(nested);
+	assert.deepEqual(nested.reasoning, { effort: "max" }, "nested ultra rewrites to the mapped max");
+	const flat: Record<string, unknown> = {
+		model: "beam-free",
+		input: "hi",
+		reasoning_effort: "ULTRA",
+	};
+	normalizeResponsesBody(flat);
+	assert.equal(flat.reasoning_effort, "max", "flat field rewrites too, case-insensitively");
+	const camel: Record<string, unknown> = {
+		model: "beam-free",
+		input: "hi",
+		reasoningEffort: "ultra",
+	};
+	normalizeResponsesBody(camel);
+	assert.equal(camel.reasoningEffort, "max", "camelCase field rewrites too");
+	// max hidden (map says null): the alias still falls back to the highest
+	// supported level, as before.
+	const hiddenMax: Record<string, unknown> = {
+		model: "nemotron-3.5-super-vl-free",
+		input: "hi",
+		reasoning: { effort: "ultra" },
+	};
+	normalizeResponsesBody(hiddenMax);
+	assert.deepEqual(hiddenMax.reasoning, { effort: "xhigh" }, "ultra clamps when max is unsupported");
+	// No declared map at all: nothing to rewrite to, the field rides.
+	const unmapped: Record<string, unknown> = {
+		model: "ovh-free/Meta-Llama-3_3-70B-Instruct",
+		input: "hi",
+		reasoning: { effort: "ultra" },
+	};
+	normalizeResponsesBody(unmapped);
+	assert.deepEqual(unmapped.reasoning, { effort: "ultra" }, "an unmapped model keeps its effort");
 });
 
 test("enforceOpencodeFingerprint: responses path clamps flat effort end to end", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		reasoning_effort: "max",
 		reasoningEffort: "ultra",
@@ -783,13 +1065,13 @@ test("enforceOpencodeFingerprint: responses path clamps flat effort end to end",
 	};
 	enforceOpencodeFingerprint(other, "/v1/responses");
 	assert.equal(other.reasoning_effort, "max", "non-spark untouched end to end");
-	assert.equal(other.reasoningEffort, "ultra", "non-spark untouched end to end");
+	assert.equal(other.reasoningEffort, "max", "the ultra alias resolves to big-pickle's mapped max end to end");
 });
 
 test("enforceOpencodeFingerprint: chat path drops tool_choice none, keeps auto-or-absent", () => {
 	for (const none of ["none", "None", { type: "none" }]) {
 		const body: Record<string, unknown> = {
-			model: "muse-spark-1.3-contributor-free",
+			model: "nemotron-3.5-super-vl-free",
 			messages: [{ role: "user", content: "hi" }],
 			tool_choice: none,
 			stream: false,
@@ -799,7 +1081,7 @@ test("enforceOpencodeFingerprint: chat path drops tool_choice none, keeps auto-o
 		assert.equal(body.stream, true, "stream still forced");
 	}
 	const auto: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		messages: [{ role: "user", content: "hi" }],
 		tool_choice: "auto",
 		stream: false,
@@ -807,7 +1089,7 @@ test("enforceOpencodeFingerprint: chat path drops tool_choice none, keeps auto-o
 	enforceOpencodeFingerprint(auto, "/v1/chat/completions");
 	assert.equal(auto.tool_choice, "auto", "auto still rides");
 	const absent: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		messages: [{ role: "user", content: "hi" }],
 		stream: false,
 	};
@@ -817,7 +1099,7 @@ test("enforceOpencodeFingerprint: chat path drops tool_choice none, keeps auto-o
 
 test("normalizeResponsesBody: drops response_format leftover from chat completions", () => {
 	const body: Record<string, unknown> = {
-		model: "muse-spark-1.3-contributor-free",
+		model: "nemotron-3.5-super-vl-free",
 		input: "hi",
 		response_format: { type: "json_object" },
 	};
@@ -837,9 +1119,9 @@ test("normalizeResponsesBody: generalized model effort clamping for mimo and nem
 	assert.equal(mimo.reasoning_effort, "xhigh", "mimo max clamped to highest supported xhigh");
 	assert.equal(mimo.reasoningEffort, "xhigh", "mimo ultra clamped to highest supported xhigh");
 
-	// nemotron-3-ultra-free: max is null, highest non-null is xhigh
+	// nemotron-3.5-lightning-free: max is null, highest non-null is xhigh
 	const nemo: Record<string, unknown> = {
-		model: "nemotron-3-ultra-free",
+		model: "nemotron-3.5-lightning-free",
 		input: "hi",
 		reasoning_effort: "max",
 		reasoningEffort: "ultra",

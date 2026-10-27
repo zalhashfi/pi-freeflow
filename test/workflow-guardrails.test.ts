@@ -24,14 +24,13 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOWS = path.join(ROOT, ".github", "workflows");
 
 const WATCH_JOB = "watch";
-const DRIFT_ISSUE_STEP = "Open or Update GitHub Issue on Drift";
-const STATE_STEP = "Update State and Commit";
+const DRIFT_ISSUE_STEP = "File or Update Critical Drift Issue";
+const STATE_STEP = "Commit Watcher State";
 const RELEASE_JOB = "validate-and-publish";
 const TAG_VALIDATION_STEP = "Validate tag against package version";
 const RELEASE_STEP = "Create or Update GitHub Release";
-const PUBLISH_STEP = "Publish with Changesets (if NPM_TOKEN is configured)";
 const TAG_GATE = "startsWith(github.ref, 'refs/tags/')";
-const FALLBACK_BODY = "OpenCode upstream drift detected but drift-report.md is missing. See workflow logs.";
+const FALLBACK_BODY = "Critical OpenCode upstream drift detected but drift-report.md is missing. See workflow logs.";
 
 type Step = { name?: string; if?: string; run?: string; uses?: string };
 type Job = { "runs-on"?: unknown; strategy?: { matrix?: Record<string, unknown> }; steps?: Step[] };
@@ -183,21 +182,13 @@ if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
   printf '%s' "\${GH_STUB_LIST:-}"
   exit 0
 fi
-if [ "$1" = "issue" ] && { [ "$2" = "comment" ] || [ "$2" = "create" ]; }; then
+if [ "$1" = "issue" ] && { [ "$2" = "comment" ] || [ "$2" = "create" ] || [ "$2" = "edit" ]; }; then
   shift 2
   while [ $# -gt 0 ]; do
     if [ "$1" = "--body-file" ]; then cp "$2" "$GH_STUB_DIR/body.txt"; fi
     shift
   done
 fi
-exit 0
-`;
-
-const NODE_STUB = `#!/bin/sh
-# Stands in for \`node scripts/opencode-watch.mjs --update\`: records the call and
-# produces a state change so the push path runs without contacting upstream.
-printf '%s\\n' "$*" >> "$NODE_STUB_DIR/node.log"
-printf '%s\\n' '{"simulated":true}' > .github/opencode-watch-state.json
 exit 0
 `;
 
@@ -232,8 +223,8 @@ test("opencode-watch.yml files the drift issue body when the report is missing",
 	});
 });
 
-test("opencode-watch.yml comments the open drift issue with the report file", { skip: SKIP_NO_YAML ?? SKIP_NO_STUBS }, () => {
-	withTempDir("pff-drift-comment-", (dir) => {
+test("opencode-watch.yml edits the open drift issue body in place", { skip: SKIP_NO_YAML ?? SKIP_NO_STUBS }, () => {
+	withTempDir("pff-drift-edit-", (dir) => {
 		const report = "# Drift\n\n- upstream file changed\n";
 		fs.writeFileSync(path.join(dir, "drift-report.md"), report);
 		const gh = makeStub(dir, "gh", GH_STUB);
@@ -246,9 +237,15 @@ test("opencode-watch.yml comments the open drift issue with the report file", { 
 
 		const calls = ghCalls(gh.bin);
 		assert.deepEqual(
-			calls.find((call) => call[1] === "comment"),
-			["issue", "comment", "42", "--body-file", "drift-report.md"],
+			calls.find((call) => call[1] === "edit"),
+			["issue", "edit", "42", "--body-file", "drift-report.md"],
 		);
+		assert.equal(
+			calls.filter((call) => call[1] === "comment").length,
+			0,
+			"an open issue is edited, never commented on every run",
+		);
+		assert.equal(calls.filter((call) => call[0] === "issue" && call[1] === "create").length, 0);
 		assert.equal(fs.readFileSync(path.join(gh.bin, "body.txt"), "utf8"), report);
 	});
 });
@@ -285,17 +282,14 @@ test(
 			git(["commit", "-m", "feat: concurrent change on main"], other);
 			git(["push", "origin", "main"], other);
 
-			const node = makeStub(dir, "node", NODE_STUB);
-			const result = runShell(scriptOf("opencode-watch.yml", WATCH_JOB, STATE_STEP), work, {
-				...node.env,
-				NODE_STUB_DIR: slash(node.bin),
-			});
+			// The watcher already advanced the state in this checkout; the step only commits it.
+			fs.writeFileSync(path.join(work, ".github", "opencode-watch-state.json"), '{"simulated":true}\n');
+			const result = runShell(scriptOf("opencode-watch.yml", WATCH_JOB, STATE_STEP), work, {});
 			assert.equal(result.status, 0, result.output);
 
 			const history = git(["--git-dir", slash(origin), "log", "--pretty=%s", "main"]);
 			assert.match(history, /chore\(watch\): update opencode watch state \[skip ci\]/, history);
 			assert.match(history, /feat: concurrent change on main/, history);
-			assert.equal(fs.readFileSync(path.join(node.bin, "node.log"), "utf8").trim(), "scripts/opencode-watch.mjs --update");
 			// The rebase carries the state file through git, so the checkout may hand it back in the
 			// host's line-ending convention (CRLF on Windows runners): the contract is that the content
 			// survives the rebase-then-push, not which newline the OS writes.
@@ -309,13 +303,37 @@ test("release.yml validates the pushed tag against package.json", { skip: SKIP_N
 	const doc = loadWorkflow("release.yml");
 	assert.equal(stepOf(doc, RELEASE_JOB, TAG_VALIDATION_STEP).if, TAG_GATE);
 	assert.equal(stepOf(doc, RELEASE_JOB, RELEASE_STEP).if, TAG_GATE);
-	assert.equal(stepOf(doc, RELEASE_JOB, RELEASE_STEP).uses, "softprops/action-gh-release@v2");
+	// The maintained action is the contract; it may be referenced by major tag
+	// or pinned to a commit SHA (the pin gate below requires the SHA form).
+	assert.match(stepOf(doc, RELEASE_JOB, RELEASE_STEP).uses ?? "", /^softprops\/action-gh-release@(v\d+|[0-9a-f]{40})$/);
 });
 
-test("release.yml reaches for the GitHub Release only on a tag", { skip: SKIP_NO_YAML }, () => {
-	const publish = stepOf(loadWorkflow("release.yml"), RELEASE_JOB, PUBLISH_STEP);
-	assert.equal(publish.if, "env.NPM_TOKEN != ''");
-	assert.equal(publish.run, "pnpm changeset publish");
+test("every workflow action is pinned to a commit SHA", { skip: SKIP_NO_YAML }, () => {
+	for (const file of ["ci.yml", "opencode-model-check.yml", "opencode-watch.yml", "release.yml"]) {
+		const doc = loadWorkflow(file);
+		for (const [jobName, job] of Object.entries(doc.jobs ?? {})) {
+			for (const step of job.steps ?? []) {
+				if (!step.uses) continue;
+				assert.match(
+					step.uses,
+					/^[^@\s]+@[0-9a-f]{40}$/,
+					`${file} (${jobName}, step "${step.name ?? "unnamed"}"): ${step.uses} must pin a commit SHA — a mutable tag can be repointed at any commit, including one written by someone else`,
+				);
+			}
+		}
+	}
+});
+
+test("release.yml never publishes to npm and proves the tarball before releasing", { skip: SKIP_NO_YAML }, () => {
+	const steps = jobOf(loadWorkflow("release.yml"), RELEASE_JOB).steps ?? [];
+	// Publishing is manual in this repo (maintainer terminal, 2FA): a workflow that can
+	// publish on its own is the regression this guards.
+	assert.doesNotMatch(steps.map((step) => step.run ?? "").join("\n"), /(npm publish|changeset publish)/);
+
+	const verifyIndex = steps.findIndex((step) => (step.run ?? "").includes("scripts/verify-published-tarball.mjs"));
+	const releaseIndex = steps.findIndex((step) => step.name === RELEASE_STEP);
+	assert.ok(verifyIndex >= 0, `expected the published-tarball verification step: ${steps.map((step) => step.name).join(", ")}`);
+	assert.ok(releaseIndex > verifyIndex, "the tarball verification must run before the GitHub Release is created");
 });
 
 test("release.yml tag validation rejects a tag that disagrees with the version", { skip: SKIP_NO_YAML ?? SKIP_NO_SHELL }, () => {
@@ -364,4 +382,77 @@ test("ci.yml exercises the declared node floor and scopes the token", { skip: SK
 	const fallback = jobOf(doc, "test-local");
 	assert.deepEqual(fallback["runs-on"], ["self-hosted", "Linux", "X64", "acerblue-local"]);
 	assert.equal(fallback.strategy, undefined);
+});
+
+test("ci.yml classifies changed paths into the gates it promises", { skip: SKIP_NO_YAML ?? SKIP_NO_SHELL ?? SKIP_NO_GIT }, () => {
+	withTempDir("pff-classify-", (dir) => {
+		const repo = path.join(dir, "repo");
+		fs.mkdirSync(repo);
+		initRepo(repo);
+
+		const commit = (files: Record<string, string>, message: string): string => {
+			for (const [name, content] of Object.entries(files)) {
+				const target = path.join(repo, name);
+				fs.mkdirSync(path.dirname(target), { recursive: true });
+				fs.writeFileSync(target, content);
+			}
+			git(["add", "-A"], repo);
+			git(["commit", "-m", message], repo);
+			return git(["rev-parse", "HEAD"], repo).trim();
+		};
+
+		const classify = (env: Record<string, string>): Record<string, string> => {
+			const output = path.join(dir, "github-output.txt");
+			fs.writeFileSync(output, "");
+			const result = runShell(scriptOf("ci.yml", "changes", "Classify changed files"), repo, {
+				...env,
+				GITHUB_OUTPUT: slash(output),
+			});
+			assert.equal(result.status, 0, result.output);
+			return Object.fromEntries(
+				fs
+					.readFileSync(output, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => line.split("=") as [string, string]),
+			);
+		};
+
+		const base = commit({ "README.md": "base\n" }, "base");
+		const docs = commit({ "docs/pages/relays.md": "page\n" }, "docs page");
+		assert.deepEqual(classify({ EVENT_NAME: "push", BEFORE_SHA: base, HEAD_SHA: docs }), {
+			code: "false",
+			pack: "false",
+			docs: "true",
+		});
+
+		// A dependency bump can break the docs build without touching docs/, and it ships.
+		const deps = commit({ "package.json": "{}\n" }, "dependency bump");
+		assert.deepEqual(classify({ EVENT_NAME: "push", BEFORE_SHA: docs, HEAD_SHA: deps }), {
+			code: "true",
+			pack: "true",
+			docs: "true",
+		});
+
+		const source = commit({ "src/relay.ts": "// touched\n" }, "source change");
+		assert.deepEqual(classify({ EVENT_NAME: "push", BEFORE_SHA: deps, HEAD_SHA: source }), {
+			code: "true",
+			pack: "true",
+			docs: "false",
+		});
+
+		const meta = commit({ "AGENTS.md": "note\n" }, "agent docs");
+		assert.deepEqual(classify({ EVENT_NAME: "push", BEFORE_SHA: source, HEAD_SHA: meta }), {
+			code: "false",
+			pack: "false",
+			docs: "false",
+		});
+
+		// A manual run has no range to diff: everything runs rather than nothing.
+		assert.deepEqual(classify({ EVENT_NAME: "workflow_dispatch" }), {
+			code: "true",
+			pack: "true",
+			docs: "true",
+		});
+	});
 });

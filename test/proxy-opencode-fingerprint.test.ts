@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { startProxy } from "../src/proxy.ts";
+import { authHeaders } from "./_auth.ts";
 import { OPENCODE_FINGERPRINT_TOOLS, toolNameOf } from "../src/opencode-fingerprint.ts";
 import { _resetUpstreamHealthForTest } from "../src/upstream-health.ts";
 import { _resetFreeTierHintForTest } from "../src/upstream-health.ts";
@@ -49,7 +50,7 @@ test("proxy: OpenCode chat request without tools receives injected fingerprint a
 			port: effectivePort,
 			path: "/v1/chat/completions",
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { "content-type": "application/json", ...authHeaders() },
 		});
 
 		const clientResPromise = new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>(
@@ -94,6 +95,14 @@ test("proxy: OpenCode chat request without tools receives injected fingerprint a
 		for (const tool of OPENCODE_FINGERPRINT_TOOLS) {
 			assert.ok(receivedTools.includes(tool), `missing fingerprint tool ${tool}`);
 		}
+		// Body-side axis: the system prompt must carry the env block, or upstream
+		// answers 429 FreeUsageLimitError as if the quota were exhausted.
+		const wireSystem = (body1.messages as Array<{ role: string; content: string }>).find(
+			(message) => message.role === "system",
+		);
+		assert.ok(wireSystem, "the block needs a system message on the wire");
+		assert.equal(wireSystem.content.match(/<env>[\s\S]*?<\/env>/g)?.length, 1, "exactly one pair reaches upstream");
+		assert.match(wireSystem.content, /Working directory:/, "the load-bearing key is inside the pair");
 
 		// 2. Non-streaming client received clean parsed JSON
 		const parsedClientJson = JSON.parse(clientRes.body) as {
@@ -163,7 +172,7 @@ test("proxy: OpenCode Responses request without tools (like advisor watchdog) re
 			port: effectivePort,
 			path: "/v1/responses",
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { "content-type": "application/json", ...authHeaders() },
 		});
 
 		const clientResPromise = new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>(
@@ -186,7 +195,7 @@ test("proxy: OpenCode Responses request without tools (like advisor watchdog) re
 		// Advisor sends minimal prompt without tools and stream: false
 		clientReq.write(
 			JSON.stringify({
-				model: "muse-spark-1.3-contributor-free",
+				model: "nemotron-3.5-super-vl-free",
 				input: "watchdog inspection",
 				stream: false,
 			}),
@@ -207,6 +216,11 @@ test("proxy: OpenCode Responses request without tools (like advisor watchdog) re
 		for (const tool of OPENCODE_FINGERPRINT_TOOLS) {
 			assert.ok(receivedToolNames.includes(tool), `missing fingerprint tool ${tool}`);
 		}
+		// Body-side axis on the responses wire: hosts that send no `instructions`
+		// (the advisor watchdog) get one carrying the env block.
+		assert.equal(typeof body2.instructions, "string", "upstream must read the block from instructions");
+		assert.equal((body2.instructions as string).match(/<env>[\s\S]*?<\/env>/g)?.length, 1);
+		assert.match(body2.instructions as string, /Working directory:/);
 
 		// 2. Client received clean completed response object
 		const parsed = JSON.parse(clientRes.body) as typeof expectedResponseObj;
@@ -265,7 +279,7 @@ test("proxy: upstream receives live UA + ses_ headers with stream:true and the f
 						port: effectivePort,
 						path: "/v1/chat/completions",
 						method: "POST",
-						headers: { "content-type": "application/json" },
+						headers: { "content-type": "application/json", ...authHeaders() },
 					},
 					(res) => {
 						const chunks: Buffer[] = [];

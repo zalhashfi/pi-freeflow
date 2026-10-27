@@ -16,9 +16,16 @@ import {
  WATCHDOG_SSE_MIN_SAMPLES,
  WATCHDOG_SSE_WINDOW,
 } from "./config.ts";
-import { cloakMessagesContent, type CaseRestoreMap, type FindGlobRestore } from "./opencode-fingerprint.ts";
+import {
+	accumulateToolCallName,
+	cloakMessagesContent,
+	looksLikeSse,
+	type CaseRestoreMap,
+	type FindGlobRestore,
+} from "./opencode-fingerprint.ts";
 import { restoreToolNameForCaller } from "./tool-translation.ts";
 import { repairToolArguments } from "./tool-args.ts";
+import type { ToolcallRepairSink, ToolcallStreamAudit } from "./toolcall-audit.ts";
 
 /**
  * A premature stream end counts as "substantial" only when BOTH thresholds
@@ -27,14 +34,26 @@ import { repairToolArguments } from "./tool-args.ts";
  */
 export const SUBSTANTIAL_MIN_CHUNKS = 50;
 export const SUBSTANTIAL_MIN_BYTES = 100 * 1024;
+// Body-stall cut for streamed upstream bodies (see pipeUpstreamStream).
+// Generous: every healthy stream observed on this proxy re-arms it within a
+// few hundred ms; a 120s byte-silence on an open socket is a wedged relay
+// leg, not a building model.
+let bodyStallCutMs = 120_000;
+/** Test-only: override the body-stall cut; returns a restore function. */
+export function _setBodyStallCutForTest(ms: number): () => void {
+ const prev = bodyStallCutMs;
+ bodyStallCutMs = ms;
+ return () => { bodyStallCutMs = prev; };
+}
 // Bounded lookahead for a streaming response whose upstream omitted the
 // content-type: the pipe holds at most this many bytes while it waits for SSE
 // evidence, then classifies the body itself (raw passthrough on overflow —
 // a genuine SSE body opens with its first field line long before this).
 const SNIFF_WINDOW_BYTES = 8192;
-// SSE field line at a line start (`data:`/`event:`), CRLF-tolerant. Consulted
-// only while the body kind is undecided (upstream sent no content-type).
-const SSE_START_RE = /(^|\n)(data|event):/;
+// Body-kind evidence is the shared `looksLikeSse` predicate (a `data:`/`event:`
+// field line at a line start, CRLF-tolerant) — one source of truth with
+// convertSseToJson's guard and the proxy's aggregate gates. Consulted only
+// while the body kind is undecided (upstream sent no content-type).
 // Wire markers proving the forwarded bytes already contain a tool call the
 // host may execute (responses + chat shapes). A re-fired turn would
 // regenerate those calls, so their presence vetoes the silent resume and
@@ -48,6 +67,29 @@ const TOOL_CALL_MARKERS = [
  "custom_tool_call_input",
  '"tool_calls"',
 ];
+// Same wire evidence for the tool-call audit gate, plus the Anthropic
+// argument-fragment event: those deltas carry no tool_use marker of their own
+// (the `content_block_start` did), yet the recorder needs every fragment to
+// classify the call, so they must reach observe() too.
+const AUDIT_TOOL_MARKERS = [...TOOL_CALL_MARKERS, '"type":"input_json_delta"'];
+// Turn-end frames carry the finish reason but no tool marker. They are the
+// only evidence a tool turn ended in plain text, so the audit gate must let
+// them through; matching the populated form (not the ubiquitous
+// `"finish_reason":null` delta) keeps the gate at one extra block per turn.
+const AUDIT_TURN_END_MARKERS = [
+ '"finish_reason":"stop"',
+ '"finish_reason":"tool_calls"',
+ '"finish_reason":"length"',
+ '"finish_reason":"content_filter"',
+ '"stop_reason":"end_turn"',
+ '"stop_reason":"tool_use"',
+ '"stop_reason":"max_tokens"',
+ '"stop_reason":"stop_sequence"',
+ '"response.completed"',
+ '"response.incomplete"',
+ '"response.failed"',
+];
+const AUDIT_MARKERS = [...AUDIT_TOOL_MARKERS, ...AUDIT_TURN_END_MARKERS];
 
 export function isSubstantial(chunks: number, bytes: number): boolean {
  return chunks > SUBSTANTIAL_MIN_CHUNKS && bytes > SUBSTANTIAL_MIN_BYTES;
@@ -80,6 +122,63 @@ const DETERMINISTIC_FAILURE_MARKERS = [
 ];
 
 /**
+ * A 429-shaped mid-stream error frame is a per-egress rate limit, not a
+ * terminal verdict: another relay IP may serve the same turn immediately.
+ * Kept separate from isTransientModelFailureFrame (which owns model flakes),
+ * and still vetoed by hard request/auth/quota verdicts so a billable or
+ * malformed request is never replayed as relay trouble.
+ */
+const RATE_LIMIT_MARKERS = [
+ "rate_limit",
+ "rate limit",
+ "too many requests",
+ '"status":429',
+ '"code":429',
+ "shared free-tier ip quota",
+];
+const RATE_LIMIT_HARD_MARKERS = [
+ "invalid_request",
+ "invalid_response",
+ "invalid_reasoning",
+ "previous_response",
+ "freetiererror",
+ "insufficient_quota",
+ "billing",
+ "authentication",
+ "invalid_api_key",
+ "permission",
+ "moderation",
+];
+
+/**
+ * True when an SSE block carries an upstream-issued rate-limit error (HTTP
+ * 429 / rate_limit_exceeded / "too many requests"). Requires an error-shaped
+ * frame so ordinary model prose mentioning "rate limit" never triggers a
+ * replay; hard billing/auth/request verdicts always win.
+ */
+export function isRetriableRateLimitFrame(s: string): boolean {
+ const lower = s.toLowerCase();
+ // A successful terminal echoes the full response object, whose `error` is
+ // null; it can contain the model's prose ("HTTP 429 means rate limit") and
+ // must never be replayed. Only a real error object/event may be held.
+ if (lower.includes('"type":"response.completed"') || lower.includes('"status":"completed"')) {
+  return false;
+ }
+ if (
+  !lower.includes('"error":{') &&
+  !lower.includes('"error":"') &&
+  !lower.includes('"status":"failed"') &&
+  !lower.includes("response.failed") &&
+  !lower.includes('"type":"error"')
+ ) {
+  return false;
+ }
+ if (RATE_LIMIT_HARD_MARKERS.some((m) => lower.includes(m))) return false;
+ return RATE_LIMIT_MARKERS.some((m) => lower.includes(m));
+}
+
+
+/**
  * True when scanned SSE text carries an upstream-issued response.failed frame
  * for a TRANSIENT model fault (server_error class). Text-only turns holding
  * such a frame may offer one silent re-fire; anything else (clean terminals,
@@ -92,20 +191,55 @@ export function isTransientModelFailureFrame(s: string): boolean {
  return false;
 }
 
+/**
+ * True when a trailing (framing-less) SSE block ends on a finished field line:
+ * the upstream FIN'd right after a complete `data:`/`event:` value and only the
+ * closing blank line is missing. Such a block carries a real event the client
+ * was owed — dropping it lost the turn's last delta (probe: `data:
+ * {"delta":"hello"}\n\n` then `data: {"delta":"world"}` + FIN delivered hello
+ * and a synthetic [DONE], never world).
+ *
+ * A block cut inside its value (`data: {"a":`) or ending on anything other
+ * than a `data:`/`event:` line stays dropped: forwarding it would put the
+ * host's parser on a broken frame.
+ */
+function endsOnFinishedSseLine(tail: string): boolean {
+ const lines = tail.split(/\r?\n/);
+ // A trailing newline terminates the last line; judge the last non-empty one.
+ let index = lines.length - 1;
+ if (index > 0 && lines[index] === "") index -= 1;
+ const line = lines[index] ?? "";
+ if (line.startsWith("data:")) {
+  const payload = line.slice(5).trim();
+  if (payload === "[DONE]") return true;
+  try {
+   JSON.parse(payload);
+   return true;
+  } catch {
+   // Not a complete JSON value: the block was cut mid-payload.
+   return false;
+  }
+ }
+ if (line.startsWith("event:")) return line.slice(6).trim().length > 0;
+ return false;
+}
+
 // Mid-stream fault split (observability only, never routing): upstream-issued
 // model-fault frames vs relay-fault truncations. Relay-health marks stay the
 // rotation mechanism; these counters attribute blame for status/logs.
 let midStreamModelFaults = 0;
+let midStreamRateLimitFaults = 0;
 let midStreamRelayTruncations = 0;
 
 /** Current mid-stream fault split. */
-export function getMidStreamFaultStats(): { modelFaults: number; relayTruncations: number } {
- return { modelFaults: midStreamModelFaults, relayTruncations: midStreamRelayTruncations };
+export function getMidStreamFaultStats(): { modelFaults: number; rateLimitFaults: number; relayTruncations: number } {
+ return { modelFaults: midStreamModelFaults, rateLimitFaults: midStreamRateLimitFaults, relayTruncations: midStreamRelayTruncations };
 }
 
 /** Test-only: reset the mid-stream fault split. */
 export function _resetMidStreamFaultStatsForTest(): void {
  midStreamModelFaults = 0;
+ midStreamRateLimitFaults = 0;
  midStreamRelayTruncations = 0;
 }
 
@@ -180,44 +314,120 @@ export interface StreamCloakOptions {
  pathname: string;
  /** Caller tool schemas for argument repair; undefined/empty means byte-identical. */
  argSchemas?: ReadonlyMap<string, Record<string, unknown>>;
+ /** Normalize delta.reasoning to delta.reasoning_content for OpenAI/OMP compatibility. */
+ normalizeReasoning?: boolean;
 }
 
 /** Per-stream drop tracking (delta events carry no name, only an index/id). */
 export interface SseStreamCloakState {
  responsesDroppedByIndex: Map<number, boolean>;
  responsesDroppedByItemId: Map<string, boolean>;
- chatDroppedByIndex: Map<number, boolean>;
  messagesDroppedByIndex: Map<number, boolean>;
  /** Output index -> tool name, so nameless argument deltas can find their schema. */
  responsesNameByIndex: Map<number, string>;
  /** Anthropic block index -> tool name, same purpose for input_json deltas. */
  messagesNameByIndex: Map<number, string>;
- /** Chat tool-call index -> restored tool name. */
- chatNameByIndex: Map<number, string>;
  /**
- * Argument fragments for tool calls whose schema admits a repair, keyed the
- * same way as the name maps above. Streaming APIs deliver arguments in
- * fragments, so a malformed packet can only be judged once complete: those
- * fragments are held here and re-emitted, repaired, on the call's terminal
- * event. Tools absent from `argSchemas` are never buffered, so their
- * arguments still stream incrementally exactly as before.
+ * Argument fragments for Anthropic tool_use blocks whose schema admits a
+ * repair, keyed the same way as the name map above. Streaming APIs deliver
+ * arguments in fragments, so a malformed packet can only be judged once
+ * complete: those fragments are held here and re-emitted, repaired, on the
+ * block's terminal event. Tools absent from `argSchemas` are never buffered,
+ * so their arguments still stream incrementally exactly as before.
  */
- chatArgsByIndex: Map<number, string>;
  messagesArgsByIndex: Map<number, string>;
+ /**
+ * Chat tool calls tracked PER CALL (defect K1): keyed by the upstream
+ * tool-call id whenever the provider sends one (`id:X`), else by the legacy
+ * index bucket (`idx:N`). Free models label EVERY parallel call `index: 0`
+ * while still sending per-call ids, so index-only keying merged their
+ * fragment streams: one call was silently lost and the other received a
+ * salvage of the merged junk. Drops, names, buffered arguments and the
+ * once-only flush guard are per call; an injected placeholder's drop
+ * verdict is never inherited by a real call that reuses its index.
+ */
+ chatCalls: Map<string, ChatTrackedCall>;
+ /**
+ * Observed delta index -> key of the call its id-less fragments currently
+ * belong to. Resolution mirrors the aggregate cloak exactly
+ * (sseToChatCompletionJson): an id-bearing delta (re)binds the index to its
+ * id-call; id-less deltas follow the current owner, else the legacy
+ * `idx:N` bucket. Never consulted for host-visible indices — that is what
+ * {@link chatIndexClaims} is for.
+ */
+ chatIndexOwner: Map<number, string>;
+ /** Host-index claims: index -> key of the call that FIRST assigned it. Set once, never rebound. */
+ chatIndexClaims: Map<number, string>;
+ /**
+ * Fresh sequential index handed out when a call's upstream index is already
+ * claimed by another tracked call; strictly above every index seen or
+ * assigned so far in this stream.
+ */
+ chatNextIndex: number;
+ /**
+ * Per-turn tool-call audit sink for the rewrites this state performs
+ * (index collisions, dropped name restatements, withheld arguments, repaired
+ * arguments). Absent when the caller did not request an audit.
+ */
+ audit?: ToolcallRepairSink;
 }
 
-export function createSseStreamCloakState(): SseStreamCloakState {
- return {
+/**
+ * Streaming state of ONE chat tool call. Exported only because it hangs off
+ * the exported per-stream state; treat it as pipe-internal.
+ */
+export interface ChatTrackedCall {
+ /** Never emit this call: injected placeholder, or a tool-less caller's call. */
+ dropped: boolean;
+ /**
+  * Restored host-facing name, folded from every name-bearing delta:
+  * fragments append, a delta that also carries arguments restates the whole
+  * name and replaces (see accumulateToolCallName).
+  */
+ name: string | undefined;
+ /**
+ * True once a name-bearing delta decided this tool is repairable and its
+ * fragments must be withheld: the packet is only judgeable once whole, so
+ * the fragments re-emerge whole+repaired on the call's terminal event.
+ */
+ buffered: boolean;
+ /** Buffered argument prefix while {@link buffered} is true ("" until a fragment arrives). */
+ args: string;
+ /**
+ * Host-visible index: the call's FIRST assigned index — its first observed
+ * index — unless that upstream index was claimed by another tracked call,
+ * in which case a fresh sequential index was handed out in arrival order.
+ */
+ hostIndex: number;
+ /** Emitted-once guard: a flush entry already went out for this call (terminal or end-of-stream). */
+ flushed: boolean;
+}
+
+/** Map key of a chat tool call that announced an upstream id. */
+function chatCallIdKey(id: string): string {
+ return `id:${id}`;
+}
+
+/** Legacy map key of the id-less fragment bucket for one observed delta index. */
+function chatIndexKey(idx: number): string {
+ return `idx:${idx}`;
+}
+
+export function createSseStreamCloakState(audit?: ToolcallRepairSink): SseStreamCloakState {
+ const state: SseStreamCloakState = {
   responsesDroppedByIndex: new Map(),
   responsesDroppedByItemId: new Map(),
-  chatDroppedByIndex: new Map(),
   messagesDroppedByIndex: new Map(),
   responsesNameByIndex: new Map(),
   messagesNameByIndex: new Map(),
-  chatNameByIndex: new Map(),
-  chatArgsByIndex: new Map(),
   messagesArgsByIndex: new Map(),
+  chatCalls: new Map(),
+  chatIndexOwner: new Map(),
+  chatIndexClaims: new Map(),
+  chatNextIndex: 0,
  };
+ if (audit !== undefined) state.audit = audit;
+ return state;
 }
 
 /**
@@ -241,11 +451,13 @@ export function flushBufferedToolArgs(
   const blocks: string[] = [];
   for (const [index, args] of state.messagesArgsByIndex) {
    const name = state.messagesNameByIndex.get(index) ?? "";
+   const repaired = repairToolArguments(name, args, cloak.argSchemas);
+   if (repaired !== args) state.audit?.repair("arguments-repaired", name);
    blocks.push(
     `event: content_block_delta\ndata: ${JSON.stringify({
      type: "content_block_delta",
      index,
-     delta: { type: "input_json_delta", partial_json: repairToolArguments(name, args, cloak.argSchemas) },
+     delta: { type: "input_json_delta", partial_json: repaired },
     })}\n\n`,
    );
   }
@@ -253,15 +465,21 @@ export function flushBufferedToolArgs(
   state.messagesNameByIndex.clear();
   return blocks.join("");
  }
- if (state.chatArgsByIndex.size === 0) return null;
  const calls: unknown[] = [];
- for (const [index, args] of state.chatArgsByIndex) {
-  const name = state.chatNameByIndex.get(index);
+ for (const call of state.chatCalls.values()) {
+  // The flushed guard makes this one-shot even when a terminal flush
+  // already emitted the call whole earlier in the stream.
+  if (!call.buffered || call.flushed) continue;
+  const name = call.name;
   if (name === undefined) continue;
-  calls.push({ index, type: "function", function: { name, arguments: repairToolArguments(name, args, cloak.argSchemas) } });
+  const args = call.args;
+  call.flushed = true;
+  call.buffered = false;
+  call.args = "";
+  const repairedArgs = repairToolArguments(name, args, cloak.argSchemas);
+  if (repairedArgs !== args) state.audit?.repair("arguments-repaired", name);
+  calls.push({ index: call.hostIndex, type: "function", function: { name, arguments: repairedArgs } });
  }
- state.chatArgsByIndex.clear();
- state.chatNameByIndex.clear();
  if (calls.length === 0) return null;
  return `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: calls } }] })}\n\n`;
 }
@@ -282,6 +500,7 @@ export function shouldBypassStreamCloak(cloak?: StreamCloakOptions): boolean {
  if (!cloak.callerHadTools && cloak.injected !== undefined) return false;
  // A repairable schema means fragmented arguments must be buffered.
  if (cloak.argSchemas !== undefined && cloak.argSchemas.size > 0) return false;
+ if (cloak.normalizeReasoning === true) return false;
  return true;
 }
 
@@ -369,7 +588,10 @@ function rewriteResponsesBlock(
     if (typeof parsed.output_index === "number") state.responsesNameByIndex.set(parsed.output_index, restored);
     if (type === "response.output_item.done") {
      rec.name = restored;
-     rec.arguments = repairToolArguments(restored, typeof rec.arguments === "string" ? rec.arguments : "", cloak.argSchemas);
+     const originalArgs = typeof rec.arguments === "string" ? rec.arguments : "";
+     const repairedArgs = repairToolArguments(restored, originalArgs, cloak.argSchemas);
+     if (repairedArgs !== originalArgs) state.audit?.repair("arguments-repaired", restored);
+     rec.arguments = repairedArgs;
      return emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
     }
     if (restored !== rec.name) {
@@ -394,6 +616,7 @@ function rewriteResponsesBlock(
    if (name !== undefined) {
     const repairedArgs = repairToolArguments(name, parsed.arguments, cloak.argSchemas);
     if (repairedArgs !== parsed.arguments) {
+     state.audit?.repair("arguments-repaired", name);
      parsed.arguments = repairedArgs;
      return emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
     }
@@ -443,10 +666,152 @@ function cloakStreamResponsesObject(resp: unknown, cloak: StreamCloakOptions): v
 }
 
 /**
+ * Resolve ONE chat tool_calls record to its tracked call, registering the
+ * call on first sight.
+ *
+ * Keying mirrors the aggregate cloak (sseToChatCompletionJson): a record with
+ * a non-empty id is keyed `id:<id>`; an id-less record joins whatever call
+ * currently OWNS its index (`chatIndexOwner`, which id-bearing deltas
+ * rebind), else the legacy `idx:<index>` bucket — so id-less parallel calls
+ * sharing `index: 0` still merge into one fragment stream, exactly as
+ * before. Host index = the call's first observed index unless that upstream
+ * index is ALREADY CLAIMED by another tracked call (`chatIndexClaims`), in
+ * which case the next fresh sequential index is handed out in arrival order.
+ * The claim deliberately counts dropped calls too: the ticket rule is
+ * "claimed by ANOTHER tracked call", and a dropped placeholder has already
+ * moved the claim bookkeeping even though it emits nothing.
+ */
+function chatTrackedCall(
+ state: SseStreamCloakState,
+ rec: Record<string, unknown>,
+): { call: ChatTrackedCall; key: string; idx: number } {
+ const idx = typeof rec.index === "number" ? rec.index : 0;
+ if (idx + 1 > state.chatNextIndex) state.chatNextIndex = idx + 1;
+ const id = typeof rec.id === "string" && rec.id !== "" ? rec.id : undefined;
+ let key: string;
+ if (id !== undefined) {
+  key = chatCallIdKey(id);
+  // Id-bearing deltas (re)bind the index owner; later id-less fragments
+  // follow, and a real call reusing an injected placeholder's index takes
+  // the connection over instead of inheriting its drop verdict.
+  state.chatIndexOwner.set(idx, key);
+ } else {
+  key = state.chatIndexOwner.get(idx) ?? chatIndexKey(idx);
+ }
+ const known = state.chatCalls.get(key);
+ if (known !== undefined) return { call: known, key, idx };
+ // First sight: assign the host-visible index. A claimed upstream index
+ // forces a fresh sequential index above every index seen or assigned so
+ // far; the fresh index is itself claimed so a later real call keeps clear.
+ const claim = state.chatIndexClaims.get(idx);
+ let call: ChatTrackedCall;
+ if (claim === undefined) {
+  state.chatIndexClaims.set(idx, key);
+  call = { dropped: false, name: undefined, buffered: false, args: "", hostIndex: idx, flushed: false };
+ } else {
+  call = { dropped: false, name: undefined, buffered: false, args: "", hostIndex: state.chatNextIndex++, flushed: false };
+  state.chatIndexClaims.set(call.hostIndex, key);
+  // Audit: two tracked calls claimed one upstream index; the host index was
+  // re-homed sequentially so the wire stays well-formed.
+  state.audit?.repair("parallel-index-collision", `idx:${idx}`);
+ }
+ state.chatCalls.set(key, call);
+ return { call, key, idx };
+}
+
+/**
+ * Point one EMITTED chat tool_call delta at its call's host index. The
+ * rewrite must only ever fire in index-collision cases, so byte-identity
+ * holds for every single-call stream: an unchanged index is left untouched,
+ * and a record with NO index field (host-defaulted 0) only gains one when
+ * the host index is not 0.
+ */
+function chatRewriteDeltaIndex(rec: Record<string, unknown>, call: ChatTrackedCall): boolean {
+ if (typeof rec.index === "number") {
+  if (rec.index === call.hostIndex) return false;
+  rec.index = call.hostIndex;
+  return true;
+ }
+ if (call.hostIndex === 0) return false;
+ rec.index = call.hostIndex;
+ return true;
+}
+
+/**
+ * Terminal chunk for chat choice: absorb any tool-call argument fragment
+ * riding the finish_reason chunk into its call's buffered prefix, then
+ * re-emit every buffered call's whole argument packet, repaired, at ITS host
+ * index. Returns true if delta was mutated.
+ *
+ * Flush-entry id policy: entries keep today's exact shape
+ * {index, type:"function", function:{name,arguments}} WITHOUT the call id.
+ * Hosts assemble streamed tool_calls by index, and every delta of the call —
+ * including the id-bearing name-delta — is emitted at the same rewritten
+ * host index, so the host has already bound the id; the stable shape also
+ * keeps the single-call flush byte-identical.
+ */
+function flushChatTerminalToolCalls(
+ d: Record<string, unknown>,
+ state: SseStreamCloakState,
+ cloak: StreamCloakOptions,
+ flushedKeys: Set<string>,
+ flushedEntries: Set<Record<string, unknown>>,
+): boolean {
+ let rewrote = false;
+
+ for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
+  if (!tc || typeof tc !== "object" || Array.isArray(tc)) continue;
+  const rec = tc as Record<string, unknown>;
+  const { call } = chatTrackedCall(state, rec);
+  const fn = rec.function;
+  const fnRec = fn && typeof fn === "object" && !Array.isArray(fn) ? (fn as Record<string, unknown>) : null;
+  if (call.buffered && !call.flushed && fnRec && typeof fnRec.arguments === "string") {
+   call.args += fnRec.arguments;
+  }
+ }
+
+ const flushed: unknown[] = [];
+ for (const [key, call] of state.chatCalls) {
+  if (!call.buffered || call.flushed) continue;
+  const name = call.name;
+  if (name === undefined) continue;
+  call.flushed = true;
+  call.buffered = false;
+  const args = call.args;
+  call.args = "";
+  flushedKeys.add(key);
+  const repairedArgs = repairToolArguments(name, args, cloak.argSchemas);
+  if (repairedArgs !== args) state.audit?.repair("arguments-repaired", name);
+  const entry = { index: call.hostIndex, type: "function", function: { name, arguments: repairedArgs } };
+  flushedEntries.add(entry);
+  flushed.push(entry);
+ }
+
+ if (flushed.length === 0 && !rewrote) return false;
+
+ // Records riding the finish chunk whose call was just flushed are removed
+ // (their fragments were absorbed above); surviving records keep flowing but
+ // are first pointed at their call's host index.
+ const remaining = (Array.isArray(d.tool_calls) ? d.tool_calls : []).filter((tc) => {
+  if (!tc || typeof tc !== "object" || Array.isArray(tc)) return true;
+  const rec = tc as Record<string, unknown>;
+  const { call, key } = chatTrackedCall(state, rec);
+  if (flushedKeys.has(key)) return false;
+  if (chatRewriteDeltaIndex(rec, call)) rewrote = true;
+  return true;
+ });
+ d.tool_calls = [...remaining, ...flushed];
+ return true;
+}
+
+/**
  * Rewrite one Chat Completions SSE block: drop injected delta.tool_calls
- * (including nameless argument continuations via per-index tracking), restore
- * surviving names. Tool-less callers lose all tool_calls with arguments
- * folded to content, mirroring the aggregate cloak. Null drops the block.
+ * (including nameless continuations via per-call tracking), restore surviving
+ * names, and keep host-visible indices true: collisions on one upstream
+ * index (free models label every parallel call index 0) are rewritten to
+ * distinct sequential indices while the call stays one call.
+ * Tool-less callers lose all tool_calls with arguments folded to content,
+ * mirroring the aggregate cloak. Null drops the block.
  */
 function rewriteChatBlock(
  block: string,
@@ -481,28 +846,22 @@ function rewriteChatBlock(
    if (c.finish_reason || c.text || c.logprobs) allDeltasEmpty = false;
    continue;
   }
-  const d = delta as Record<string, unknown>;
+ const d = delta as Record<string, unknown>;
+ if (cloak.normalizeReasoning && typeof d.reasoning === "string" && typeof d.reasoning_content !== "string") {
+  d.reasoning_content = d.reasoning;
+  changed = true;
+  allDeltasEmpty = false;
+ }
   // Terminal chunk for this choice: re-emit every buffered tool call's whole
-  // argument packet, repaired. The fragments never went out, so this is the
-  // first and only time the client sees them. Runs before the tool_calls
-  // branch because the terminal chunk usually carries an empty delta.
-  // Indices flushed on this block: their arguments are final, so the
-  // per-delta loop below must not buffer them a second time.
-  const flushedIndices = new Set<number>();
-  if (c.finish_reason && state.chatArgsByIndex.size > 0) {
-   const flushed: unknown[] = [];
-   for (const [idx, args] of state.chatArgsByIndex) {
-    const name = state.chatNameByIndex.get(idx);
-    if (name === undefined) continue;
-    flushedIndices.add(idx);
-    flushed.push({ index: idx, type: "function", function: { name, arguments: repairToolArguments(name, args, cloak.argSchemas) } });
-   }
-   state.chatArgsByIndex.clear();
-   state.chatNameByIndex.clear();
-   if (flushed.length > 0) {
-    d.tool_calls = [...(Array.isArray(d.tool_calls) ? d.tool_calls : []), ...flushed];
-    changed = true;
-   }
+  // argument packet, repaired, at its host index. The fragments never went
+  // out, so this is the first and only time the client sees them. Runs
+  // before the tool_calls branch because the terminal chunk usually carries
+  // an empty delta. Call keys flushed on this block: their arguments are
+  // final, so the per-delta loop below must not buffer them a second time.
+  const flushedKeys = new Set<string>();
+  const flushedEntries = new Set<Record<string, unknown>>();
+  if (c.finish_reason && flushChatTerminalToolCalls(d, state, cloak, flushedKeys, flushedEntries)) {
+   changed = true;
   }
   if (!Array.isArray(d.tool_calls)) {
    if (Object.keys(d).length > 0) allDeltasEmpty = false;
@@ -512,13 +871,21 @@ function rewriteChatBlock(
   let folded = "";
   for (const tc of d.tool_calls as unknown[]) {
    if (!tc || typeof tc !== "object" || Array.isArray(tc)) continue;
+   // Flush entry rebuilt by the terminal flush above: pure passthrough.
+   // These carry no id, so key resolution would misbind them to whichever
+   // call currently owns the index — today's code skipped them the same way
+   // via the index-keyed flushedIndices set.
+   if (flushedEntries.has(tc as Record<string, unknown>)) {
+    kept.push(tc);
+    continue;
+   }
    const rec = tc as Record<string, unknown>;
-   const idx = typeof rec.index === "number" ? rec.index : 0;
+   const { call, key } = chatTrackedCall(state, rec);
    const fn = rec.function;
    const fnRec = fn && typeof fn === "object" && !Array.isArray(fn) ? (fn as Record<string, unknown>) : null;
    const name = fnRec && typeof fnRec.name === "string" && fnRec.name !== "" ? (fnRec.name as string) : "";
    if (!cloak.callerHadTools) {
-    state.chatDroppedByIndex.set(idx, true);
+    call.dropped = true;
     if (fnRec) {
      folded += (typeof fnRec.arguments === "string" && fnRec.arguments) || name;
     }
@@ -527,44 +894,75 @@ function rewriteChatBlock(
    }
    if (name !== "") {
     if (isInjectedName(name, cloak.injected)) {
-     state.chatDroppedByIndex.set(idx, true);
+     // The verdict is the CALL's, not the index's: a real id-bearing call
+     // reusing this index rebinds the fragment owner (chatIndexOwner) and
+     // inherits nothing.
+     call.dropped = true;
      changed = true;
      continue;
     }
     const restored = restoreStreamName(name, cloak);
-    if (restored !== name && fnRec) {
+    // Fold this delta's name into the call's accumulated name: a name-only
+    // delta is a fragment (append), a delta that ALSO carries arguments
+    // restates the whole name (replace) — same rule as the aggregate cloak,
+    // see accumulateToolCallName. When the restated name is the one the host
+    // already holds, it is dropped from the wire instead of re-sent: the host
+    // concatenates streamed name deltas, so a second copy would hand it
+    // `get_weatherget_weather`.
+    const previousName = call.name;
+    const hasArgs = fnRec !== null && typeof fnRec.arguments === "string" && fnRec.arguments !== "";
+    const toolName = accumulateToolCallName(previousName, restored, hasArgs);
+    const nameRepeated = hasArgs && previousName !== undefined && toolName === previousName;
+    call.name = toolName;
+    if (nameRepeated && fnRec) {
+     delete fnRec.name;
+     changed = true;
+     // Audit: the upstream restated a name the host already holds; the copy
+     // was kept off the wire so the host does not concatenate it.
+     state.audit?.repair("name-restated", toolName);
+    } else if (restored !== name && fnRec) {
      fnRec.name = restored;
      changed = true;
     }
-    state.chatDroppedByIndex.delete(idx);
-    state.chatNameByIndex.set(idx, restored);
-    if (isRepairableTool(restored, cloak.argSchemas) && !flushedIndices.has(idx)) {
+    call.dropped = false;
+    if (isRepairableTool(toolName, cloak.argSchemas) && !call.flushed && !flushedKeys.has(key)) {
      // Hold this call's arguments: the packet is only judgeable once whole,
      // so it is re-emitted repaired on the terminal finish_reason chunk.
-     state.chatArgsByIndex.set(idx, "");
+     // Reset-then-absorb mirrors the old per-index buffer exactly.
+     if (!call.buffered) state.audit?.repair("arguments-buffered", toolName);
+     call.buffered = true;
+     call.args = "";
      if (fnRec && typeof fnRec.arguments === "string" && fnRec.arguments !== "") {
-      state.chatArgsByIndex.set(idx, fnRec.arguments);
+      call.args = fnRec.arguments;
       delete fnRec.arguments;
       changed = true;
      }
+     if (nameRepeated && fnRec && Object.keys(fnRec).length === 0) {
+      // Repeat header whose name and arguments both moved elsewhere: the
+      // delta has nothing left to tell the host.
+      continue;
+     }
      kept.push(tc);
+     if (chatRewriteDeltaIndex(rec, call)) changed = true;
      continue;
     }
     kept.push(tc);
+    if (chatRewriteDeltaIndex(rec, call)) changed = true;
     continue;
    }
-   // Nameless continuation (argument chunk): follows the index verdict.
-   if (state.chatDroppedByIndex.get(idx) === true) {
+   // Nameless continuation (argument chunk): follows the CALL's verdict.
+   if (call.dropped) {
     changed = true;
     continue;
    }
-  if (state.chatArgsByIndex.has(idx) && fnRec && typeof fnRec.arguments === "string") {
-   state.chatArgsByIndex.set(idx, (state.chatArgsByIndex.get(idx) ?? "") + fnRec.arguments);
+  if (call.buffered && fnRec && typeof fnRec.arguments === "string") {
+   call.args += fnRec.arguments;
    delete fnRec.arguments;
    changed = true;
    continue;
   }
   kept.push(tc);
+  if (chatRewriteDeltaIndex(rec, call)) changed = true;
  }
   if (kept.length > 0) {
    d.tool_calls = kept;
@@ -674,6 +1072,7 @@ function rewriteMessagesBlock(
     rec.name = restored;
     state.messagesNameByIndex.set(index, restored);
     if (isRepairableTool(restored, cloak.argSchemas)) {
+     if (!state.messagesArgsByIndex.has(index)) state.audit?.repair("arguments-buffered", restored);
      state.messagesArgsByIndex.set(index, typeof rec.input === "string" ? rec.input : "");
     }
     return emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
@@ -703,10 +1102,12 @@ function rewriteMessagesBlock(
   const name = state.messagesNameByIndex.get(index) ?? "";
   state.messagesArgsByIndex.delete(index);
   state.messagesNameByIndex.delete(index);
+  const repaired = repairToolArguments(name, buffered, cloak.argSchemas);
+  if (repaired !== buffered) state.audit?.repair("arguments-repaired", name);
   const flushed: Record<string, unknown> = {
    type: "content_block_delta",
    index,
-   delta: { type: "input_json_delta", partial_json: repairToolArguments(name, buffered, cloak.argSchemas) },
+   delta: { type: "input_json_delta", partial_json: repaired },
   };
   const stopBlock = emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
   return `${emitSseBlock("content_block_delta", JSON.stringify(flushed), true)}\n\n${stopBlock}`;
@@ -750,21 +1151,24 @@ export function rewriteSseBlock(
  if (cloak.pathname.endsWith("/messages")) return rewriteMessagesBlock(block, state, cloak);
  return rewriteChatBlock(block, state, cloak);
 }
+export type MidStreamRefireReason = "truncation" | "model" | "rate_limit";
 /**
  * Options for pipeUpstreamStream.
  */
 export interface StreamPipeOptions {
  /**
-  * Mid-stream resume hook. Invoked at most once per turn, only when the
-  * upstream truncates (clean FIN without a terminal marker, premature
-  * socket close, or a genuine stream error) while the client is still
-  * attached. Return a replacement upstream readable to continue THIS turn
-  * on it — no synthetic terminal is injected and the client response stays
-  * open. Return null (or throw) to keep the existing terminate behavior:
-  * a synthetic response.incomplete/failed plus relay-health accounting.
+  * Mid-stream resume hook. Invoked at most once per turn when the upstream
+  * truncates (clean FIN without a terminal marker, premature socket close,
+  * or a genuine stream error), emits a transient model-failure frame, or
+  * emits a retriable rate-limit frame, while the client is still attached.
+  * Return a replacement upstream readable to continue THIS turn on it — no
+  * synthetic terminal is injected and the client response stays open.
+  * Return null (or throw) to keep the existing terminate behavior: a held
+  * failure frame is released, a synthetic response.incomplete/failed is
+  * injected when needed, and the response is ended exactly once.
   * Client aborts and clean terminal markers never reach this hook.
   */
- refire?: () => Promise<Readable | null>;
+ refire?: (reason?: MidStreamRefireReason) => Promise<Readable | null>;
  /**
   * Content-type the upstream sent for this response, passed through verbatim.
   * A value that is present and not an SSE type (text/event-stream) switches
@@ -774,6 +1178,14 @@ export interface StreamPipeOptions {
   * upstream omitted it; the pipe then classifies the buffered start itself.
   */
  upstreamContentType?: string | null;
+ /**
+  * Per-turn tool-call audit recorder (see toolcall-audit.ts). `observe` gets
+  * every forwarded SSE block that carries a tool marker — cloaked and
+  * bypassed streams alike, after any rewrite; `finish` is idempotent and the
+  * pipe calls it exactly once per turn (raw non-SSE bodies finish with
+  * `terminal: false`). Cloak rewrites also report through its `repair`.
+  */
+ audit?: ToolcallStreamAudit;
 }
 /**
  * Pipes an upstream readable stream to a client HTTP response.
@@ -827,7 +1239,17 @@ export function pipeUpstreamStream(
  // `end` already ran; `close` always trails it on a later tick).
  let refirePending = false;
  // Streaming cloak: per-stream rewrite state (null = byte-identical passthrough).
- const cloakState = cloak && !shouldBypassStreamCloak(cloak) ? createSseStreamCloakState() : null;
+ // The repair sink is wrapped because a throwing sink must never drop a chunk.
+ const auditRepairs = opts?.audit
+  ? {
+    repair: (kind: string, detail?: string): void => {
+     try {
+      opts.audit!.repair(kind, detail);
+     } catch { }
+    },
+   }
+  : undefined;
+ const cloakState = cloak && !shouldBypassStreamCloak(cloak) ? createSseStreamCloakState(auditRepairs) : null;
  // Holds the trailing incomplete SSE block across chunks; complete blocks are
  // rewritten and forwarded, so a function_call name split across chunks still
  // matches its injected record.
@@ -861,6 +1283,59 @@ export function pipeUpstreamStream(
  };
  // One-shot resume guard: the refire hook below fires at most once per turn.
  let refireUsed = false;
+ // Tool-call audit completion: exactly one finish per turn. A normal stream
+ // reports from both `end` and `close`, and a rescue hands the turn to a
+ // replacement stream — the guard keeps the report single (the recorder is
+ // idempotent; an external sink need not be).
+ let auditFinished = false;
+ const finishAudit = (terminal: boolean, unclassifiable = false): void => {
+  if (auditFinished) return;
+  auditFinished = true;
+  // An external sink must never change what the client receives.
+  try {
+   opts?.audit?.finish(unclassifiable ? { terminal, unclassifiable: true } : { terminal });
+  } catch { }
+ };
+
+ // Body-stall watchdog: after response headers a streaming body has no fixed
+ // total deadline (See relay.ts: the per-attempt timer is headers-only).
+ // The only failure left is a wedged leg that keeps the socket open
+ // and sends nothing — protected by a per-stream idle cut well above every
+ // observed healthy inter-chunk gap (thinking-heavy streams emit sub-second,
+ // even the slowest logged TTFB is tens of seconds). On expiry the CURRENT
+ // stream is destroyed with a relay-fault error so the truncation path
+ // (health mark + one mid-stream refire) owns the turn. Every forwarded byte
+ // re-arms it; end/close/error disarm it; a rescue re-arms the replacement.
+ let stallCutTimer: NodeJS.Timeout | undefined;
+ let stallCutStream: Readable | null = null;
+ const fireStallCut = (target: Readable): void => {
+  stallCutTimer = undefined;
+  stallCutStream = null;
+  if (target.destroyed || clientAborted || target !== nodeStream) return;
+  const stallErr = new Error(
+   `upstream body idle (no data for ${bodyStallCutMs}ms)`,
+  ) as Error & { code?: string };
+  stallErr.code = "FF_BODY_STALL";
+  stallErr.name = "TimeoutError";
+  target.destroy(stallErr);
+ };
+ const scheduleStallCut = (s: Readable): void => {
+  clearTimeout(stallCutTimer);
+  stallCutStream = s;
+  const timer = setTimeout(() => fireStallCut(s), bodyStallCutMs);
+  timer.unref?.();
+  stallCutTimer = timer;
+ };
+ const breatheStallCut = (): void => {
+  if (stallCutTimer !== undefined && stallCutStream === nodeStream) {
+   scheduleStallCut(nodeStream);
+  }
+ };
+ const disarmStallCut = (): void => {
+  clearTimeout(stallCutTimer);
+  stallCutTimer = undefined;
+  stallCutStream = null;
+ };
 
  const sniffThinking = (chunk: Buffer | string): boolean => {
   const s =
@@ -886,31 +1361,51 @@ export function pipeUpstreamStream(
    s.includes("[DONE]")
   );
  };
- // Held transient model-failure frame (raw chunk or rewritten block text):
+ // Held transient failure frame (raw chunk or rewritten block text):
  // withheld from the client while one silent resume is attempted. Dropped on
  // success, forwarded verbatim (as the genuine upstream verdict) when the
  // resume is vetoed, unavailable, or fails. Null outside a hold.
  let heldFailureChunk: string | Buffer | null = null;
+ let heldFailureReason: "model" | "rate_limit" = "model";
  /**
-  * Hold an upstream-issued transient model-failure frame for one silent
-  * resume on a sibling relay. Returns true when held (caller must NOT
-  * forward the frame); false keeps the existing terminate behavior. Tool
-  * turns always veto: a regenerated turn would re-execute forwarded calls.
+  * Hold an upstream-issued transient failure frame for one silent resume on
+  * a sibling relay. Returns true when held (caller must NOT forward the
+  * frame); false keeps the existing terminate behavior. Tool turns always
+  * veto: a regenerated turn would re-execute forwarded calls.
   */
- const holdModelFailureForRefire = (chunk: string | Buffer): boolean => {
-  if (refirePending || heldFailureChunk !== null || sawToolCall) return false;
+ const holdFailureForRefire = (
+  chunk: string | Buffer,
+  reason: "model" | "rate_limit",
+ ): boolean => {
+  if (refirePending || heldFailureChunk !== null || sawToolCall) {
+   // Audit: the only veto worth recording is the tool-turn one — a resume
+   // would regenerate calls the host already received.
+   if (sawToolCall) opts?.audit?.refireSkipped();
+   return false;
+  }
   if (clientAborted || refireUsed || !opts?.refire || res.writableEnded || res.destroyed) return false;
   refireUsed = true;
   refirePending = true;
   heldFailureChunk = chunk;
-  midStreamModelFaults += 1;
-  log(
-   "warn",
-   "upstream model failed this turn mid-stream (model fault) — retrying once on the next relay",
-   { totalChunks, totalBytes },
-   rid,
-  );
-  void rescueHeldModelFailure();
+  heldFailureReason = reason;
+  if (reason === "rate_limit") {
+   midStreamRateLimitFaults += 1;
+   log(
+    "info",
+    "upstream rate-limited this turn mid-stream — retrying once on the next relay",
+    { totalChunks, totalBytes },
+    rid,
+   );
+  } else {
+   midStreamModelFaults += 1;
+   log(
+    "warn",
+    "upstream model failed this turn mid-stream (model fault) — retrying once on the next relay",
+    { totalChunks, totalBytes },
+    rid,
+   );
+  }
+  void rescueHeldFailure(heldFailureReason);
   return true;
  };
  /**
@@ -939,16 +1434,16 @@ export function pipeUpstreamStream(
   } catch { }
  };
  /**
-  * Resume a held model-failure turn on the replacement stream from
+  * Resume a held transient-failure turn on the replacement stream from
   * opts.refire (rotation marking lives there, shared with the truncation
   * path). Success drops the held frame; the stale cut stream's later
   * events are neutered by the generation check in watch().
   */
- const rescueHeldModelFailure = async (): Promise<void> => {
+ const rescueHeldFailure = async (reason: "model" | "rate_limit"): Promise<void> => {
   const refire = opts?.refire;
   let next: Readable | null = null;
   try {
-   next = refire ? await refire() : null;
+   next = refire ? await refire(reason) : null;
   } catch {
    next = null;
   }
@@ -958,6 +1453,21 @@ export function pipeUpstreamStream(
     next?.destroy();
    } catch { }
    releaseHeldFailure();
+   // The cut stream's FIN/close may already have been consumed while the
+   // rescue was in flight (both handlers return early on refirePending), so
+   // nothing else will terminate this response. A held terminal frame sets
+   // hasTerminalEvent in releaseHeldFailure; a non-terminal chat/error frame
+   // still gets the synthetic terminal before the socket closes.
+   if (!hasTerminalEvent) {
+    ensureTerminalEvent(false, "mid-stream rescue failed", false, true);
+   }
+   try {
+    if (!res.writableEnded) res.end();
+   } catch { }
+   // The cut stream's own end/close may already have passed while this
+   // rescue was in flight, so completion is reported here instead (idempotent
+   // across the later close).
+   finishAudit(hasTerminalEvent);
    return;
   }
   heldFailureChunk = null;
@@ -971,7 +1481,12 @@ export function pipeUpstreamStream(
   try {
    if (!cut.destroyed) cut.destroy();
   } catch { }
-  log("debug", "mid-stream model-fault refire: continuing turn on replacement stream", { totalChunks, totalBytes }, rid);
+  log(
+   "debug",
+   `mid-stream ${reason === "rate_limit" ? "rate-limit" : "model-fault"} refire: continuing turn on replacement stream`,
+   { totalChunks, totalBytes },
+   rid,
+  );
  };
  /**
   * Write one payload to the client with the shared backpressure/flush
@@ -1014,6 +1529,9 @@ export function pipeUpstreamStream(
   * delivery guarantees.
   */
  const forwardText = (text: string): void => {
+  // A hold/refire can start inside a multi-block chunk; the cut stream's
+  // remaining blocks must not interleave with the replacement turn.
+  if (refirePending) return;
   const buf = Buffer.from(text, "utf8");
   const scanBuf =
    terminalScanCarry.length > 0
@@ -1021,14 +1539,33 @@ export function pipeUpstreamStream(
     : buf;
   const scanned = scanBuf.toString("utf8");
   if (!sawToolCall && TOOL_CALL_MARKERS.some((m) => scanned.includes(m))) sawToolCall = true;
+  // A 429-shaped frame is a per-egress rate limit: hold it for one silent
+  // resume on a sibling relay before the client ever sees a rate-limit error.
+  // Classify the CURRENT complete block, not the terminal scan carry: the
+  // carry may splice a previous block's "error" key into this one.
+  // Tool turns, a spent resume budget, or a hard verdict keep it terminal.
+  if (!hasTerminalEvent && isRetriableRateLimitFrame(text) && holdFailureForRefire(text, "rate_limit")) {
+   return;
+  }
   if (!hasTerminalEvent && checkTerminalEvent(scanned)) {
    // Upstream-issued transient model failure on a text-only turn: hold the
    // frame for one silent resume instead of terminating (tool turns veto
-   // inside holdModelFailureForRefire and keep the terminal below).
-   if (isTransientModelFailureFrame(scanned) && holdModelFailureForRefire(text)) return;
+   // inside holdFailureForRefire and keep the terminal below).
+   if (isTransientModelFailureFrame(scanned) && holdFailureForRefire(text, "model")) return;
    hasTerminalEvent = true;
   }
   terminalScanCarry = Buffer.from(scanBuf.subarray(Math.max(0, scanBuf.length - 32)));
+  // Per-turn tool-call audit: hand over the EXACT forwarded bytes of any block
+  // that carries a tool call (chat deltas, responses items, messages
+  // tool_use + argument fragments) or a populated turn-end marker (so a tool
+  // turn that ended in plain text records its finish reason). The recorder
+  // parses the block itself, so plain text/reasoning blocks are never copied.
+  // Dropped blocks returned before this point and are therefore never observed.
+  if (opts?.audit !== undefined && AUDIT_MARKERS.some((m) => text.includes(m))) {
+   try {
+    opts.audit.observe(text);
+   } catch { }
+  }
   deliver(text);
  };
  const sseBoundary = /\r?\n\r?\n/;
@@ -1036,9 +1573,14 @@ export function pipeUpstreamStream(
   isError = false,
   errorMsg?: string,
   penalizeRelay = true,
+  // Watchdog-window verdict for this stream. Defaults to the relay-health
+  // verdict; the marker-less FIN below overrides it: that truncation is
+  // exactly what the failed-SSE window exists to catch, so it must count as a
+  // failure even though a clean endpoint (not a relay fault) produced it.
+  recordFailed = penalizeRelay || isError,
  ) => {
   if (hasTerminalEvent || res.writableEnded) return;
-  if (!clientAborted) recordOnce(penalizeRelay || isError);
+  if (!clientAborted) recordOnce(recordFailed);
   // Only genuine upstream-side truncation penalizes relay health.
   // Client disconnects and clean upstream ends leave it untouched.
   if (penalizeRelay && relayUrl && relayUrl !== "direct") {
@@ -1084,6 +1626,11 @@ export function pipeUpstreamStream(
  const tryRefire = async (): Promise<boolean> => {
   if (clientAborted || refireUsed || !opts?.refire) return false;
   if (sawToolCall) {
+   // Audit: the resume budget was not spent because the turn already
+   // forwarded tool calls (a regeneration would duplicate them).
+   try {
+    opts?.audit?.refireSkipped();
+   } catch { }
    log("debug", "mid-stream refire skipped: turn already forwarded tool calls", { totalChunks, totalBytes }, rid);
    return false;
   }
@@ -1092,7 +1639,7 @@ export function pipeUpstreamStream(
   refirePending = true;
   let next: Readable | null = null;
   try {
-   next = await opts.refire();
+   next = await opts.refire("truncation");
   } catch {
    next = null;
   }
@@ -1109,6 +1656,7 @@ export function pipeUpstreamStream(
   sseDecoder = new StringDecoder("utf8");
   terminalScanCarry = Buffer.alloc(0);
   watch(next);
+  scheduleStallCut(next);
   log("debug", "mid-stream refire: continuing turn on replacement stream", { totalChunks, totalBytes }, rid);
   return true;
  };
@@ -1163,6 +1711,7 @@ export function pipeUpstreamStream(
  };
  const onData = (chunk: Buffer | string): void => {
   try {
+   breatheStallCut();
    // While a replacement stream is being fetched the cut stream is stale:
    // its late frames must not interleave with the rescued turn.
    if (refirePending) return;
@@ -1185,7 +1734,7 @@ export function pipeUpstreamStream(
     const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
     gateChunks.push(buf);
     gateBytes += buf.length;
-    const isSse = SSE_START_RE.test(Buffer.concat(gateChunks, gateBytes).toString("utf8"));
+    const isSse = looksLikeSse(Buffer.concat(gateChunks, gateBytes).toString("utf8"));
     if (!isSse && gateBytes < SNIFF_WINDOW_BYTES) return;
     if (!isSse) {
      bodyGate = "raw";
@@ -1208,6 +1757,7 @@ export function pipeUpstreamStream(
  };
 
  const onError = async (e: unknown): Promise<void> => {
+  disarmStallCut();
   // A rescue is already in flight (its outcome decides the turn): a late
   // error from the cut stream must not inject a terminal mid-rescue.
   if (refirePending) return;
@@ -1255,10 +1805,14 @@ export function pipeUpstreamStream(
    if (!res.writableEnded) {
     res.end();
    }
+   // Audit completion: no terminal SSE event was forwarded on this path (or
+   // one was, before the error); a rescue returned above and owns the report.
+   finishAudit(hasTerminalEvent);
   } catch { }
  };
 
  const onEnd = async (): Promise<void> => {
+  disarmStallCut();
   // A rescue is in flight (its outcome owns the turn): the cut stream's FIN
   // must neither inject a terminal nor end res mid-rescue.
   if (refirePending) return;
@@ -1275,6 +1829,10 @@ export function pipeUpstreamStream(
    try {
     if (!res.writableEnded) res.end();
    } catch { }
+   // Audit: a raw (non-SSE) body carries no event stream to inspect, so the
+   // turn is not classifiable: the summary says `remap: "unknown"` rather
+   // than accusing the model of answering without tools.
+   finishAudit(false, true);
    log(
     "debug",
     `non-SSE upstream body passed through verbatim — ${totalChunks} chunks (${(totalBytes / 1024).toFixed(1)}KB)`,
@@ -1298,6 +1856,17 @@ export function pipeUpstreamStream(
     } else {
      forwardText(tail);
     }
+   } else if (endsOnFinishedSseLine(tail)) {
+    // A complete final event that merely lost its trailing blank line: forward
+    // it, framed as a finished block, so neither the synthetic terminal below
+    // nor a re-fire's replacement bytes can splice onto its last line. A
+    // genuinely partial block was refused above and stays dropped.
+    if (cloakState && cloak) {
+     const rewritten = rewriteSseBlock(tail, cloakState, cloak);
+     if (rewritten !== null) forwardText(`${rewritten}\n\n`);
+    } else {
+     forwardText(tail.endsWith("\n") ? `${tail}\n` : `${tail}\n\n`);
+    }
    }
   }
  // Buffered tool arguments are released on the call's terminal event, which a
@@ -1309,6 +1878,9 @@ export function pipeUpstreamStream(
   const flushed = flushBufferedToolArgs(cloakState, cloak);
   if (flushed !== null) forwardText(flushed);
  }
+  // A tail-framed failure frame may have started a hold during the flush
+  // above; the rescue owns the turn now. Do not inject a terminal or end.
+  if (refirePending || heldFailureChunk !== null) return;
   if (hasTerminalEvent) recordOnce(false);
   const elapsed = ((Date.now() - startAt) / 1000).toFixed(1);
   if (!hasTerminalEvent && totalChunks > 0) {
@@ -1317,12 +1889,16 @@ export function pipeUpstreamStream(
    // terminal below. A resumed turn keeps streaming into the same client
    // response; the final outcome is logged when that stream ends.
    if (await tryRefire()) return;
-   // Clean upstream end without a detectable marker: keep the host
-   // contract (synthetic terminal) but never blame the relay.
+   // A FIN with no terminal marker is the truncation the failed-SSE window
+   // exists to catch, so the watchdog counts it as a failure (the relay is
+   // still never blamed — the endpoint completed the connection cleanly, it
+   // just never said the turn was done). Keep the host contract with a
+   // synthetic terminal.
    ensureTerminalEvent(
     false,
     "upstream ended without terminal marker",
     false,
+    true,
    );
   }
   if (thinkingChunks > 0) {
@@ -1343,9 +1919,12 @@ export function pipeUpstreamStream(
   try {
    if (!res.writableEnded) res.end();
   } catch { }
+  // Audit completion for the turn (idempotent; `close` trails this call).
+  finishAudit(hasTerminalEvent);
  };
 
  const onClose = async (): Promise<void> => {
+  disarmStallCut();
   // A stalled `close` trailing an `end` that is mid-rescue must neither
   // inject a terminal nor end res — the replacement stream owns the turn now.
   if (refirePending) return;
@@ -1358,6 +1937,9 @@ export function pipeUpstreamStream(
    const flushed = flushBufferedToolArgs(cloakState, cloak);
    if (flushed !== null) forwardText(flushed);
   }
+   // A tail-framed failure frame may have started a hold during the flush
+   // above; the rescue owns the turn now.
+   if (refirePending || heldFailureChunk !== null) return;
    if (bodyGate !== "sse") {
     // Non-SSE passthrough: same relay-fault accounting as the SSE path's
     // mid-body close (a genuine upstream socket death, not a client
@@ -1370,10 +1952,13 @@ export function pipeUpstreamStream(
    } else if (!hasTerminalEvent && totalChunks > 0) {
     if (clientAborted || upstreamEnded) {
      // Client disconnect teardown or post-end cleanup — the relay
-     // is not at fault; still give the host a terminal event.
+     // is not at fault; still give the host a terminal event. The
+     // watchdog verdict is a failure either way: a clean FIN with no
+     // terminal marker is the truncation the failed-SSE window catches
+     // (and a real client abort is skipped inside ensureTerminalEvent).
      sseBuffer = "";
      terminalScanCarry = Buffer.alloc(0);
-     ensureTerminalEvent(false, "stream interrupted by client", false);
+     ensureTerminalEvent(false, "stream interrupted by client", false, true);
     } else {
      // Same offer as the clean-end path above: one silent re-fire before
      // marking this relay and terminating the turn.
@@ -1390,6 +1975,11 @@ export function pipeUpstreamStream(
     }
    }
    if (!res.writableEnded) res.end();
+   // Audit completion: `end` normally already reported (the guard makes this
+   // a no-op then); a socket death or rescue teardown reports from here. Raw
+   // (non-SSE) bodies carry no event stream, so they are never terminal and
+   // never classifiable (`remap: "unknown"`).
+   finishAudit(bodyGate === "sse" && hasTerminalEvent, bodyGate !== "sse");
   } catch { }
  };
  const watch = (s: Readable): void => {
@@ -1401,6 +1991,7 @@ export function pipeUpstreamStream(
   s.on("close", () => { if (s === nodeStream) void onClose(); });
  };
  watch(nodeStream);
+ scheduleStallCut(nodeStream);
 
  req.on("aborted", () => {
   clientAborted = true;

@@ -19,6 +19,7 @@ import { startProxy } from "../src/proxy.ts";
 import { ALL_HOST_TOOL_NAMES, translateToolsForPath } from "../src/tool-translation.ts";
 import { ensureChatFingerprintTools, ensureMessagesFingerprintTools, ensureResponsesFingerprintTools } from "../src/opencode-fingerprint.ts";
 import { MODEL_MAP } from "../src/models.ts";
+import { tokenAuthHeaders } from "../src/token.ts";
 
 const PORT = 29483;
 const OP_ENUM = ["init", "start", "done", "rm", "drop", "block", "unblock", "append", "view"];
@@ -196,7 +197,7 @@ function callFromSse(sse: string, endpoint: string): { name: string; args: strin
 }
 
 const targets = process.argv.slice(2).filter((a) => !a.startsWith("-"));
-const models = targets.length > 0 ? targets : ["muse-spark-1.3-contributor-free", "mimo-v2.6-flash-free"];
+const models = targets.length > 0 ? targets : ["nemotron-3.5-super-vl-free", "mimo-v2.6-flash-free"];
 const { server, port } = await startProxy(PORT);
 try {
  for (const model of models) {
@@ -241,7 +242,7 @@ try {
   try {
    const res = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...tokenAuthHeaders() },
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(Number(process.env.FF_TIMEOUT_MS ?? 90_000)),
    });

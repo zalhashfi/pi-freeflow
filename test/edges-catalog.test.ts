@@ -159,13 +159,16 @@ test("refreshCatalog 200 maps the /inference/v1/models free list onto catalog fl
  });
 });
 
-test("stale cache without etag serves spark-1.3 with repaired responses api (issue #6)", async () => {
+test("stale cache without etag drops the retired Cline Muse Spark entry (issue #6 shape)", async () => {
  await withCacheFileIsolation(async () => {
-  // Reporter's exact file shape: 3-day-old cache, no etag, 1.3 entry
-  // written before enrichment knew it (api missing), paid ids present.
+  // Reporter's exact file shape: 3-day-old cache, no etag, an entry written
+  // before enrichment knew it (api missing), paid ids present — plus the
+  // Cline Muse Spark entry, which was still in the catalog when those caches
+  // were written and is now retired (2026-10-22). The stale row must be
+  // dropped, not served: a dead-listed id never re-enters the picker.
   const staleSpark = {
-   id: "muse-spark-1.3-contributor-free",
-   name: "Muse Spark 1.3 (1M)",
+   id: "cline-free/muse-spark-1.3-contributor",
+   name: "Muse Spark 1.2 (1M)",
    reasoning: true,
    contextWindow: 1_048_576,
    maxTokens: 131_072,
@@ -182,7 +185,7 @@ test("stale cache without etag serves spark-1.3 with repaired responses api (iss
    source: "opencode" as const,
   };
   const models = [
-   ...baselineModels().filter((m) => m.id !== "muse-spark-1.3-contributor-free"),
+   ...baselineModels().filter((m) => m.id !== "cline-free/muse-spark-1.3-contributor"),
    staleSpark,
    paid,
   ];
@@ -204,9 +207,12 @@ test("stale cache without etag serves spark-1.3 with repaired responses api (iss
   };
   const result = await refreshCatalog(false);
   assert.equal(calls, 1, "etagless stale cache must attempt one plain revalidation fetch");
-  const spark = result.find((m) => m.id === "muse-spark-1.3-contributor-free");
-  assert.ok(spark, "stale 1.3 entry must survive");
-  assert.equal(spark.api, "openai-responses", "stale 1.3 api must be backfilled, not undefined");
+  const spark = result.find((m) => m.id === "cline-free/muse-spark-1.3-contributor");
+  assert.equal(spark, undefined, "the retired Cline entry must not survive a stale cache");
+  assert.ok(
+   result.some((m) => m.id === "cline/nemotron-3.5-super-vl"),
+   "the surviving Cline model must still come from the static base",
+  );
   assert.equal(result.some((m) => m.id === "claude-fable-5-1"), false, "paid ids must be purged");
  });
 });
@@ -247,7 +253,10 @@ test("mergeCatalog drops paid upstream ids like claude-fable-5-1 (issue #6)", ()
 test("isFreeCatalogId accepts -free, :free, /free and known ids, rejects paid and dead", () => {
 	assert.equal(isFreeCatalogId("mimo-v2.6-flash-free"), true);
 	assert.equal(isFreeCatalogId("mimo-v2.5-free"), false);
-	assert.equal(isFreeCatalogId("thinkingmachines/inkling-small:free"), true);
+	assert.equal(isFreeCatalogId("thinkingmachines/inkling-small:free"), false);
+	// Retired 2026-10-21: Kilo answers 404 unavailable_model for inkling-small and
+	// 404 "Function not found" for nemotron-3-super-120b-a12b.
+	assert.equal(isFreeCatalogId("nvidia/nemotron-3-super-120b-a12b:free"), false);
 	// stepfun/step-5-preview-free was demoted to paid on Kilo (2026-10-16).
 	assert.equal(isFreeCatalogId("stepfun/step-5-preview-free"), false);
 	assert.equal(isFreeCatalogId("lab/new-model/free"), true);
@@ -275,6 +284,16 @@ test("isFreeCatalogId accepts -free, :free, /free and known ids, rejects paid an
 	assert.equal(isFreeCatalogId("ovh-free/Mistral-7B-Instruct-v0.3"), false);
 	assert.equal(isFreeCatalogId("ovh-free/Meta-Llama-3_3-70B-Instruct"), true);
 	assert.equal(isFreeCatalogId("ovh/Mistral-Nemo-Instruct-2407"), false, "an unnamespaced OVH id is not in the catalog");
+	// Added 2026-10-22: a Zen free id relies on the static catalog for
+	// recognition, and the Kilo ids carry `:free`. Both free MiniMax M3.1
+	// Flash endpoints retired on 2026-10-23, so both are dead now.
+	assert.equal(isFreeCatalogId("minimax-m3.1-flash-free"), false);
+	assert.equal(isFreeCatalogId("flint-40b-free"), true);
+	assert.equal(isFreeCatalogId("minimax/minimax-m3.1-flash:free"), false);
+	assert.equal(isFreeCatalogId("nvidia/nemotron-3.5-super-vl:free"), true);
+	assert.equal(isFreeCatalogId("reflection/beam-free"), true);
+	assert.equal(isFreeCatalogId("recursive/flint-v1.0:free"), true);
+	assert.equal(isFreeCatalogId("xingchen-agi/xing4.0-29b-a4b:free"), true);
  assert.equal(isFreeCatalogId(""), false);
 });
 
@@ -295,20 +314,39 @@ test("sanitizeCatalogModels keeps every OVH id and repairs its source", () => {
 	assert.deepEqual(merged.map((m) => m.id).sort(), OVH_MODELS.map((m) => m.id).sort());
 });
 
-test("sanitizeCatalogModels repairs stale spark api to openai-responses (issue #6)", () => {
- const staleSpark = {
-  id: "muse-spark-1.3-contributor-free",
+test("sanitizeCatalogModels repairs a stale Cline row against its static definition (issue #6)", () => {
+ // A cache written while the Cline Muse Spark entry was still catalogued can
+ // carry a wrong api on the surviving Cline model. The static definition is
+ // authoritative: the stale `openai-responses` label must be replaced by the
+ // static chat row, and a retired id must never be repaired back into life.
+ const staleNemotron = {
+  id: "cline/nemotron-3.5-super-vl",
+  name: "Nemotron 3.5 Super VL (1M)",
+  reasoning: false,
+  contextWindow: 128_000,
+  maxTokens: 4_096,
+  api: "openai-responses" as const,
+  input: ["text"] as ["text"],
+  source: "opencode" as const,
+ };
+ const retiredSpark = {
+  id: "cline-free/muse-spark-1.3-contributor",
   name: "Muse Spark 1.3 (1M)",
   reasoning: true,
   contextWindow: 1_048_576,
   maxTokens: 131_072,
-  api: "openai-completions" as const,
+  api: "openai-responses" as const,
   input: ["text", "image"] as ["text", "image"],
-  source: "opencode" as const,
+  source: "cline" as const,
  };
- const merged = mergeCatalog([], [staleSpark]);
- assert.equal(merged.length, 1);
- assert.equal(merged[0].api, "openai-responses");
+ const merged = mergeCatalog([], [staleNemotron, retiredSpark]);
+ assert.deepEqual(merged.map((m) => m.id), ["cline/nemotron-3.5-super-vl"], "the retired Cline id must be purged");
+ assert.equal(merged[0].api, undefined, "the stale responses label must not survive the static chat definition");
+ assert.equal(merged[0].name, "Nemotron 3.5 Super VL [Cline]", "the static display name wins");
+ assert.equal(merged[0].contextWindow, 1_000_000);
+ assert.equal(merged[0].maxTokens, 131_072);
+ assert.equal(merged[0].reasoning, true);
+ assert.equal(merged[0].source, "cline");
 });
 
 test("readCatalogCache purges paid ids persisted by pre-fix refreshes (issue #6)", async () => {

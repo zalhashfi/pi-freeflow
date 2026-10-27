@@ -11,6 +11,13 @@
  * 3. Tools: must declare the placeholder sextet {bash, glob, grep, read, edit, write}
  * 4. Streaming: must be stream: true
  *
+ * A fifth axis lives in the body rather than the headers: the free tier refuses
+ * any request whose system prompt carries no complete `<env>` environment block,
+ * and it refuses with HTTP 429 FreeUsageLimitError — the same status and
+ * retry-after-to-00:00-UTC body as an exhausted quota, although the quota is
+ * untouched (issue #117/#118: same machine, same minute, 200 with the block and
+ * 429 without it). See ensureEnvBlock below.
+ *
  * This module ensures axes 3 and 4 are enforced on outgoing requests, and handles
  * bidirectional streaming conversion: if the client requested non-streaming
  * (stream: false), upstream is still sent stream: true to pass the gate, and the
@@ -18,8 +25,8 @@
  *
  * freeflow serves ONLY OMP and Pi hosts. Either host may send any of its tools
  * (see src/tool-translation.ts for the canonical inventories) in any wire shape,
- * so enforcement renames caller placeholders to lowercase (Bash -> bash,
- * retargeting tool_choice), translates caller tools to the target path's shape
+ * so enforcement renames caller placeholders to lowercase (Bash -> bash),
+ * translates caller tools to the target path's shape
  * (Pi find -> upstream glob via the translator), and only then injects the
  * missing placeholders. Caller tools (ls, powershell, find, web_search, ...)
  * are never dropped. Injected placeholder calls are cloaked from downstream
@@ -34,7 +41,6 @@ import {
  buildFindGlobRestore,
  isOmpLikeCaller,
  restoreToolNameForCaller,
- retargetToolChoiceForUpstream,
  sanitizeUpstreamToolName,
  translateToolsForPath,
  upstreamToolNameFor,
@@ -51,7 +57,9 @@ const EFFORT_DESCENDING: ThinkingLevel[] = ["max", "xhigh", "high", "medium", "l
 /**
  * Find the highest supported effort for a model whose thinkingLevelMap
  * declares the requested effort as null. Returns null when no clamp is
- * needed (effort is supported or model has no map).
+ * needed (effort is supported or model has no map). The one supported effort
+ * that is still rewritten is `ultra` (see below): it is an alias, never a
+ * value the gateway enumerates.
  */
 function clampedEffortFor(model: string, effort: string): string | null {
  const def = getModelDef(model);
@@ -59,12 +67,19 @@ function clampedEffortFor(model: string, effort: string): string | null {
  const map = def.thinkingLevelMap;
  // "off" means disable reasoning entirely — never clamp it even when map says null
  if (effort.toLowerCase() === "off") return null;
- // "ultra" is an unofficial alias for beyond-max; treat as "max"
- const key = (effort.toLowerCase() === "ultra" ? "max" : effort.toLowerCase()) as ThinkingLevel;
+ // "ultra" is an unofficial alias for beyond-max: treated as "max" for the
+ // support test, and rewritten to the model's own mapped value below. Using
+ // the alias only for the clamp test left `ultra` on the wire, and the
+ // gateway answers 400 for every effort level its model does not enumerate.
+ const isUltra = effort.toLowerCase() === "ultra";
+ const key = (isUltra ? "max" : effort.toLowerCase()) as ThinkingLevel;
+ // Alias of a supported level: rewrite, because upstream knows the level, not
+ // the alias.
+ if (isUltra && key in map && map[key] !== null && map[key] !== undefined) return map[key];
  // Effort is supported (non-null) → no clamp
  if (key in map && map[key] !== null && map[key] !== undefined) return null;
  // Effort key is unknown and not "ultra" → let upstream decide
- if (!(key in map) && effort.toLowerCase() !== "ultra") return null;
+ if (!(key in map) && !isUltra) return null;
  // Find highest supported effort
  for (const level of EFFORT_DESCENDING) {
   if (map[level] !== null && map[level] !== undefined) return level;
@@ -101,9 +116,9 @@ export function isPlaceholderToolName(name: unknown): boolean {
  * Fill for one missing fingerprint slot: the shared OMP real definition when
  * the caller is OMP-like, otherwise the empty COMPAT placeholder Pi keeps.
  * `edit` is always COMPAT, even for OMP-like callers: no single static edit
- * schema executes on either host (OMP is edit-mode dependent, Pi wants
- * edits[]), so it must stay in the cloaked `injected` list, never
- * `injectedReal`. Single lockstep source for the three wire-shape ensure
+ * executes on either host (OMP is edit-mode dependent, Pi wants
+ * edits[]), so it must stay in the cloaked `injected` list even when the
+ * caller would otherwise receive real definitions. Single lockstep source for the three wire-shape ensure
  * functions below.
  */
 function fingerprintFill(name: FingerprintToolName, omp: boolean): { description: string; schema: Record<string, unknown> } {
@@ -144,27 +159,6 @@ export function normalizePlaceholderCase(body: Record<string, unknown>): CaseRes
   holder.name = lower;
  }
  return restore;
-}
-
-/**
- * Retarget a caller tool_choice that names a placeholder in original casing
- * ({function:{name}}, {name}) to the lowercased name. String choices
- * ("auto", ...) and non-placeholder names pass untouched. Request-side only.
- */
-export function retargetToolChoice(body: Record<string, unknown>): void {
- const choice = body.tool_choice;
- if (!choice || typeof choice !== "object" || Array.isArray(choice)) return;
- const c = choice as Record<string, unknown>;
- const fn =
-  c.function && typeof c.function === "object" && !Array.isArray(c.function)
-   ? (c.function as Record<string, unknown>)
-   : null;
- if (fn && typeof fn.name === "string" && isPlaceholderToolName(fn.name)) {
-  fn.name = (fn.name as string).toLowerCase();
- }
- if (typeof c.name === "string" && isPlaceholderToolName(c.name)) {
-  c.name = (c.name as string).toLowerCase();
- }
 }
 
 /** Restore caller casing on one downstream tool name (bounded map, else verbatim). */
@@ -381,6 +375,30 @@ function restoreNativeEffortAfterChoiceDrop(body: Record<string, unknown>): void
  * Highest non-null level a model's declared map supports, or null when the
  * model declares no map or only supports `off` (nothing to fall back to).
  */
+/**
+ * Chat-lane mirror of the responses effort clamp (normalizeResponsesBody):
+ * a host targeting the chat path spells the effort flat — `reasoning_effort`
+ * or `reasoningEffort` — and the same clampedEffortFor algorithm applies.
+ * A level the model's map declares unsupported is clamped to the highest
+ * supported one; a supported level or a key the map does not know is left
+ * for upstream to rule on; genuine `off` is never rewritten. The Zen
+ * messages lane carries no flat effort spelling, so it is not touched.
+ */
+function clampChatReasoningEffort(body: Record<string, unknown>): void {
+ const model = body.model;
+ if (typeof model !== "string") return;
+ for (const key of ["reasoning_effort", "reasoningEffort"] as const) {
+  const flat = body[key];
+  if (typeof flat !== "string") continue;
+  const clamped = clampedEffortFor(model, flat);
+  if (clamped !== null) body[key] = clamped;
+ }
+}
+
+/**
+ * Highest non-null level a model's declared map supports, or null when the
+ * model declares no map or only supports `off` (nothing to fall back to).
+ */
 function highestSupportedEffort(model: string): string | null {
  const map = getModelDef(model)?.thinkingLevelMap;
  if (!map) return null;
@@ -480,9 +498,205 @@ export function normalizeResponsesBody(body: Record<string, unknown>): void {
  if (body.store === undefined) body.store = false;
 }
 
+/** Complete `<env>` … `</env>` pair; non-greedy so two blocks stay two matches. */
+const ENV_PAIR_RE = /<env>[\s\S]*?<\/env>/g;
+/** A tag whose partner is missing or was stripped: it can shadow the real pair. */
+const ENV_TAG_RE = /<\/?env>/g;
+/** The gate's load-bearing key. Any value passes; a different key does not. */
+const WORKING_DIRECTORY_RE = /Working directory:[ \t]*([^\n<]*)/;
+/** The gate reads the key, not a usable path: this block is a fingerprint. */
+const FALLBACK_WORKING_DIRECTORY = "(current project)";
+
+/** One mutable piece of system-prompt text: the only place a block can live. */
+type SystemText = { read(): string; write(text: string): void };
+
+/** `container[key]` as a mutable string segment. */
+function stringSegment(container: Record<string, unknown>, key: string): SystemText {
+ return {
+  read: () => (typeof container[key] === "string" ? (container[key] as string) : ""),
+  write: (text) => {
+   container[key] = text;
+  },
+ };
+}
+
+/** The text blocks of a parts array (`content[]` / Anthropic `system[]`). */
+function textBlockSegments(blocks: unknown[]): SystemText[] {
+ const segments: SystemText[] = [];
+ for (const block of blocks) {
+  if (!block || typeof block !== "object" || Array.isArray(block)) continue;
+  const rec = block as Record<string, unknown>;
+  if (typeof rec.text !== "string") continue;
+  segments.push({
+   read: () => rec.text as string,
+   write: (text) => {
+    rec.text = text;
+   },
+  });
+ }
+ return segments;
+}
+
+/**
+ * Text segments of a `content` field: a plain string, or the text blocks of a
+ * parts array (Chat Completions spells message content both ways). A parts
+ * array with no text block gains one, because there is nowhere else to append.
+ */
+function contentSegments(message: Record<string, unknown>): SystemText[] {
+ const content = message.content;
+ if (!Array.isArray(content)) {
+  if (typeof content !== "string") message.content = "";
+  return [stringSegment(message, "content")];
+ }
+ const segments = textBlockSegments(content);
+ if (segments.length > 0) return segments;
+ const block: Record<string, unknown> = { type: "text", text: "" };
+ content.push(block);
+ return [stringSegment(block, "text")];
+}
+
+/**
+ * Chat Completions system prompt: every `role: "system"` message in order.
+ * A body with none gains one at the top.
+ */
+function chatSystemSegments(body: Record<string, unknown>): SystemText[] {
+ const existing = body.messages;
+ if (existing !== undefined && !Array.isArray(existing)) return [];
+ const messages: unknown[] = Array.isArray(existing) ? existing : ((body.messages = []) as unknown[]);
+ const segments: SystemText[] = [];
+ for (const message of messages) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+  const rec = message as Record<string, unknown>;
+  if (rec.role !== "system") continue;
+  segments.push(...contentSegments(rec));
+ }
+ if (segments.length > 0) return segments;
+ const added: Record<string, unknown> = { role: "system", content: "" };
+ messages.unshift(added);
+ return [stringSegment(added, "content")];
+}
+
+/** Anthropic Messages system prompt: `system` is a string or a text-block array. */
+function messagesSystemSegments(body: Record<string, unknown>): SystemText[] {
+ const system = body.system;
+ if (Array.isArray(system)) {
+  const segments = textBlockSegments(system);
+  if (segments.length > 0) return segments;
+  const block: Record<string, unknown> = { type: "text", text: "" };
+  system.push(block);
+  return [stringSegment(block, "text")];
+ }
+ if (typeof system !== "string") body.system = "";
+ return [stringSegment(body, "system")];
+}
+
+/**
+ * Responses system prompt: `instructions`, or the `system` / `developer` items
+ * a host seats in `input[]` instead. Real OpenCode clients send `instructions`,
+ * so a host that sends neither gets one.
+ */
+function responsesSystemSegments(body: Record<string, unknown>): SystemText[] {
+ if (typeof body.instructions === "string") return [stringSegment(body, "instructions")];
+ const input = body.input;
+ if (Array.isArray(input)) {
+  const segments: SystemText[] = [];
+  for (const item of input) {
+   if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+   const rec = item as Record<string, unknown>;
+   if (rec.role !== "system" && rec.role !== "developer") continue;
+   if (typeof rec.content !== "string") continue;
+   segments.push(stringSegment(rec, "content"));
+  }
+  if (segments.length > 0) return segments;
+ }
+ body.instructions = "";
+ return [stringSegment(body, "instructions")];
+}
+
+/**
+ * Every complete env block in the system text, in wire order. Upstream reads
+ * only the FIRST pair, which is why order decides whether a request passes.
+ */
+function envBlocks(segments: SystemText[]): Array<{ segment: number; start: number; end: number; body: string }> {
+ const blocks: Array<{ segment: number; start: number; end: number; body: string }> = [];
+ segments.forEach((segment, index) => {
+  for (const match of segment.read().matchAll(ENV_PAIR_RE)) {
+   if (match.index === undefined) continue;
+   blocks.push({ segment: index, start: match.index, end: match.index + match[0].length, body: match[0] });
+  }
+ });
+ return blocks;
+}
+
+/** Drop every env block and stray tag from `text`, keeping one pair verbatim. */
+function stripEnvBlocks(text: string, keep?: { start: number; end: number }): string {
+ const strip = (part: string) => part.replace(ENV_PAIR_RE, "").replace(ENV_TAG_RE, "");
+ const result =
+  keep === undefined
+   ? strip(text)
+   : `${strip(text.slice(0, keep.start))}${text.slice(keep.start, keep.end)}${strip(text.slice(keep.end))}`;
+ return result.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** The `Working directory:` value the caller already stated, if any. */
+function statedWorkingDirectory(segments: SystemText[]): string | null {
+ for (const segment of segments) {
+  const value = WORKING_DIRECTORY_RE.exec(segment.read())?.[1]?.trim();
+  if (value) return value;
+ }
+ return null;
+}
+
+/**
+ * Guarantee the free-tier environment gate: exactly one `<env>` … `</env>` pair
+ * in the system prompt, with `Working directory:` inside it.
+ *
+ * Measured 2026-10-24 (issues #117/#118): a body with the block answers 200 and
+ * the same body without it answers 429 FreeUsageLimitError, on the same machine
+ * within the same minute, with the retry-after countdown still hours away from
+ * 00:00 UTC. The countdown is a generic error body, not a quota window, so a
+ * host that never emits the block fails on the direct route no matter what
+ * else the lane gets right.
+ *
+ * Two measured traps decide the shape of this function:
+ * - Upstream reads only the FIRST pair in the text. A stale or partial copy
+ *   above the real block shadows it and still 429s, even though the block
+ *   itself is complete and correct. So a fix must leave exactly one pair, not
+ *   merely append one.
+ * - `Working directory:` is load-bearing. A plausible-looking block carrying
+ *   `Platform:` or `Shell:` instead is refused; a block carrying only
+ *   `Working directory:` is accepted. So an existing block without the key is
+ *   replaced rather than kept and duplicated.
+ *
+ * A host block that already satisfies both rides through byte-for-byte: the
+ * host knows its environment, this module does not. Anything else is folded
+ * into the last system message, which upstream accepts on every wire shape.
+ */
+export function ensureEnvBlock(body: Record<string, unknown>, pathname: string): void {
+ if (!body || typeof body !== "object") return;
+ const segments = pathname.endsWith("/responses")
+  ? responsesSystemSegments(body)
+  : pathname.endsWith("/messages")
+   ? messagesSystemSegments(body)
+   : chatSystemSegments(body);
+ if (segments.length === 0) return;
+ const blocks = envBlocks(segments);
+ const carrying = blocks.find((block) => WORKING_DIRECTORY_RE.test(block.body));
+ // Already the single pair upstream reads, with the key inside: leave it be.
+ if (carrying !== undefined && blocks.length === 1) return;
+ const fallback = carrying === undefined ? (statedWorkingDirectory(segments) ?? FALLBACK_WORKING_DIRECTORY) : "";
+ segments.forEach((segment, index) => {
+  segment.write(stripEnvBlocks(segment.read(), carrying !== undefined && carrying.segment === index ? carrying : undefined));
+ });
+ if (carrying !== undefined) return;
+ const last = segments[segments.length - 1];
+ const text = last.read();
+ last.write(`${text ? `${text}\n\n` : ""}<env>\n  Working directory: ${fallback}\n</env>`);
+}
+
 /**
  * Enforce the full OpenCode free-tier client fingerprint on a parsed request body.
- * Caller placeholders are lowercased (Bash -> bash, tool_choice retargeted),
+ * Caller placeholders are lowercased (Bash -> bash),
  * tools translated to the target path's wire shape (Pi find -> upstream glob via
  * src/tool-translation.ts), then the missing slots injected in that shape: real
  * executable definitions for OMP-like callers (ask/task/todo/hub/lsp present,
@@ -490,10 +704,11 @@ export function normalizeResponsesBody(body: Record<string, unknown>): void {
  * no-ops for Pi. `edit` is always the cloaked placeholder (no static edit
  * schema executes on either host). Returns the original stream flag,
  * caller-tools flag, whether injection added tools, and the bounded
- * per-request restore records (caseRestore, findGlob, injected, injectedReal)
- * for downstream cloaking. Cloaking strips by `injected` only: names in
- * `injectedReal` were served with executable definitions, so model calls to
- * them execute downstream instead of being cloaked.
+ * per-request restore records (caseRestore, findGlob, injected)
+ * for downstream cloaking. Cloaking strips by `injected` only: any missing
+ * slot the caller received with an executable definition is not a
+ * placeholder, so model calls to it execute downstream instead of being
+ * cloaked.
  *
  * `argSchemas` (lowercased caller tool name -> declared parameters) lets
  * downstream repair malformed arguments against the caller's own schema; it
@@ -510,7 +725,6 @@ export function enforceOpencodeFingerprint(
  caseRestore: CaseRestoreMap;
  findGlob: FindGlobRestore;
  injected: string[];
- injectedReal: string[];
  argSchemas: Map<string, Record<string, unknown>>;
 } {
  const clientRequestedStream = body.stream === true;
@@ -518,22 +732,25 @@ export function enforceOpencodeFingerprint(
  // Zen responses shape conformance first (Chat leftovers, tool_choice, spark
  // effort clamp, store default): Kilo/Cline bodies never reach here.
  if (pathname.endsWith("/responses")) normalizeResponsesBody(body);
+ else if (pathname.endsWith("/chat/completions")) clampChatReasoningEffort(body);
  // Chat path mirrors the responses drop: Zen free tier accepts only auto, so a
- // caller "none" (string or { type: "none" }) would 400 upstream. Messages
- // path keeps its own choice semantics.
- enforceAutoToolChoice(body);
+ // caller "none" (string or { type: "none" }) would 400 upstream. The Zen
+ // messages lane keeps its own choice semantics: Anthropic names choices with
+ // `any` / `{ type: "tool", name: ... }`, and the drop would delete them.
+ if (!pathname.endsWith("/messages")) enforceAutoToolChoice(body);
  // Upstream Zen free tier mandates stream: true for all free requests
  body.stream = true;
+ // Fifth axis, body-side: a system prompt without a complete env block answers
+ // 429 FreeUsageLimitError (see ensureEnvBlock). After the shape normalization
+ // above, so the responses path edits the field upstream will actually read.
+ ensureEnvBlock(body, pathname);
 
  const caseRestore = normalizePlaceholderCase(body);
- retargetToolChoice(body);
 
+ // No tool_choice retargeting here: enforceAutoToolChoice above already
+ // deleted every non-"auto" choice (Zen accepts only "auto"), so the only
+ // survivor is the string "auto" — nothing to rename, no choice to carry.
  const findGlob = buildFindGlobRestore(Array.isArray(body.tools) ? body.tools : []);
- // Caller tool_choice naming `find` must ride upstream as `glob` — the rename
- // above collapses the declaration, so an unretargeted choice dangles.
- if (body.tool_choice !== undefined) {
-  body.tool_choice = retargetToolChoiceForUpstream(body.tool_choice, findGlob) as Record<string, unknown> | string;
- }
  // Captured before translation and injection: the map is keyed by CALLER tool
  // name (what arrives downstream), and injected placeholders must not be
  // repairable.
@@ -557,7 +774,6 @@ export function enforceOpencodeFingerprint(
  // executable when injected); real definitions survive downstream so
  // injected OMP calls execute.
  const injected = missing.filter((n) => !ompLike || n === "edit");
- const injectedReal = ompLike ? missing.filter((n) => n !== "edit") : [];
 
  // Zen alone asks for a rename: its free-tier gate looks for the sextet name
  // `glob`, so a Pi caller that sent `find` needs it renamed into that slot.
@@ -577,13 +793,37 @@ export function enforceOpencodeFingerprint(
  const after = Array.isArray(body.tools) ? body.tools.length : 0;
 
  // Note: Upstream OpenCode Zen explicitly rejects any tool_choice other than "auto"
- // with HTTP 400 (only "auto" is supported). tool_choice is auto-or-absent here:
- // normalizeResponsesBody drops "none" on the responses path, the chat branch above
- // drops it on the chat path, and we never impose a choice.
+ // with HTTP 400 (only "auto" is supported). tool_choice is auto-or-absent on the
+ // responses and chat paths (normalizeResponsesBody / enforceAutoToolChoice above),
+ // the Zen messages lane keeps the caller's own choice semantics (Anthropic
+ // spells choices with `any` / `{ type: "tool", name: ... }`), and we never
+ // impose a choice.
  // Empty-placeholder callers stay silent via the COMPAT description and the
  // output-aggregator; real OMP definitions execute normally.
 
- return { clientRequestedStream, callerHadTools, addedTools: after > before, caseRestore, findGlob, injected, injectedReal, argSchemas };
+ return { clientRequestedStream, callerHadTools, addedTools: after > before, caseRestore, findGlob, injected, argSchemas };
+}
+
+/**
+ * SSE field line at a line start (`data:`/`event:`), CRLF-tolerant. One source
+ * of truth for every "is this actually an event stream?" decision: the body
+ * gate in src/stream-pipe.ts, the proxy's aggregate gates, and
+ * convertSseToJson's own guard.
+ *
+ * A substring test is not enough. A plain-JSON 200 whose text merely CONTAINS
+ * `data:` — a bash command mentioning `metadata:`, a base64 `data:image/png`
+ * blob, `multipart/form-data:` — used to be fed to the SSE aggregator and
+ * replaced by an empty synthesized completion (content null, tool calls gone,
+ * HTTP 200). Line anchoring keeps such bodies byte-identical. Lives here
+ * rather than next to stream-pipe's former SSE_START_RE because that module
+ * already imports this one: exporting it from there would close an import
+ * cycle.
+ */
+const SSE_FIELD_LINE_RE = /^(data|event):/m;
+
+/** True when `text` carries a real SSE field line at a line start. */
+export function looksLikeSse(text: string): boolean {
+ return text.length > 0 && SSE_FIELD_LINE_RE.test(text);
 }
 
 /**
@@ -679,6 +919,32 @@ function cloakChatMessage(
  else delete m.tool_calls;
 }
 
+/**
+ * Fold one streamed `function.name` delta into the accumulated tool name.
+ *
+ * Providers stream names in two legitimate shapes, and the difference is the
+ * presence of arguments on the same delta:
+ *
+ * - **Fragment** (`name`, no `arguments`): the ordinary piecewise stream — the
+ *   delta carries the next slice of the name, so append it.
+ * - **Repeat header** (`name` AND `arguments`): OpenCode Zen restates the
+ *   WHOLE name on the frame that opens the arguments (observed live
+ *   2026-10-22: `name:"get_weather"` alone, then `name:"get_weather",
+ *   arguments:"{…}"`). The name there is authoritative, so replace instead of
+ *   appending — appending produced `get_weatherget_weather`, a tool name no
+ *   tool declaration matches. A full mid-stream restatement is the same shape.
+ *
+ * Shared by both aggregators (the non-streamed completion cloak and the
+ * streaming cloak) so streamed and aggregated output always agree.
+ */
+export function accumulateToolCallName(
+ previous: string | undefined,
+ delta: string,
+ carriesArguments: boolean,
+): string {
+ return carriesArguments ? delta : `${previous ?? ""}${delta}`;
+}
+
 export function sseToChatCompletionJson(
  sseText: string,
  callerHadTools = true,
@@ -744,7 +1010,15 @@ export function sseToChatCompletionJson(
         };
         if (tc.id) existing.id = tc.id;
         if (tc.type) existing.type = tc.type;
-        if (tc.function?.name) existing.function.name += tc.function.name;
+        if (tc.function?.name) {
+         // See accumulateToolCallName: a name on an arguments-carrying delta
+         // is the whole name restated, not another fragment.
+         existing.function.name = accumulateToolCallName(
+          existing.function.name,
+          tc.function.name,
+          typeof tc.function.arguments === "string" && tc.function.arguments !== "",
+         );
+        }
         if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
         toolCallsMap.set(key, existing);
        }
@@ -1090,7 +1364,7 @@ export function convertSseToJson(
 ): string {
  if (!sseText || typeof sseText !== "string") return sseText;
  const trimmed = sseText.trim();
- if (!trimmed.includes("data:")) {
+ if (!looksLikeSse(trimmed)) {
   return sseText;
  }
  try {
@@ -1176,4 +1450,160 @@ export function repairJsonToolArguments(
   }
  }
  return changed ? JSON.stringify(body) : bodyText;
+}
+
+/**
+ * Profiled OpenCode fingerprint (A/B-able). V1_PROFILE mirrors the legacy
+ * opencodeHeaders()/sextet behaviour byte-for-byte.
+ */
+import {
+ OPENCODE_CLIENT as PROFILE_OPENCODE_CLIENT,
+ OPENCODE_PROJECT as PROFILE_OPENCODE_PROJECT,
+ buildOpenCodeUserAgent,
+ createOpenCodeRequestId,
+ getLiveOpenCodeV2Version,
+ getLiveOpenCodeVersion,
+ getOpenCodeUserAgent,
+ resolveOpenCodeProject,
+ type OpenCodeProjectVariant,
+} from "./config.ts";
+import {
+ BASH_READ_119_PARAM_SCHEMAS,
+ READ_SHELL_V2_DEFS,
+} from "./tool-translation.ts";
+
+export type FingerprintToolSet = "sextet" | "bash-read" | "read-shell";
+export interface OpenCodeProfile {
+ id: string;
+ uaShape: "v1" | "full" | "v2";
+ uaChannel: string;
+ client: string;
+ project: string;
+ sendRequestId: boolean;
+ sendAffinity: boolean;
+ tools: FingerprintToolSet;
+}
+export const V1_PROFILE: OpenCodeProfile = {
+ id: "v1",
+ uaShape: "v1",
+ uaChannel: "latest",
+ client: PROFILE_OPENCODE_CLIENT,
+ project: PROFILE_OPENCODE_PROJECT,
+ sendRequestId: false,
+ sendAffinity: true,
+ tools: "sextet",
+};
+function profileUserAgent(profile: OpenCodeProfile): string {
+ if (profile.uaShape === "v1") return getOpenCodeUserAgent();
+ if (profile.uaShape === "v2") {
+  return buildOpenCodeUserAgent(profile.uaShape, getLiveOpenCodeV2Version(), profile.uaChannel, profile.client);
+ }
+ return buildOpenCodeUserAgent(profile.uaShape, getLiveOpenCodeVersion(), profile.uaChannel, profile.client);
+}
+/**
+ * Selectable v2 profile for the User-Agent A/B (opt-in only — the default
+ * lane keeps V1_PROFILE above byte-for-byte).
+ * Emits the CLI shape the passing client sends today:
+ * `opencode/latest/<2.x>/cli` on the latest channel with a live 2.x version
+ * (pinned 2.0.27 fallback while no live 2.x lookup has landed). Headers,
+ * affinity pair and sextet toolset match V1 otherwise, so the A/B isolates
+ * the UA string.
+ */
+export const V2_PROFILE: OpenCodeProfile = {
+ id: "v2",
+ uaShape: "v2",
+ uaChannel: "latest",
+ client: PROFILE_OPENCODE_CLIENT,
+ project: PROFILE_OPENCODE_PROJECT,
+ sendRequestId: false,
+ sendAffinity: true,
+ tools: "sextet",
+};
+/**
+ * Return a copy of `profile` sending one project-header variant
+ * ("fixed" | "global" | "cwd"). The caller's profile is never mutated, and
+ * the default lane never calls this — it keeps the fixed pin.
+ */
+export function withProjectHeader(
+ profile: OpenCodeProfile,
+ variant: OpenCodeProjectVariant,
+ cwd?: string,
+): OpenCodeProfile {
+ return { ...profile, id: `${profile.id}:project=${variant}`, project: resolveOpenCodeProject(variant, cwd) };
+}
+/**
+ * Opt-in OpenAI-compat body variant for the lane A/B: mark the body for usage
+ * accounting the way the CLI's openai-compat request does. Merges into an
+ * existing stream_options object rather than replacing it. Never applied by
+ * the default lane — only probes or A/B callers invoke this.
+ */
+export function applyOpenAiCompatVariant(body: Record<string, unknown>): void {
+ if (!body || typeof body !== "object") return;
+ const existing = body.stream_options;
+ if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+  (existing as Record<string, unknown>).include_usage = true;
+  return;
+ }
+ body.stream_options = { include_usage: true };
+}
+export function opencodeHeadersFor(sessionId: string, profile: OpenCodeProfile): Record<string, string> {
+ const headers: Record<string, string> = {
+  Authorization: "Bearer public",
+  "User-Agent": profileUserAgent(profile),
+  "x-opencode-client": profile.client,
+  "x-opencode-project": profile.project,
+  "x-opencode-session": sessionId,
+  "x-opencode-session-id": sessionId,
+ };
+ if (profile.sendAffinity) {
+  headers["x-session-affinity"] = sessionId;
+  headers["x-session-id"] = sessionId;
+ }
+ if (profile.sendRequestId) headers["x-opencode-request"] = createOpenCodeRequestId();
+ return headers;
+}
+function pushChatTool(body: Record<string, unknown>, name: string, description: string, parameters: Record<string, unknown>): void {
+ (body.tools as unknown[]).push({
+  type: "function",
+  function: { name, description, parameters },
+ });
+}
+/**
+ * Ensure the profile's toolset on a Chat Completions body. Idempotent and
+ * case-insensitive; caller tools pass through verbatim, missing slots append.
+ * bash-read descriptions follow fingerprintFill (OMP-like real defs, else
+ * COMPAT placeholder) with verbatim 1.19.0 parameters; read-shell uses the
+ * verbatim v2.0.26 definitions.
+ */
+export function ensureFingerprintToolsFor(body: Record<string, unknown>, tools: FingerprintToolSet, ompLike?: boolean): void {
+ if (tools === "sextet") {
+  ensureChatFingerprintTools(body, ompLike);
+  return;
+ }
+ if (!body || typeof body !== "object") return;
+ const present = new Set<string>();
+ if (Array.isArray(body.tools)) {
+  for (const tool of body.tools) {
+   const name = toolNameOf(tool);
+   if (name) present.add(name.toLowerCase());
+  }
+ } else {
+  body.tools = [];
+ }
+ const omp = ompLike ?? isOmpLikeCaller(present);
+ if (tools === "bash-read") {
+  for (const name of ["bash", "read"] as const) {
+   if (present.has(name)) continue;
+   const fill = fingerprintFill(name, omp);
+   pushChatTool(body, name, fill.description, { ...(BASH_READ_119_PARAM_SCHEMAS[name] as Record<string, unknown>) });
+   present.add(name);
+  }
+  return;
+ }
+ for (const name of ["read", "shell"] as const) {
+  if (present.has(name)) continue;
+  const def = READ_SHELL_V2_DEFS[name];
+  pushChatTool(body, name, def.description, { ...(def.parameters as Record<string, unknown>) });
+  present.add(name);
+ }
 }

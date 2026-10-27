@@ -19,8 +19,8 @@ All commands are available inside the OMP or Pi TUI via `/freeflow`:
 | `/freeflow export [path] [--include-secrets]` | Save the relay pool to a JSON file (relay passwords are stripped unless you ask for them) |
 | `/freeflow import <path> [--merge&vert;--replace] [--dry-run]` | Load a relay pool from a file — merged into the pool by default, or `--replace` to swap it out |
 | `/freeflow test <index&vert;url&vert;label>` | Probe a relay for reachability (HTTP 200 + latency) |
-| `/freeflow on &vert; off &vert; auto &vert; spread` | Relay mode (auto = enabled for freeflow, spread = rotate across the healthy relays) |
-| `/freeflow deploy <platform>` | Guided relay deploy (cloudflare, deno, vercel — Cloudflare recommended, Vercel last resort) |
+| `/freeflow on &vert; off &vert; auto &vert; sticky &vert; spread` | Relay mode (auto/sticky = sticky primary until 429/error, spread = rotate across healthy relays) |
+| `/freeflow deploy <platform>` | Guided relay deploy (cloudflare, deno, vercel — Cloudflare is the recommended edge relay, Vercel the last resort; for OpenCode Zen traffic a self-hosted pool is recommended, see [Relays](/pages/relays)) |
 | `/freeflow install-startup` | Install the login-startup hook so the daemon comes up with your session |
 | `/freeflow uninstall-startup` | Remove the login-startup hook |
 | `/freeflow logs [lines]` | Inspect recent proxy logs |
@@ -40,6 +40,8 @@ All commands are available inside the OMP or Pi TUI via `/freeflow`:
 ## Logging
 
 Logs are written to `~/.pi/agent/pi-freeflow.log` with auto-rotation at 10MB (10 files). Each entry includes a request correlation ID for end-to-end tracing. Full debug logging is on by default so error reports can include complete request lifecycles (toggle with `/freeflow debug off`).
+
+A second, separate file records tool-call turns: `~/.pi/agent/toolcall-audit.jsonl`, rotated at 5 MiB. It holds one line per finished turn that declared tools, one per upstream attempt abandoned in favour of another, and one per conversation the host retried — tool names, argument sizes, finish reasons and classified failures, never message text or argument values. Field-by-field detail and jq recipes are in [Architecture](/pages/architecture#tool-call-audit-log).
 
 ## Troubleshooting
 

@@ -4,7 +4,6 @@ import {
 	PI_TOOL_NAMES,
 	buildFindGlobRestore,
 	restoreToolNameForCaller,
-	retargetToolChoiceForUpstream,
 	translateToolsForPath,
 	sanitizeUpstreamToolName,
 	upstreamToolNameFor,
@@ -255,13 +254,6 @@ test("pi usage: only the fingerprint lane renames find to glob", () => {
 	assert.equal(renamed.renamedFindToGlob, true);
 	assert.equal(restoreToolNameForCaller("glob", renamed), "find", "restore map brings find back");
 	assert.equal(restoreToolNameForCaller("read", renamed), "read", "non-glob names untouched by restore");
-	// tool_choice is carried across the rename, never imposed.
-	assert.deepEqual(
-		retargetToolChoiceForUpstream({ type: "function", name: "find" }, renamed),
-		{ type: "function", name: "glob" },
-	);
-	assert.equal(retargetToolChoiceForUpstream("auto", renamed), "auto", "auto choice never retargeted");
-	assert.equal(retargetToolChoiceForUpstream(undefined, renamed), undefined, "absent choice never imposed");
 });
 
 test("pi usage: OMP-style glob fixture is untouched and never restores to find", () => {
@@ -399,7 +391,14 @@ test("pi usage: custom registerTool envelope keeps unbounded name with constrain
 				`${path}: wire name folded only where upstream would reject it`,
 			);
 			assert.deepEqual(upstreamParamsOf(out), customParams, `${path}: custom params verbatim`);
-			assert.equal((out as Record<string, unknown>).strict, true, `${path}: resolved strict rides along`);
+			// `strict` sits at the target wire position: inside the chat
+			// `function` wrapper, top-level on the other shapes.
+			const fn = out.function as Record<string, unknown> | undefined;
+			assert.deepEqual(
+				fn && typeof fn.strict === "boolean" ? fn.strict : (out as Record<string, unknown>).strict,
+				true,
+				`${path}: resolved strict rides along`,
+			);
 			assert.deepEqual(
 				(out as Record<string, unknown>).constrainedSampling,
 				constrainedSampling,
