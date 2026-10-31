@@ -2,6 +2,7 @@
  * Configuration and path resolution for pi-freeflow
  */
 
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -26,15 +27,54 @@ export const KILO_CHAT_URL = "https://api.kilo.ai/api/gateway/chat/completions";
 export const KILO_RESPONSES_URL = "https://api.kilo.ai/api/gateway/responses";
 export const OPENCODE_API_URL = `${UPSTREAM_OPENCODE}/v1`;
 /**
- * OpenAI-compat Zen lane (opt-in A/B only — the default lane stays /v1).
- * The official CLI addresses the free tier here rather than on the plain
- * /v1 chat path; same gateway, same Bearer public credential, but the path
- * carries the extra `/openai` segment and the body carries `stream_options`.
- * Relay probes address it via OPENCODE_OPENAI_COMPAT_PATH (the x-relay-path
- * the workers forward as target + path).
+ * OpenAI-compat Zen lane — the DEFAULT lane for chat completions.
+ * Live truth (v1 1.19.4 MITM, SG): the official CLI addresses the free tier
+ * here (`POST https://opencode.ai/inference/openai/v1/chat/completions`),
+ * not on the plain /v1 chat path. Same gateway, same Bearer public
+ * credential, but the path carries the extra `/openai` segment and the body
+ * carries `stream_options: { include_usage: true }`.
+ * The plain `/inference/v1/chat/completions` path stays as the fallback when
+ * the compat lane answers 404/405. Relay probes address the compat lane via
+ * OPENCODE_OPENAI_COMPAT_PATH (the x-relay-path the workers forward as
+ * target + path).
  */
 export const OPENCODE_OPENAI_COMPAT_URL = `${UPSTREAM_OPENCODE}/openai/v1/chat/completions`;
 export const OPENCODE_OPENAI_COMPAT_PATH = "/inference/openai/v1/chat/completions";
+
+/**
+ * Origin (scheme + host) of the OpenCode gateway. UPSTREAM_OPENCODE above is
+ * the origin plus the `/inference` base path; joining a `/inference/...`
+ * upstream path onto it would double the base (`/inference/inference/...`),
+ * so callers that already hold an upstream-rooted path join it here instead.
+ */
+export const OPENCODE_ORIGIN = "https://opencode.ai";
+
+/**
+ * Default-lane upstream path for a request path. Chat completions ride
+ * the openai-compat lane (live CLI truth); every other path (responses,
+ * messages, models) keeps its plain mapping. The plain chat path stays as
+ * the fallback when the compat lane answers 404/405.
+ *
+ * Accepts EITHER form because production `validatePath` resolves the local
+ * `/v1/...` path against the `/inference` base, so `target.pathname` already
+ * arrives upstream-rooted (`/inference/v1/chat/completions`): a leading
+ * `/inference` base is normalized off before mapping, and an already-compat
+ * or unknown path passes through untouched instead of being sliced blindly.
+ * Idempotent: feeding its own output back returns it unchanged.
+ */
+export function zenUpstreamPathFor(localOrUpstreamPathname: string): string {
+ const local = localOrUpstreamPathname.startsWith("/inference/")
+  ? localOrUpstreamPathname.slice("/inference".length)
+  : localOrUpstreamPathname;
+ if (local === "/v1/chat/completions") return OPENCODE_OPENAI_COMPAT_PATH;
+ if (local.startsWith("/v1/")) return `/inference${local}`;
+ return localOrUpstreamPathname;
+}
+
+/** Full upstream URL for a local request path on the default Zen lane. */
+export function zenUpstreamUrlFor(localPathname: string): string {
+ return `${OPENCODE_ORIGIN}${zenUpstreamPathFor(localPathname)}`;
+}
 // Cline serves chat completions only — responses-path requests are translated
 // to chat upstream and back (see tool-translation.ts). Direct-only: Cline
 // traffic never rides the relay pool and carries a per-user bearer token
@@ -92,9 +132,15 @@ export const OPENCODE_VERSION_TTL_MS = 6 * 60 * 60 * 1_000;
 export const OPENCODE_USER_AGENT_ENV = "PI_FREEFLOW_OPENCODE_USER_AGENT";
 /** Owned UA probe cache file (sibling of the update-check cache). */
 export const OPENCODE_VERSION_CACHE_ENV = "PI_FREEFLOW_OPENCODE_VERSION_CACHE";
+/** Opt-in 4-token UA: "1" emits opencode/latest/<live>/cli (2.x allowed); "channel/client" customizes. Unset → default 3-token shape. */
+export const OPENCODE_UA_V2_ENV = "PI_FREEFLOW_OPENCODE_UA_V2";
+/** Opt-in project variant: "cwd" hashes cwd via sha1; unset/any other → "global". Default byte-identical. */
+export const OPENCODE_PROJECT_ENV = "PI_FREEFLOW_OPENCODE_PROJECT";
+/** Working directory for the project header when PROJECT=cwd; ignored on every other variant. */
+export const OPENCODE_CWD_ENV = "PI_FREEFLOW_OPENCODE_CWD";
+/** Opt-in extra header allowlist (comma-separated, e.g. b3,traceparent,accept); default allowlist unchanged. */
+export const OPENCODE_EXTRA_HEADERS_ENV = "PI_FREEFLOW_OPENCODE_EXTRA_HEADERS";
 
-export const OPENCODE_VERSION = OPENCODE_VERSION_FALLBACK;
-export const OPENCODE_USER_AGENT = `opencode/${OPENCODE_VERSION}`;
 export const OPENCODE_CLIENT = "cli";
 
 function compareVersionParts(a: string, b: string): number {
@@ -123,6 +169,92 @@ export function toOpenCodeUserAgent(version: unknown): string | null {
  const bare = v.startsWith("opencode/") ? v.slice("opencode/".length) : v;
  if (!isSupportedOpenCodeVersion(bare)) return null;
  return `opencode/${bare}`;
+}
+
+/** Memo TTL for the installed-binary probe: at most one spawn per minute. */
+export const OPENCODE_BINARY_VERSION_TTL_MS = 60_000;
+/** Where an observed live OpenCode version came from. */
+export type OpenCodeVersionSource = "registry" | "binary";
+
+/**
+ * Parse `opencode --version` output into a bare semver, else null.
+ * Accepts the shapes the CLIs print (`2.2.0`, `v2.2.0`, `opencode-ai 1.19.4`)
+ * and floors through isSupportedOpenCodeVersion, so anything below 1.17.0
+ * (or unparseable) never drives the wire UA.
+ */
+export function parseOpenCodeBinaryVersion(output: unknown): string | null {
+ if (typeof output !== "string") return null;
+ const match = output.match(/(\d+\.\d+\.\d+)/);
+ if (!match) return null;
+ const version: string | undefined = match[1];
+ if (version === undefined || !isSupportedOpenCodeVersion(version)) return null;
+ return version;
+}
+
+/** Minimal spawnSync result surface the binary probe reads. */
+export interface OpenCodeSpawnResult {
+ status: number | null;
+ stdout?: unknown;
+ stderr?: unknown;
+ error?: unknown;
+}
+/** spawnSync-compatible injector for the binary probe (tests stub this). */
+export type OpenCodeSpawnSync = (
+ command: string,
+ args: readonly string[],
+ options: { encoding: "utf8"; timeout: number; windowsHide: boolean; shell?: boolean },
+) => OpenCodeSpawnResult;
+
+function defaultOpenCodeSpawn(
+ command: string,
+ args: readonly string[],
+ options: { encoding: "utf8"; timeout: number; windowsHide: boolean; shell?: boolean },
+): OpenCodeSpawnResult {
+ // Single-string form under a Windows shell: resolves *.cmd shims the same
+ // way isCommandAvailable does; direct exec elsewhere.
+ if (process.platform === "win32") {
+  return spawnSync(`${command} ${args.join(" ")}`, {
+   encoding: options.encoding,
+   timeout: options.timeout,
+   windowsHide: options.windowsHide,
+   shell: true,
+  }) as unknown as OpenCodeSpawnResult;
+ }
+ return spawnSync(command, [...args], options) as unknown as OpenCodeSpawnResult;
+}
+
+let binaryMemo: { key: string; version: string | null; probedAt: number } | null = null;
+
+/**
+ * Probe the locally installed `opencode` binary (`--version`, 10s timeout).
+ * Offline-safe by construction: no network, try/catch, null when the binary
+ * is missing, fails, times out, or prints an unsupported version. Results
+ * (including misses) are memoized ~60s so the request path never spawns
+ * more than once a minute. Pass `spawnImpl` to stub the spawn in tests —
+ * never rely on a real PATH binary there (CI has none).
+ */
+export function probeInstalledOpenCodeVersion(opts: {
+ execPath?: string;
+ timeoutMs?: number;
+ spawnImpl?: OpenCodeSpawnSync;
+} = {}): string | null {
+ const execPath = opts.execPath ?? "opencode";
+ const timeoutMs = opts.timeoutMs ?? 10_000;
+ const now = Date.now();
+ if (binaryMemo && binaryMemo.key === execPath && now - binaryMemo.probedAt < OPENCODE_BINARY_VERSION_TTL_MS) {
+  return binaryMemo.version;
+ }
+ let version: string | null = null;
+ try {
+  const spawn = opts.spawnImpl ?? defaultOpenCodeSpawn;
+  const res = spawn(execPath, ["--version"], { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
+  if (res && res.error === undefined && res.status === 0) {
+   const text = [res.stdout, res.stderr].filter((part): part is string => typeof part === "string").join("\n");
+   version = parseOpenCodeBinaryVersion(text);
+  }
+ } catch { version = null; }
+ binaryMemo = { key: execPath, version, probedAt: now };
+ return version;
 }
 
 function openCodeVersionCachePath(): string {
@@ -159,6 +291,7 @@ function writeOpenCodeVersionCache(version: string): void {
 }
 
 let liveOpenCodeVersion: string | null = null;
+let liveOpenCodeVersionSource: OpenCodeVersionSource | null = null;
 /** Memoized disk read: path -> { version, fileCheckedAt } so opencodeHeaders() stays sync and cheap. */
 let diskMemo: { path: string; version: string | null; readAt: number } | null = null;
 const DISK_MEMO_TTL_MS = 60_000;
@@ -174,22 +307,47 @@ function memoizedDiskVersion(): string | null {
 }
 
 /** Test-only: reset the in-process live version (cache file untouched). */
-export function _resetLiveOpenCodeVersionForTest(): void { liveOpenCodeVersion = null; diskMemo = null; }
+export function _resetLiveOpenCodeVersionForTest(): void {
+ liveOpenCodeVersion = null;
+ liveOpenCodeVersionSource = null;
+ diskMemo = null;
+ binaryMemo = null;
+}
 
 /**
- * Synchronous UA getter — offline-safe by construction. Precedence:
- * env override > in-process live version > fresh disk cache > pinned fallback.
- * Never throws, never touches the network (disk re-read at most once a minute).
+ * Current OpenCode version for the wire UA — the single precedence chain:
+ * env override > installed binary (1.x line) > in-process live version >
+ * fresh disk cache > pinned fallback. Never throws, never touches the
+ * network (disk re-read at most once a minute, binary probe at most once a
+ * minute). An installed 2.x binary never drives the compat-lane UA — it is
+ * skipped here and surfaces via getLiveOpenCodeVersion for logs only.
+ */
+function currentOpenCodeVersion(): string {
+ const override = toOpenCodeUserAgent(process.env[OPENCODE_USER_AGENT_ENV]);
+ if (override) return override.slice("opencode/".length);
+ const installed = probeInstalledOpenCodeVersion();
+ if (installed && installed.split(".")[0] === "1") return installed;
+ if (liveOpenCodeVersion && isSupportedOpenCodeVersion(liveOpenCodeVersion)) return liveOpenCodeVersion;
+ const disk = memoizedDiskVersion();
+ if (disk) return disk;
+ return OPENCODE_VERSION_FALLBACK;
+}
+
+/**
+ * Synchronous UA getter — the single User-Agent implementation every lane
+ * sends (offline-safe by construction). Default the verbatim CLI full shape.
+ * With PI_FREEFLOW_OPENCODE_UA_V2=1, the 4-token latest/cli shape with the
+ * live version (2.x allowed); "channel/client" customizes both tokens.
  */
 export function getOpenCodeUserAgent(): string {
- const override = toOpenCodeUserAgent(process.env[OPENCODE_USER_AGENT_ENV]);
- if (override) return override;
- if (liveOpenCodeVersion && isSupportedOpenCodeVersion(liveOpenCodeVersion)) {
-  return `opencode/${liveOpenCodeVersion}`;
+ const v2raw = process.env[OPENCODE_UA_V2_ENV];
+ const v2 = typeof v2raw === "string" ? v2raw.trim() : "";
+ if (v2.length > 0) {
+  if (v2 === "1") return buildOpenCodeUserAgent(getLiveOpenCodeVersion(), { channel: "latest", client: OPENCODE_CLIENT });
+  const parts = v2.split("/").map((p) => p.trim()).filter((p) => p.length > 0);
+  if (parts.length === 2) return buildOpenCodeUserAgent(getLiveOpenCodeVersion(), { channel: parts[0], client: parts[1] });
  }
- const disk = memoizedDiskVersion();
- if (disk) return `opencode/${disk}`;
- return OPENCODE_USER_AGENT;
+ return buildOpenCodeUserAgent(currentOpenCodeVersion());
 }
 
 /**
@@ -200,7 +358,7 @@ export function getOpenCodeUserAgent(): string {
  */
 export async function refreshOpenCodeUserAgent(fetchImpl: typeof fetch = fetch): Promise<string> {
  const override = toOpenCodeUserAgent(process.env[OPENCODE_USER_AGENT_ENV]);
- if (override) return override;
+ if (override) return getOpenCodeUserAgent();
  try {
   const res = await fetchImpl("https://registry.npmjs.org/opencode-ai/latest", {
    signal: AbortSignal.timeout(10_000),
@@ -210,47 +368,47 @@ export async function refreshOpenCodeUserAgent(fetchImpl: typeof fetch = fetch):
   const version = (body as Record<string, unknown>)?.version;
   if (!isSupportedOpenCodeVersion(version)) return getOpenCodeUserAgent();
   liveOpenCodeVersion = version as string;
+  liveOpenCodeVersionSource = "registry";
   writeOpenCodeVersionCache(version as string);
   diskMemo = null;
-  return `opencode/${version}`;
+  return getOpenCodeUserAgent();
  } catch { return getOpenCodeUserAgent(); }
 }
-/** Live version already fetched in-process, else the pinned fallback. No network, no side effect. */
-export function getLiveOpenCodeVersion(): string { return liveOpenCodeVersion ?? OPENCODE_VERSION_FALLBACK; }
+/**
+ * Live version already fetched in-process, else the installed binary, else
+ * the pinned fallback. The installed 2.x line surfaces here (and in logs)
+ * while the compat-lane UA keeps the 1.x line — major-2 never auto-switches
+ * the wire shape. No network; the binary probe is memoized ~60s.
+ */
+export function getLiveOpenCodeVersion(): string {
+ if (liveOpenCodeVersion) return liveOpenCodeVersion;
+ return probeInstalledOpenCodeVersion() ?? OPENCODE_VERSION_FALLBACK;
+}
+/**
+ * Where the live version came from: `registry` when refresh populated it,
+ * `binary` when it reflects the installed binary, null on the pure fallback.
+ */
+export function getOpenCodeVersionSource(): OpenCodeVersionSource | null {
+ if (liveOpenCodeVersion) return liveOpenCodeVersionSource;
+ if (probeInstalledOpenCodeVersion() !== null) return "binary";
+ return null;
+}
 
 /**
- * Pinned fallback for the v2 (channel/version/client) User-Agent shape.
- * The free-tier CLI that passes the gate today reports the 2.x line, while
- * the v1 fallback above pins the 1.x line the default lane sends — the two
- * shapes need separate pins so a v2 A/B never emits `opencode/latest/1.x/...`.
+ * Build the OpenCode User-Agent string: default the verbatim CLI full shape
+ * (`opencode/<version> ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`).
+ * With both channel+client, the 4-token CLI shape
+ * (`opencode/<channel>/<version>/<client> ai-sdk/... runtime/...`).
+ * The legacy bare shape is gone with the A/B profiles.
  */
-export const OPENCODE_V2_VERSION_FALLBACK = "2.0.27";
-
-/**
- * Live 2.x version for the v2 UA shape, else the v2 pinned fallback.
- * A live 1.x lookup never leaks into a v2 UA: only a major-2 version is used.
- * No network, no side effect.
- */
-export function getLiveOpenCodeV2Version(): string {
- if (typeof liveOpenCodeVersion === "string" && /^2\.\d+\.\d+$/.test(liveOpenCodeVersion)) {
-  return liveOpenCodeVersion;
+export function buildOpenCodeUserAgent(version: string, opts?: { channel?: string; client?: string }): string {
+ if (typeof opts?.channel === "string" && opts.channel.length > 0 && typeof opts?.client === "string" && opts.client.length > 0) {
+  return `opencode/${opts.channel}/${version}/${opts.client} ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`;
  }
- return OPENCODE_V2_VERSION_FALLBACK;
+ return `opencode/${version} ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`;
 }
 
-/**
- * Build an OpenCode User-Agent string.
- * v1: `opencode/<version>` (legacy shape); full: verbatim CLI 1.19.0 capture
- * (`opencode/<version> ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`);
- * v2: `opencode/<channel>/<version>/<client>` (CLI shape).
- */
-export function buildOpenCodeUserAgent(shape: "v1" | "full" | "v2", version: string, channel = "latest", client = "opencode"): string {
- if (shape === "full") return `opencode/${version} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`;
- if (shape === "v2") return `opencode/${channel}/${version}/${client}`;
- return `opencode/${version}`;
-}
-
-const STABLE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const STABLE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{13,14}$/;
 const STABLE_SESSION_CAP = 1000;
 const stableSessionCache = new Map<string, string>();
 const TIME48_MASK = (1n << 48n) - 1n;
@@ -295,32 +453,11 @@ export function _stableSessionCacheSizeForTest(): number { return stableSessionC
 
 /** Test-only: whether a key is currently memoized (proves LRU eviction). */
 export function _stableSessionHasKeyForTest(key: string): boolean { return stableSessionCache.has(key); }
-// OpenCode project ID: 40-character sha1 hex hash
-export const OPENCODE_PROJECT = createHash("sha1")
- .update("git-remote:github.com/anomalyco/opencode")
- .digest("hex");
-
-/**
- * Project-header variants for the x-opencode-project A/B (opt-in only —
- * the default lane keeps OPENCODE_PROJECT above).
- * - "fixed": the pinned sha1 above (what the default lane sends today).
- * - "global": the literal `global` project the CLI sends outside a repo.
- * - "cwd": sha1 hex of the working directory, matching the CLI inside a repo.
- */
+/** The literal `global` project the CLI sends outside a repo. */
 export const OPENCODE_PROJECT_GLOBAL = "global";
-export type OpenCodeProjectVariant = "fixed" | "global" | "cwd";
 /** sha1 hex digest of a working directory (what the CLI sends as the project). */
 export function openCodeProjectForCwd(cwd: string): string {
  return createHash("sha1").update(cwd).digest("hex");
-}
-/**
- * Resolve one project-header variant. "cwd" without a usable cwd falls back
- * to the fixed pin rather than emitting an empty or garbage header.
- */
-export function resolveOpenCodeProject(variant: OpenCodeProjectVariant, cwd?: string): string {
- if (variant === "global") return OPENCODE_PROJECT_GLOBAL;
- if (variant === "cwd" && typeof cwd === "string" && cwd.length > 0) return openCodeProjectForCwd(cwd);
- return OPENCODE_PROJECT;
 }
 
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -364,23 +501,52 @@ export function createOpenCodeRequestId(): string {
  return `msg_${createOpenCodeId(false)}`;
 }
 
-export const OPENCODE_SESSION = createOpenCodeSessionId();
+/**
+ * Live project header: legacy cwd hash preserved, env only overrides. Unset
+ * PI_FREEFLOW_OPENCODE_PROJECT keeps today's behavior (cwd → sha1, else
+ * `global`), so the wire default (no cwd threaded) stays `global` and
+ * existing callers/tests are unchanged. "global" forces global even with a
+ * cwd; "cwd" hashes the param or PI_FREEFLOW_OPENCODE_CWD (else global).
+ */
+export function resolveOpenCodeProjectLive(cwd?: string): string {
+ const variant = process.env[OPENCODE_PROJECT_ENV];
+ if (variant === "cwd") {
+  const effective = typeof cwd === "string" && cwd.length > 0 ? cwd : process.env[OPENCODE_CWD_ENV];
+  if (typeof effective === "string" && effective.length > 0) return openCodeProjectForCwd(effective);
+  return OPENCODE_PROJECT_GLOBAL;
+ }
+ if (variant === "global") return OPENCODE_PROJECT_GLOBAL;
+ if (typeof cwd === "string" && cwd.length > 0) return openCodeProjectForCwd(cwd);
+ return OPENCODE_PROJECT_GLOBAL;
+}
 
-export function opencodeHeaders(): Record<string, string> {
- const sessionId = OPENCODE_SESSION;
- // Real OpenCode CLI (captured 2.0.28) does NOT send x-opencode-request on
- // /inference/v1. Emitting msg_* there is treated as a non-OpenCode client and
- // returns 403 FreeTierError — keep the helper for ID-shape tests, but omit
- // the header on the wire.
+/**
+ * Live-truth OpenCode headers (v1 1.19.4 MITM, SG): full UA, Bearer public,
+ * client cli, per-conversation ses_* session, fresh msg_* request id per
+ * prepare, and the cwd-derived project. Affinity headers are NEVER sent on
+ * the opencode lane (upstream treats them as a non-OpenCode signal); they
+ * are gated to non-opencode lanes only (see sanitizeHeaders callers).
+ *
+ * @param sessionKey conversation-scoped key reused within a run
+ *   (stableOpenCodeSessionId maps it deterministically; a valid ses_* passes
+ *   through verbatim). Omitted/empty allocates a fresh id for this call.
+ * @param cwd working directory for the project header; omitted → `global`
+ *   unless PI_FREEFLOW_OPENCODE_PROJECT=cwd supplies one through
+ *   PI_FREEFLOW_OPENCODE_CWD.
+ */
+export function opencodeHeaders(sessionKey?: string, cwd?: string): Record<string, string> {
+ const sessionId =
+  typeof sessionKey === "string" && sessionKey.length > 0
+   ? stableOpenCodeSessionId(sessionKey)
+   : createOpenCodeSessionId();
  return {
   Authorization: "Bearer public",
   "User-Agent": getOpenCodeUserAgent(),
   "x-opencode-client": OPENCODE_CLIENT,
-  "x-opencode-project": OPENCODE_PROJECT,
+  "x-opencode-project": resolveOpenCodeProjectLive(cwd),
   "x-opencode-session": sessionId,
   "x-opencode-session-id": sessionId,
-  "x-session-affinity": sessionId,
-  "x-session-id": sessionId,
+  "x-opencode-request": createOpenCodeRequestId(),
  };
 }
 
@@ -661,6 +827,16 @@ export const BASE_PORT_REPROBE_MS = 3_000;
 export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** Default timeout for upstream headers while proxying a request. */
 export const UPSTREAM_HEADER_TIMEOUT_MS = 300_000;
+// ── Zen transport (opt-in Bun sidecar) ─────────────────────────────────
+// PI_FREEFLOW_ZEN_TRANSPORT selects the TLS stack that originates the Zen
+// direct-leg connection. Unset (or anything but "bun-sidecar") keeps the
+// Node fetch path, byte-identical to today. Set exactly "bun-sidecar" to
+// route the Zen direct leg through src/zen-sidecar.ts (Bun.fetch native
+// stack) with automatic degrade to Node fetch when bun is absent, too old,
+// or the sidecar fails. Zen relay legs are skipped while the sidecar is
+// active (a relay would re-originate the connection and forfeit the
+// sidecar's fingerprint); non-Zen lanes never use the sidecar.
+export const ZEN_TRANSPORT_ENV = "PI_FREEFLOW_ZEN_TRANSPORT";
 /** Timeout for refreshing the catalog (host fetchDynamicModels). */
 export const CATALOG_REFRESH_TIMEOUT_MS = 10_000;
 /** Timeout for probing a relay with a light /v1/models request. */
